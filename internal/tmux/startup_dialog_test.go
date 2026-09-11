@@ -432,18 +432,25 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	// as an EMPTY value indistinguishable from "nothing arrived" — only the
 	// exit status (0 = something was read, non-zero = the read timed out)
 	// tells them apart.
-	// clear happens IMMEDIATELY after the real dismiss key is consumed, not
-	// after the stray-key wait: DismissDialog does its own post-send
-	// re-capture (~500ms after sending Enter) to confirm the dialog cleared,
-	// and that must see a blank screen well before this script's 1-second
-	// stray-key wait finishes — the marker/verdict text can print later.
+	//
+	// A REAL second-long wait now sits between the dismiss key landing and
+	// the verdict being knowable, but DismissDialog re-verifies the pane
+	// only ~500ms after sending — sooner than that. tmux capture-pane
+	// includes scrollback, so `clear` never hides the dialog's own text from
+	// that re-check; only a PROMPT-lead line appearing AFTER the dialog text
+	// (classifyStartupDialog's "already answered" rule) satisfies it. So the
+	// script prints a bare shell-prompt-shaped line ("$ ") immediately after
+	// the real key is consumed — independent of the stray-key wait — and
+	// writes the actual exact-stream verdict to a FILE once that wait
+	// completes, which the test reads separately after giving it time.
+	markerPath := filepath.Join(t.TempDir(), "trust.marker")
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'\n" +
 		"IFS= read -r _line\n" +
-		"clear\n" +
+		"printf '%s' '$ '\n" +
 		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
-		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter\\n'; " +
-		"else printf 'unexpected: line=%s extra=%s status=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\"; fi\n"
+		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter' > " + markerPath + "; " +
+		"else printf 'unexpected: line=%s extra=%s status=%s' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\" > " + markerPath + "; fi\n"
 	scriptPath := filepath.Join(t.TempDir(), "trust.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -466,16 +473,16 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	// A return status alone cannot tell a correctly-dismissed dialog from
 	// one that merely stopped matching the classifier for an unrelated
 	// reason (codex finding on this file). The script's own stray-key read
-	// waits a full second before printing its verdict, so this wait must
+	// waits a full second before writing its verdict, so this wait must
 	// clear that 1s mark with margin (~550ms already elapsed inside
 	// DetectAndDismissKnownDialog's own post-send sleep).
 	time.Sleep(900 * time.Millisecond)
-	after, err := tm.CapturePane(sessionName, 30)
+	verdict, err := os.ReadFile(markerPath)
 	if err != nil {
-		t.Fatalf("CapturePane (after): %v", err)
+		t.Fatalf("reading verdict marker: %v", err)
 	}
-	if !strings.Contains(after, "exact-single-enter") {
-		t.Errorf("dismiss did not send exactly one Enter and nothing else\npane: %q", after)
+	if string(verdict) != "exact-single-enter" {
+		t.Errorf("dismiss did not send exactly one Enter and nothing else: %q", verdict)
 	}
 }
 
@@ -512,23 +519,24 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	// Enter is a lone newline byte, which `read -n1` consumes and reports as
 	// an empty value indistinguishable from "nothing arrived" (codex Medium,
 	// startup_dialog_test.go:399, REVISION 3).
-	// clear happens IMMEDIATELY after the real dismiss keys are consumed,
-	// not after the stray-key wait — same reasoning as the trust dialog
-	// script above: DismissDialog's own post-send re-check must see a
-	// blank screen well before this script's 1-second stray-key wait ends.
-	// $_line is already captured by then, so clearing the screen doesn't
-	// lose it.
+	//
+	// A bare "$ " prints IMMEDIATELY after the real key is consumed — not
+	// after the stray-key wait — so DismissDialog's own post-send re-check
+	// (~700ms after sending Down) reads it as an answered prompt well before
+	// this script's 1-second stray-key wait ends; tmux capture-pane includes
+	// scrollback, so `clear` alone never hid the dialog text from that
+	// re-check (see the trust dialog test above). The exact-stream verdict
+	// goes to a FILE once the wait completes, read separately below.
+	markerPath := filepath.Join(t.TempDir(), "bypass.marker")
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Bypass Permissions mode'\n" +
 		"printf '%s\\n' '1. No'\n" +
 		"printf '%s\\n' '2. Yes, I accept'\n" +
 		"IFS= read -r _line\n" +
-		"clear\n" +
+		"printf '%s' '$ '\n" +
 		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
-		"printf '%s' \"$_line\" | cat -v\n" +
-		"printf ':end:'\n" +
-		"if [ \"$_extra_status\" -eq 0 ]; then printf 'stray-key'; else printf 'clean'; fi\n" +
-		"printf '\\n'\n"
+		"{ printf '%s' \"$_line\" | cat -v; printf ':end:'; " +
+		"if [ \"$_extra_status\" -eq 0 ]; then printf 'stray-key'; else printf 'clean'; fi; } > " + markerPath + "\n"
 	scriptPath := filepath.Join(t.TempDir(), "bypass.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -547,15 +555,15 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	}
 
 	// See the trust dialog test above: the script's stray-key read waits a
-	// full second before printing its verdict, so this wait must clear that
+	// full second before writing its verdict, so this wait must clear that
 	// mark with margin.
 	time.Sleep(900 * time.Millisecond)
-	after, err := tm.CapturePane(sessionName, 30)
+	verdict, err := os.ReadFile(markerPath)
 	if err != nil {
-		t.Fatalf("CapturePane (after): %v", err)
+		t.Fatalf("reading verdict marker: %v", err)
 	}
-	if !strings.Contains(after, "^[[B:end:clean") {
-		t.Errorf("dismiss did not send exactly Down then Enter and nothing else\npane: %q", after)
+	if !strings.Contains(string(verdict), "^[[B:end:clean") {
+		t.Errorf("dismiss did not send exactly Down then Enter and nothing else: %q", verdict)
 	}
 }
 
@@ -580,18 +588,23 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 	// the complete key stream").
 	// The timeout is an integer second and the verdict reads the read's exit
 	// status, not $_extra's string value — see the trust dialog test above
-	// for why (codex Medium, startup_dialog_test.go:399, REVISION 3). clear
-	// happens right after the real key is consumed, before the stray-key
-	// wait — same reasoning as the trust dialog script above.
+	// for why (codex Medium, startup_dialog_test.go:399, REVISION 3). "$ "
+	// prints IMMEDIATELY after the real key is consumed — not after the
+	// stray-key wait — so DismissDialog's post-send re-check reads it as an
+	// answered prompt well before the 1-second wait ends; capture-pane
+	// includes scrollback, so `clear` alone never hid the dialog text from
+	// that re-check (see the trust dialog test above). The exact-stream
+	// verdict goes to a FILE once the wait completes.
+	markerPath := filepath.Join(t.TempDir(), "theme.marker")
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'\n" +
 		"printf '%s\\n' '1. Dark mode'\n" +
 		"printf '%s\\n' '2. Light mode'\n" +
 		"IFS= read -r _line\n" +
-		"clear\n" +
+		"printf '%s' '$ '\n" +
 		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
-		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter\\n'; " +
-		"else printf 'unexpected: line=%s extra=%s status=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\"; fi\n"
+		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter' > " + markerPath + "; " +
+		"else printf 'unexpected: line=%s extra=%s status=%s' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\" > " + markerPath + "; fi\n"
 	scriptPath := filepath.Join(t.TempDir(), "theme.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -610,15 +623,15 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 	}
 
 	// See the trust dialog test above: the script's stray-key read waits a
-	// full second before printing its verdict, so this wait must clear that
+	// full second before writing its verdict, so this wait must clear that
 	// mark with margin.
 	time.Sleep(900 * time.Millisecond)
-	after, err := tm.CapturePane(sessionName, 30)
+	verdict, err := os.ReadFile(markerPath)
 	if err != nil {
-		t.Fatalf("CapturePane (after): %v", err)
+		t.Fatalf("reading verdict marker: %v", err)
 	}
-	if !strings.Contains(after, "exact-single-enter") {
-		t.Errorf("dismiss did not send exactly one Enter and nothing else\npane: %q", after)
+	if string(verdict) != "exact-single-enter" {
+		t.Errorf("dismiss did not send exactly one Enter and nothing else: %q", verdict)
 	}
 }
 
