@@ -859,12 +859,17 @@ func TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead(t *testing.
 	}
 }
 
-// TestHandleFailedInjection_DirtyDeadLetterWriteFailureDropsRatherThanRequeues
+// TestHandleFailedInjection_DirtyDeadLetterWriteFailureRetainsRatherThanRequeues
 // covers the double-fault the review found: when the entry is composer-dirty
 // AND the dead-letter write itself fails, requeuing would resume the exact
-// retype-into-dirty-composer loop hq-g52db was filed to fix. The corrected
-// policy drops the message (loud log) instead of requeuing it.
-func TestHandleFailedInjection_DirtyDeadLetterWriteFailureDropsRatherThanRequeues(t *testing.T) {
+// retype-into-dirty-composer loop hq-g52db was filed to fix. It must never
+// be requeued into the active queue — but it must also be RETAINED, not
+// silently dropped: R2 (hq-g52db REVISION 3) prohibits dropping such an
+// entry, so it comes back in unresolved for the caller to leave un-acked
+// (this test's name and assertions previously described — and only
+// verified — the "drop" half; High 1 changed the policy and this now also
+// checks the retention half).
+func TestHandleFailedInjection_DirtyDeadLetterWriteFailureRetainsRatherThanRequeues(t *testing.T) {
 	townRoot := t.TempDir()
 	sessionName := "gt-crew-test"
 	blockDeadLetterDir(t, townRoot, sessionName)
@@ -874,7 +879,10 @@ func TestHandleFailedInjection_DirtyDeadLetterWriteFailureDropsRatherThanRequeue
 	}
 	deliverErr := fmt.Errorf("%w: %w", tmux.ErrSubmitNotVerified, tmux.ErrComposerDirty)
 
-	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+	unresolved := handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+	if len(unresolved) != 1 || unresolved[0].ID != "dirty-and-unwritable" {
+		t.Fatalf("unresolved = %v, want [dirty-and-unwritable] (retained, not dropped)", unresolved)
+	}
 
 	requeued, err := nudge.Drain(townRoot, sessionName)
 	if err != nil {

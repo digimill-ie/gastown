@@ -160,14 +160,22 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 		toRequeue = append(toRequeue, n)
 	}
 
+	// Merge into (not replace) unresolved: a batch can contain BOTH an
+	// unverified double-fault entry (already appended to unresolved above)
+	// AND a separately-bounded entry that only failed its ordinary
+	// requeue below — returning `failed` alone, or a bare `nil` when
+	// toRequeue was empty, silently dropped the double-fault entries from
+	// the caller's view, undoing the R2 retention fix above (found by
+	// TestPipeline_UnverifiedDoubleFault_RetainsClaim).
 	if len(toRequeue) == 0 {
-		return nil
+		return unresolved
 	}
 	failed, err := nudge.Requeue(townRoot, sessionName, toRequeue)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed for %d/%d entries: %v\n", source, sessionName, len(failed), len(toRequeue), err)
 	}
-	return failed
+	unresolved = append(unresolved, failed...)
+	return unresolved
 }
 
 // partitionForInjection splits claimed nudges into three groups: still
