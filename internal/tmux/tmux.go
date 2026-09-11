@@ -2215,6 +2215,178 @@ func (t *Tmux) DismissStartupDialogsBlind(session string) error {
 	return nil
 }
 
+// StartupDialogKind identifies a specific known Claude Code / Codex startup
+// dialog by its pane content. The empty value (DialogNone) means no known
+// dialog is currently visible.
+type StartupDialogKind string
+
+const (
+	// DialogNone means no known startup dialog is visible.
+	DialogNone StartupDialogKind = ""
+	// DialogWorkspaceTrust is the "trust this folder" / "Quick safety check"
+	// prompt. Dismissed with a single Enter (the safe option is pre-selected).
+	DialogWorkspaceTrust StartupDialogKind = "workspace-trust"
+	// DialogBypassPermissions is the "Bypass Permissions mode" warning shown
+	// with --dangerously-skip-permissions. Dismissed with Down then Enter.
+	DialogBypassPermissions StartupDialogKind = "bypass-permissions"
+	// DialogThemePicker is the first-run "Choose the text style" theme
+	// selection screen. Dismissed with a single Enter (default is
+	// pre-highlighted), matching AcceptWorkspaceTrustDialog's convention.
+	DialogThemePicker StartupDialogKind = "theme-picker"
+)
+
+// containsThemePickerDialog reports whether content shows the first-run
+// theme picker. This dialog was previously undetected: the helpers above
+// (AcceptWorkspaceTrustDialog, AcceptBypassPermissionsWarning) cover trust
+// and bypass only (gtn-k43 / hq-ooijo revision 2, codex finding).
+func containsThemePickerDialog(content string) bool {
+	if strings.Contains(content, "Choose the text style") {
+		return true
+	}
+	return strings.Contains(content, "Dark mode") && strings.Contains(content, "Light mode")
+}
+
+// ContainsBackgroundTaskHint reports whether content shows tmux/Claude Code's
+// own indicator that a command is running in the background, or that the
+// agent is actively streaming output. A session showing either is genuinely
+// busy: it must never be treated as a startup stall no matter how stale the
+// tmux activity fields read (gtn-k43, measured 2026-09-11 on gastown/furiosa).
+func ContainsBackgroundTaskHint(content string) bool {
+	return strings.Contains(content, "Running in the background") ||
+		strings.Contains(content, "esc to interrupt")
+}
+
+// lastKnownDialogLine scans content line by line and returns the line index
+// and kind of the LAST known dialog marker found, or (-1, DialogNone) if
+// none appear. Scanning line-by-line and keeping only the last match mirrors
+// lastStartupBlockerLine so both functions agree on "current" vs "historical".
+func lastKnownDialogLine(content string) (int, StartupDialogKind) {
+	lastLine := -1
+	lastKind := DialogNone
+	for i, line := range strings.Split(content, "\n") {
+		switch {
+		case containsWorkspaceTrustDialog(line):
+			lastLine, lastKind = i, DialogWorkspaceTrust
+		case strings.Contains(line, "Bypass Permissions mode"):
+			lastLine, lastKind = i, DialogBypassPermissions
+		case containsThemePickerDialog(line):
+			lastLine, lastKind = i, DialogThemePicker
+		}
+	}
+	return lastLine, lastKind
+}
+
+// classifyStartupDialog identifies which known startup dialog, if any, is
+// CURRENTLY showing in captured pane content. It rejects historical or
+// quoted dialog text still sitting in scrollback: if a prompt indicator
+// appears on a later line than the dialog marker, the dialog has already
+// been answered (same rule as promptAppearsAfterStartupBlocker).
+func classifyStartupDialog(content string) StartupDialogKind {
+	blockerLine, kind := lastKnownDialogLine(content)
+	if kind == DialogNone {
+		return DialogNone
+	}
+	if promptLine := lastPromptIndicatorLine(content); promptLine > blockerLine {
+		return DialogNone
+	}
+	return kind
+}
+
+// dialogDismissKeys returns the exact key sequence a given dialog kind
+// needs. Sending a kind's own sequence — never a blind Enter/Down/Enter — is
+// the fix for gtn-k43 / hq-ooijo: a session with no visible dialog now
+// receives zero keys instead of whatever the blind sequence used to send.
+func (t *Tmux) dialogDismissKeys(target string, kind StartupDialogKind) error {
+	switch kind {
+	case DialogWorkspaceTrust, DialogThemePicker:
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	case DialogBypassPermissions:
+		if _, err := t.run("send-keys", "-t", target, "Down"); err != nil {
+			return fmt.Errorf("sending Down for %s: %w", kind, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	default:
+		return fmt.Errorf("unknown dialog kind %q", kind)
+	}
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// dialogTarget resolves the pane that actually runs the agent, falling back
+// to the session name when no agent pane can be identified (single-pane
+// sessions, or legacy sessions without GT_PANE_ID).
+func (t *Tmux) dialogTarget(session string) string {
+	if pane, err := t.FindAgentPane(session); err == nil && pane != "" {
+		return pane
+	}
+	return session
+}
+
+// ClassifyVisibleDialog captures the agent pane's CURRENT content and
+// reports which known startup dialog, if any, is showing. It never sends
+// keys — pure detection, safe to call for dry-run surveys.
+func (t *Tmux) ClassifyVisibleDialog(session string) (StartupDialogKind, error) {
+	content, err := t.CapturePane(t.dialogTarget(session), 80)
+	if err != nil {
+		return DialogNone, fmt.Errorf("capturing pane: %w", err)
+	}
+	return classifyStartupDialog(content), nil
+}
+
+// DismissDialog sends the key sequence for kind, but only after revalidating
+// that the dialog is still showing at the moment of the send: a dialog can
+// disappear between detection and action (the agent dismissed it itself, or
+// the screen moved on), and a stale detection must never fire keys into
+// whatever replaced it. After sending, it re-captures the pane and confirms
+// the dialog actually cleared; if it did not, the caller should escalate
+// rather than report success.
+func (t *Tmux) DismissDialog(session string, kind StartupDialogKind) error {
+	target := t.dialogTarget(session)
+
+	recheck, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("revalidating pane: %w", err)
+	}
+	if classifyStartupDialog(recheck) != kind {
+		return fmt.Errorf("%s dialog no longer visible at send time", kind)
+	}
+
+	if err := t.dialogDismissKeys(target, kind); err != nil {
+		return err
+	}
+
+	after, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("verifying dismiss: %w", err)
+	}
+	if classifyStartupDialog(after) == kind {
+		return fmt.Errorf("%s dialog still visible after dismiss keys", kind)
+	}
+	return nil
+}
+
+// DetectAndDismissKnownDialog inspects the agent pane's current content and,
+// only when a specific known dialog is detected, sends the exact key
+// sequence that dialog needs. If no known dialog is visible it is a no-op —
+// window silence alone never authorises input (gtn-k43 / hq-ooijo). This
+// replaces DismissStartupDialogsBlind for stall remediation; that function
+// is retained for its original startup-time callers.
+func (t *Tmux) DetectAndDismissKnownDialog(session string) (StartupDialogKind, error) {
+	kind, err := t.ClassifyVisibleDialog(session)
+	if err != nil || kind == DialogNone {
+		return kind, err
+	}
+	if err := t.DismissDialog(session, kind); err != nil {
+		return kind, err
+	}
+	return kind, nil
+}
+
 // GetPaneCommand returns the current command running in a pane.
 // Returns "bash", "zsh", "claude", "node", etc.
 func (t *Tmux) GetPaneCommand(session string) (string, error) {
@@ -2366,6 +2538,26 @@ func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
 	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("parsing session activity: %w", err)
+	}
+	return time.Unix(timestamp, 0), nil
+}
+
+// GetWindowActivity returns the last activity time for a session's active
+// window (#{window_activity}). Unlike GetSessionActivity's #{session_activity},
+// which freezes at session-creation time on every session with no attached
+// client (hq-wisp-y46vn, measured on four live sessions), window_activity
+// keeps moving whenever the window's pane produces output — attached or not.
+// Use this, never GetSessionActivity, to decide whether a detached agent
+// session is still doing anything.
+func (t *Tmux) GetWindowActivity(session string) (time.Time, error) {
+	out, err := t.run("display-message", "-t", session, "-p", "#{window_activity}")
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing window activity: %w", err)
 	}
 	return time.Unix(timestamp, 0), nil
 }

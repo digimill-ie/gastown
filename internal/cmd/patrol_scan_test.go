@@ -221,3 +221,27 @@ func TestPatrolScanZombieItemSerialization(t *testing.T) {
 		t.Errorf("Error = %q, want %q", parsed.Error, "restart failed: tmux error")
 	}
 }
+
+// TestPatrolScanDryRunFlag verifies --dry-run is registered, defaults to
+// false, and is wired to the same patrolScanDryRun variable runPatrolScan
+// reads to skip zombie/completion mutations and all notifications (gtn-k43 /
+// hq-ooijo: a witness must be able to survey without acting).
+func TestPatrolScanDryRunFlag(t *testing.T) {
+	flag := patrolScanCmd.Flags().Lookup("dry-run")
+	if flag == nil {
+		t.Fatal("expected --dry-run flag to be registered on `gt patrol scan`")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--dry-run default = %q, want %q", flag.DefValue, "false")
+	}
+
+	old := patrolScanDryRun
+	defer func() { patrolScanDryRun = old }()
+
+	if err := flag.Value.Set("true"); err != nil {
+		t.Fatalf("setting --dry-run: %v", err)
+	}
+	if !patrolScanDryRun {
+		t.Error("patrolScanDryRun = false after setting --dry-run=true")
+	}
+}

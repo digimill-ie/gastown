@@ -20,6 +20,7 @@ var (
 	patrolScanNotify  bool
 	patrolScanRig     string
 	patrolScanVerbose bool
+	patrolScanDryRun  bool
 )
 
 var patrolScanCmd = &cobra.Command{
@@ -45,11 +46,17 @@ Use --notify to send mail when zombies with active work are detected.
 Long-running scan phases emit progress diagnostics to stderr so JSON stdout
 remains machine-readable while operators can see where a slow patrol is stuck.
 
+Use --dry-run to survey without acting: stall detection classifies pane
+content but never sends keys, and zombie/completion detection (which can
+restart sessions and create wisps) is skipped entirely rather than run
+unaudited. No notifications are sent in dry-run.
+
 Examples:
   gt patrol scan                    # Scan current rig
   gt patrol scan --rig gastown      # Scan specific rig
   gt patrol scan --json             # Machine-readable output
-  gt patrol scan --notify           # Send mail on zombie detection`,
+  gt patrol scan --notify           # Send mail on zombie detection
+  gt patrol scan --dry-run          # Survey only, no keys/restarts/mail`,
 	RunE: runPatrolScan,
 }
 
@@ -58,6 +65,7 @@ func init() {
 	patrolScanCmd.Flags().BoolVar(&patrolScanNotify, "notify", false, "Send mail to witness/mayor when active-work zombies are detected")
 	patrolScanCmd.Flags().StringVar(&patrolScanRig, "rig", "", "Rig to scan (default: infer from cwd or GT_RIG)")
 	patrolScanCmd.Flags().BoolVarP(&patrolScanVerbose, "verbose", "v", false, "Verbose output")
+	patrolScanCmd.Flags().BoolVar(&patrolScanDryRun, "dry-run", false, "Survey only — suppress all scan mutations and notifications")
 
 	patrolCmd.AddCommand(patrolScanCmd)
 }
@@ -158,15 +166,31 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// internally — it only uses the router for workspace context. Notifications
 	// are sent exclusively below via --notify, avoiding double-send.
 	diagnostics := cmd.ErrOrStderr()
-	zombieResult := runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
-		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
-	})
+
+	// Stall detection always runs — dryRun is threaded through so it still
+	// classifies and reports candidates, but sends zero keys (gtn-k43 /
+	// hq-ooijo). Zombie restart and completion routing are mutation-heavy
+	// paths this fix does not audit for dry-run safety, so --dry-run skips
+	// them entirely rather than run them unaudited.
+	var zombieResult *witness.DetectZombiePolecatsResult
+	var completionResult *witness.DiscoverCompletionsResult
+	if !patrolScanDryRun {
+		zombieResult = runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
+			return witness.DetectZombiePolecats(bd, workDir, rigName, router)
+		})
+	} else if diagnostics != nil {
+		fmt.Fprintln(diagnostics, "gt patrol scan: skipping zombie detection (--dry-run)")
+	}
 	stallResult := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
-		return witness.DetectStalledPolecats(workDir, rigName)
+		return witness.DetectStalledPolecats(workDir, rigName, patrolScanDryRun)
 	})
-	completionResult := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
-		return witness.DiscoverCompletions(bd, workDir, rigName, router)
-	})
+	if !patrolScanDryRun {
+		completionResult = runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
+			return witness.DiscoverCompletions(bd, workDir, rigName, router)
+		})
+	} else if diagnostics != nil {
+		fmt.Fprintln(diagnostics, "gt patrol scan: skipping completion discovery (--dry-run)")
+	}
 
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
@@ -174,8 +198,8 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// Notify when zombies with active work are detected.
 	// Always notify the mayor for active-work zombies (dead polecats with hooked
 	// beads) — this is the primary mechanism for detecting failed work. (GH #3584)
-	// Use --notify=false to suppress (e.g., in dry-run/testing contexts).
-	if zombieResult != nil {
+	// --dry-run suppresses all notifications, not only --notify=false.
+	if !patrolScanDryRun && zombieResult != nil {
 		activeZombies := countActiveWorkZombies(zombieResult)
 		if activeZombies > 0 {
 			sendZombieNotification(router, rigName, zombieResult, activeZombies)

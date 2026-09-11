@@ -1725,7 +1725,7 @@ func TestDetectStalledPolecatsResult_Empty(t *testing.T) {
 func TestDetectStalledPolecats_NoPolecats(t *testing.T) {
 	t.Parallel()
 	// Should handle missing polecats directory gracefully
-	result := DetectStalledPolecats("/nonexistent/path", "testrig")
+	result := DetectStalledPolecats("/nonexistent/path", "testrig", false)
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for nonexistent dir", result.Checked)
@@ -1748,7 +1748,7 @@ func TestDetectStalledPolecats_EmptyPolecatsDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(tmpDir, rigName, false)
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for empty polecats dir", result.Checked)
@@ -1781,7 +1781,7 @@ func TestDetectStalledPolecats_NoSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(tmpDir, rigName, false)
 
 	// Should count 2 polecats (skip hidden)
 	if result.Checked != 2 {
