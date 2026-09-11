@@ -101,13 +101,30 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 
 		// Also drain queued nudges (from --mode=queue or --mode=wait-idle fallback).
 		// The nudge queue is per-session; detect our session name.
+		//
+		// Uses DrainClaims, not Drain: Drain acks (deletes) each entry the
+		// instant it is read, BEFORE this function even attempts to print
+		// it — so a crash, or fmt.Print simply failing (e.g. a closed
+		// stdout), lost the nudge with no durable trace, and the print
+		// error was silently ignored besides (codex, mail_check.go:106,
+		// changes-requested at REVISION 3 — High 5). Order everywhere:
+		// claim, deliver, THEN ack — same discipline as nudge_poller.go
+		// and watchAndDeliver. Claims whose print fails are left un-acked
+		// so a future orphan sweep restores them instead of losing them.
 		sessionName := tmux.CurrentSessionName()
 		if sessionName != "" {
-			queuedNudges, drainErr := nudge.Drain(workDir, sessionName)
+			claims, drainErr := nudge.DrainClaims(workDir, sessionName)
 			if drainErr != nil {
 				fmt.Fprintf(os.Stderr, "gt mail check: nudge queue drain error: %v\n", drainErr)
-			} else if len(queuedNudges) > 0 {
-				fmt.Print(nudge.FormatForInjection(queuedNudges))
+			} else if len(claims) > 0 {
+				out := nudge.FormatForInjection(claimNudges(claims))
+				if _, printErr := fmt.Print(out); printErr != nil {
+					fmt.Fprintf(os.Stderr, "gt mail check: failed to print queued nudges, leaving claims unacked for recovery: %v\n", printErr)
+				} else {
+					nudge.AckClaims(claims, nil, func(c nudge.Claim, ackErr error) {
+						fmt.Fprintf(os.Stderr, "gt mail check: failed to ack nudge claim for %s: %v\n", c.Nudge.ID, ackErr)
+					})
+				}
 			}
 		}
 

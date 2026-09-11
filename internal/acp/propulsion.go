@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,26 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/townlog"
 )
+
+// errBusyDeferred signals that notify deliberately skipped InjectPrompt this
+// cycle (busy agent, non-urgent nudge) rather than attempting and failing
+// it. deliverNudges must not treat this like a successful delivery: only
+// notifyWithMeta's UI-only side channel saw the content, and the agent's
+// active turn never received it via InjectPrompt — acking the claim here
+// would delete it on the strength of that UI notification alone (codex,
+// propulsion.go:267, changes-requested at REVISION 3 — High 6).
+var errBusyDeferred = errors.New("nudge delivery deferred: session busy")
+
+// claimRecoveryInterval periodically re-invokes deliverNudges even when no
+// new nudge arrives. A retained claim (busy-deferred delivery, or a
+// requeue/dead-letter write that itself failed) produces no filesystem
+// event of its own — WatcherForSession only fires on a fresh .json file —
+// so without this, such a claim has no recovery trigger and can sit until
+// an unrelated new nudge happens to arrive (codex, propulsion.go:190,
+// changes-requested at REVISION 3 — High 7). Deliberately shorter than
+// nudge's staleClaimThreshold (5 minutes) so a busy-deferred claim gets
+// re-checked well before it would otherwise be swept as orphaned.
+const claimRecoveryInterval = 60 * time.Second
 
 // acpDebugLogger provides file-based debug logging for ACP when GT_ACP_DEBUG=1.
 // It lazily opens the log file on first use and keeps it open for the session.
@@ -183,11 +204,17 @@ func (p *Propeller) eventLoop() {
 	}
 	defer func() { _ = watcher.Close() }()
 
+	ticker := time.NewTicker(claimRecoveryInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case <-watcher.Events():
+			p.deliverNudges()
+		case <-ticker.C:
+			// Periodic recovery sweep — see claimRecoveryInterval.
 			p.deliverNudges()
 		}
 	}
@@ -257,6 +284,19 @@ func (p *Propeller) deliverNudges() {
 	}
 
 	if err := p.notify(text, meta, urgent); err != nil {
+		if errors.Is(err, errBusyDeferred) {
+			// Busy, non-urgent: leave every claim retained (un-acked)
+			// rather than requeuing. Requeuing would write a fresh .json
+			// file immediately, which the watcher would see right away —
+			// if the agent stays busy, that becomes a tight requeue/re-
+			// notify loop. Leaving the claim as-is means the next
+			// recovery trigger (a new nudge, or claimRecoveryInterval)
+			// picks it up via DrainClaims' own orphan sweep once
+			// staleClaimThreshold passes. Acking here would delete the
+			// claim on nothing more than a UI-only notification (High 6).
+			debugLog(p.townRoot, "[Propeller] deliverNudges: session busy, retaining %d claim(s) for later recovery", len(claims))
+			return
+		}
 		requeue(fmt.Sprintf("delivery failure: %v", err))
 		style.PrintWarning("ACP Propeller failed to deliver nudge: %v", err)
 		return
@@ -395,5 +435,11 @@ func (p *Propeller) notify(text string, meta map[string]string, urgent bool) err
 			return err
 		}
 	}
-	return nil
+	// Busy and non-urgent: InjectPrompt was deliberately skipped, not
+	// attempted and failed. Report this distinctly from success — only
+	// notifyWithMeta's UI-only side channel ran, and the agent's active
+	// turn never received the content — so the caller does not ack the
+	// claim on the strength of a skip (codex, propulsion.go:267,
+	// changes-requested at REVISION 3 — High 6).
+	return errBusyDeferred
 }

@@ -417,20 +417,28 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 				return
 			}
 
-			toInject, exhausted := partitionForInjection(claims)
+			toInject, exhausted, staleInFlight := partitionForInjection(claims)
 			var unresolved []nudge.QueuedNudge
 			if len(exhausted) > 0 {
 				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(exhausted), errAttemptsExhausted)...)
+			}
+			if len(staleInFlight) > 0 {
+				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(staleInFlight), errPriorAttemptUnresolved)...)
 			}
 			if len(toInject) > 0 {
 				// Persist the incremented Attempts count before injecting —
 				// see Claim.MarkAttempt and the matching comment in
 				// nudge_poller.go.
-				toInject = markAttempts(sourceIdleWatcher, sessionName, toInject)
-				formatted := nudge.FormatForInjection(claimNudges(toInject))
-				if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
-					fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
-					unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(toInject), err)...)
+				marked, failedPersist := markAttempts(sourceIdleWatcher, sessionName, toInject)
+				if len(failedPersist) > 0 {
+					unresolved = append(unresolved, claimNudges(failedPersist)...)
+				}
+				if len(marked) > 0 {
+					formatted := nudge.FormatForInjection(claimNudges(marked))
+					if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+						fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+						unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(marked), err)...)
+					}
 				}
 			}
 
