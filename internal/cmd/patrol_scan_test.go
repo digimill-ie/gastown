@@ -387,3 +387,93 @@ func writeZeroStallThresholds(t *testing.T, townRoot string) {
 		t.Fatal(err)
 	}
 }
+
+// TestPatrolScan_DryRun_SkipsZombieAndCompletionPhases closes the gap codex
+// found in the dry-run coverage above: TestPatrolScan_DryRun_NeverSendsKeys
+// only exercises the stall/dialog path (DetectStalledPolecats runs
+// unconditionally and is itself dryRun-aware), so it cannot fail if the
+// `if !patrolScanDryRun` guard around zombie detection, completion discovery,
+// or the zombie notification were removed — those phases have their own,
+// separate mutation-heavy paths (reap/restart, bead/mail routing) that
+// TestPatrolScanDryRunFlag (flag wiring only) also does not reach (codex
+// finding, patrol_scan_test.go:355). Rather than construct a live zombie or
+// completion fixture, this asserts on the phase's own start/skip diagnostic
+// line — a direct read of which branch actually ran, not an inference from
+// its absence of side effects.
+func TestPatrolScan_DryRun_SkipsZombieAndCompletionPhases(t *testing.T) {
+	newEmptyRigFixture := func(t *testing.T) (townRoot, rigName string) {
+		t.Helper()
+		townRoot = t.TempDir()
+		rigName = "testrig"
+		if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Empty polecats dir: DetectZombiePolecats and DiscoverCompletions
+		// both os.ReadDir it and return immediately on an empty result, so
+		// this never touches Dolt/bd — only whether the phase ran at all is
+		// under test here, not what it finds.
+		if err := os.MkdirAll(filepath.Join(townRoot, rigName, "polecats"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GT_TMUX_SOCKET", "")
+		return townRoot, rigName
+	}
+
+	runScanCapturingDiagnostics := func(t *testing.T, townRoot, rigName string, dryRun bool) string {
+		t.Helper()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(townRoot); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		origRig, origDryRun, origJSON := patrolScanRig, patrolScanDryRun, patrolScanJSON
+		patrolScanRig, patrolScanDryRun, patrolScanJSON = rigName, dryRun, false
+		t.Cleanup(func() { patrolScanRig, patrolScanDryRun, patrolScanJSON = origRig, origDryRun, origJSON })
+
+		var stderr bytes.Buffer
+		patrolScanCmd.SetErr(&stderr)
+		t.Cleanup(func() { patrolScanCmd.SetErr(nil) })
+
+		if err := runPatrolScan(patrolScanCmd, nil); err != nil {
+			t.Fatalf("runPatrolScan (dryRun=%v): %v", dryRun, err)
+		}
+		return stderr.String()
+	}
+
+	t.Run("dry-run skips both phases", func(t *testing.T) {
+		townRoot, rigName := newEmptyRigFixture(t)
+		diagnostics := runScanCapturingDiagnostics(t, townRoot, rigName, true)
+
+		if !strings.Contains(diagnostics, "skipping zombie detection (--dry-run)") {
+			t.Errorf("dry-run did not skip zombie detection\ndiagnostics: %s", diagnostics)
+		}
+		if !strings.Contains(diagnostics, "skipping completion discovery (--dry-run)") {
+			t.Errorf("dry-run did not skip completion discovery\ndiagnostics: %s", diagnostics)
+		}
+		if strings.Contains(diagnostics, "starting zombie detection") {
+			t.Errorf("dry-run started zombie detection anyway\ndiagnostics: %s", diagnostics)
+		}
+		if strings.Contains(diagnostics, "starting completion discovery") {
+			t.Errorf("dry-run started completion discovery anyway\ndiagnostics: %s", diagnostics)
+		}
+	})
+
+	t.Run("without dry-run, the identical setup runs both phases (control)", func(t *testing.T) {
+		townRoot, rigName := newEmptyRigFixture(t)
+		diagnostics := runScanCapturingDiagnostics(t, townRoot, rigName, false)
+
+		if !strings.Contains(diagnostics, "starting zombie detection") {
+			t.Errorf("zombie detection did not run without --dry-run — this control proves the skip assertions above test something real\ndiagnostics: %s", diagnostics)
+		}
+		if !strings.Contains(diagnostics, "starting completion discovery") {
+			t.Errorf("completion discovery did not run without --dry-run\ndiagnostics: %s", diagnostics)
+		}
+	})
+}

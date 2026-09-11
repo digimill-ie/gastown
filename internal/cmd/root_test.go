@@ -306,11 +306,13 @@ func TestIsDryRunInvocation(t *testing.T) {
 // TestPersistentPreRunDryRunSuppressesSharedMutations proves that a command
 // declaring --dry-run=true suppresses persistentPreRun's own mutations, not
 // only its RunE logic: the rigs.json fallback copy (session.InitRegistry's
-// write side effect) and this session's own heartbeat touch. Both
-// polarities, run against identical fixtures: dry-run writes neither file;
-// the same setup without dry-run writes both (gtn-m7s / hq-ooijo revision 2,
-// codex finding on root.go:133,242 — "a dry-run flag must suppress ALL scan
-// mutations").
+// write side effect), this session's own heartbeat touch, and the
+// cmd-usage.jsonl telemetry append (logCommandUsage used to run before the
+// dry-run check, so a dry-run invocation still wrote it — codex finding,
+// root.go:137). Both polarities, run against identical fixtures: dry-run
+// writes none of the three; the same setup without dry-run writes all three
+// (gtn-m7s / hq-ooijo revision 2, codex finding on root.go:133,242 — "a
+// dry-run flag must suppress ALL scan mutations").
 //
 // NOTE: cannot use t.Parallel() — mutates cwd, env, and global registries.
 func TestPersistentPreRunDryRunSuppressesSharedMutations(t *testing.T) {
@@ -358,8 +360,24 @@ func TestPersistentPreRunDryRunSuppressesSharedMutations(t *testing.T) {
 		return filepath.Join(townRoot, ".runtime", "heartbeats", sessionName+".json")
 	}
 
-	t.Run("dry-run writes neither file", func(t *testing.T) {
+	// logUsagePath is a package-level var pointing at the REAL
+	// $GT_HOME/.gt/cmd-usage.jsonl by default. Redirect it to a per-subtest
+	// temp file so persistentPreRun's telemetry write is observable and
+	// isolated, instead of silently appending to (and being masked by) the
+	// developer's own real usage log (codex Low, root_test.go:372 — neither
+	// polarity redirected it before this).
+	origLogUsagePath := logUsagePath
+	t.Cleanup(func() { logUsagePath = origLogUsagePath })
+	redirectUsageLog := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "cmd-usage.jsonl")
+		logUsagePath = path
+		return path
+	}
+
+	t.Run("dry-run writes neither file, nor the usage log", func(t *testing.T) {
 		townRoot := newFixture(t)
+		usageLog := redirectUsageLog(t)
 		t.Setenv("GT_SESSION", "gt-test-dryrun-session")
 		t.Setenv("GT_ROLE", "polecat")
 
@@ -379,10 +397,14 @@ func TestPersistentPreRunDryRunSuppressesSharedMutations(t *testing.T) {
 		if _, err := os.Stat(heartbeatPath(townRoot, "gt-test-dryrun-session")); !os.IsNotExist(err) {
 			t.Errorf("heartbeat file present after --dry-run (stat err=%v) — dry-run must not touch the caller's own heartbeat", err)
 		}
+		if _, err := os.Stat(usageLog); !os.IsNotExist(err) {
+			t.Errorf("cmd-usage.jsonl present after --dry-run (stat err=%v) — dry-run must not write telemetry either", err)
+		}
 	})
 
-	t.Run("without dry-run, the identical setup writes both (control)", func(t *testing.T) {
+	t.Run("without dry-run, the identical setup writes all three (control)", func(t *testing.T) {
 		townRoot := newFixture(t)
+		usageLog := redirectUsageLog(t)
 		t.Setenv("GT_SESSION", "gt-test-live-session")
 		t.Setenv("GT_ROLE", "polecat")
 
@@ -398,6 +420,9 @@ func TestPersistentPreRunDryRunSuppressesSharedMutations(t *testing.T) {
 		}
 		if _, err := os.Stat(heartbeatPath(townRoot, "gt-test-live-session")); err != nil {
 			t.Errorf("heartbeat file missing without --dry-run: %v", err)
+		}
+		if _, err := os.Stat(usageLog); err != nil {
+			t.Errorf("cmd-usage.jsonl missing without --dry-run: %v", err)
 		}
 	})
 }

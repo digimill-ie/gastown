@@ -2080,6 +2080,15 @@ func lastStartupBlockerLine(content string) int {
 	}
 	last := -1
 	for i, line := range strings.Split(content, "\n") {
+		// A live composer line that happens to QUOTE a marker string (e.g.
+		// "› explain Bypass Permissions mode") is not the dialog itself —
+		// same-line quoted text must never register as a blocker, or a
+		// healthy session gets killed for typing about the dialog it just
+		// dismissed (codex finding, tmux.go:2313 — the sibling bug in
+		// classifyStartupDialog/lastKnownDialogLine below).
+		if lineIsPromptIndicator(line) {
+			continue
+		}
 		for _, marker := range markers {
 			if strings.Contains(line, marker) {
 				last = i
@@ -2111,6 +2120,16 @@ var promptSuffixes = []string{">", "›", "$", "%", "#", "❯"}
 // classifyStartupDialog / tmux.go:2289).
 var composerPrefixes = []string{">", "›", "❯"}
 
+// dialogOptionLinePattern matches a numbered option immediately after a
+// composer-lead glyph (e.g. "1. Dark mode", "2. Yes, I accept"). A dialog's
+// own selection cursor is drawn with the same glyphs as a live composer
+// ("❯ 1. Dark mode"), so without this check a still-showing dialog's own
+// option line reads as an already-answered composer and suppresses
+// detection of the dialog that is rendering it (codex finding, tmux.go:2145
+// — "a selection cursor reads as composer"; startup_dialog_test.go:38,43
+// omitted this case entirely).
+var dialogOptionLinePattern = regexp.MustCompile(`^\d+\.\s`)
+
 // containsPromptIndicator checks if pane content contains a prompt indicator
 // that signals a shell or agent is ready (no dialog blocking it).
 func containsPromptIndicator(content string) bool {
@@ -2137,14 +2156,26 @@ func lineIsPromptIndicator(line string) bool {
 		}
 	}
 	for _, prefix := range composerPrefixes {
-		// Require the prefix alone ("> ") or followed by a space before any
-		// typed text ("› review this") — not merely HasPrefix — so a dialog
-		// option glyph that happens to start with the same character (a
-		// TUI selection cursor immediately butted against other text) isn't
-		// misread as a live composer.
-		if trimmed == prefix || strings.HasPrefix(trimmed, prefix+" ") {
+		if trimmed == prefix {
 			return true
 		}
+		// Require the prefix followed by a space before any typed text
+		// ("› review this") — not merely HasPrefix — so a dialog option
+		// glyph that happens to start with the same character (a TUI
+		// selection cursor immediately butted against other text) isn't
+		// misread as a live composer.
+		rest, ok := strings.CutPrefix(trimmed, prefix+" ")
+		if !ok {
+			continue
+		}
+		// A numbered option right after the lead glyph is the dialog's own
+		// selection cursor pointing at one of its choices, not user-typed
+		// composer content — reject it so a still-showing dialog's option
+		// list can't read as an already-answered prompt.
+		if dialogOptionLinePattern.MatchString(rest) {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -2288,6 +2319,17 @@ func lastKnownDialogLine(content string) (int, StartupDialogKind) {
 	lastLine := -1
 	lastKind := DialogNone
 	for i, line := range strings.Split(content, "\n") {
+		// A live composer line that QUOTES dialog text on the same line
+		// (e.g. "› explain Bypass Permissions mode") is not the dialog —
+		// it is typed content that happens to mention it. The old
+		// line-order check ("does a prompt appear on a LATER line") only
+		// caught historical text in earlier scrollback; it never rejected
+		// the marker and its resolving prompt sharing one line, so
+		// detection AND revalidation both authorised keys into that
+		// composer (codex High, tmux.go:2313, REVISION 2).
+		if lineIsPromptIndicator(line) {
+			continue
+		}
 		switch {
 		case containsWorkspaceTrustDialog(line):
 			lastLine, lastKind = i, DialogWorkspaceTrust

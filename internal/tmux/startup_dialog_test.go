@@ -84,6 +84,38 @@ func TestClassifyStartupDialog(t *testing.T) {
 			content: "",
 			want:    DialogNone,
 		},
+		{
+			// codex High, tmux.go:2313, REVISION 2: quoted dialog text and its
+			// own resolving composer prefix on ONE line must not authorise a
+			// dismissal. The old check only rejected a prompt on a LATER
+			// line than the marker; same-line was never covered, so this
+			// composer read as "the bypass dialog, not yet answered".
+			name:    "composer line quotes bypass dialog text on the same line — must not authorise a dismissal",
+			content: "› explain Bypass Permissions mode",
+			want:    DialogNone,
+		},
+		{
+			name:    "composer line quotes workspace trust text on the same line — must not authorise a dismissal",
+			content: "› what happens if I decline to trust this folder?",
+			want:    DialogNone,
+		},
+		{
+			// codex Medium, tmux.go:2145: a dialog's own selection cursor
+			// ("❯ 1. Dark mode") shares composerPrefixes' lead glyph with a
+			// live composer. Without excluding numbered-option lines, this
+			// reads as "a real composer appeared after the dialog marker",
+			// i.e. already answered — even though the dialog is still
+			// showing. Fixtures previously omitted the cursor glyph
+			// entirely (startup_dialog_test.go:38,43 at review time).
+			name:    "theme picker with a real selection cursor on an option line",
+			content: "Choose the text style that looks best with your terminal:\n❯ 1. Dark mode\n  2. Light mode",
+			want:    DialogThemePicker,
+		},
+		{
+			name:    "bypass dialog with a real selection cursor on an option line",
+			content: "Bypass Permissions mode\n❯ 1. No\n  2. Yes, I accept",
+			want:    DialogBypassPermissions,
+		},
 	}
 
 	for _, tt := range tests {
@@ -285,6 +317,51 @@ func TestDetectAndDismissKnownDialog_NoDialogSendsNoKeys(t *testing.T) {
 	}
 }
 
+// TestDetectAndDismissKnownDialog_QuotedDialogTextInComposerSendsNoKeys is
+// the live-tmux regression for the codex High finding on tmux.go:2313: an
+// idle composer whose typed text happens to QUOTE a dialog marker, on the
+// SAME line as the composer's own lead glyph, must never be read as that
+// dialog. `read` blocks so the composer line stays exactly as printed
+// (no trailing shell prompt would otherwise land on a later line and mask
+// the bug via the old line-order check).
+func TestDetectAndDismissKnownDialog_QuotedDialogTextInComposerSendsNoKeys(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-detect-quoted-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.SendKeys(sessionName, "clear; printf '%s' '› explain Bypass Permissions mode'; read -r _dlg"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	before, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (before): %v", err)
+	}
+
+	kind, err := tm.DetectAndDismissKnownDialog(sessionName)
+	if err != nil {
+		t.Fatalf("DetectAndDismissKnownDialog: %v", err)
+	}
+	if kind != DialogNone {
+		t.Fatalf("kind = %q, want DialogNone (quoted dialog text on the composer's own line must not authorise a dismissal)", kind)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	after, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if before != after {
+		t.Errorf("pane content changed — a key reached the composer quoting dialog text\nbefore: %q\nafter:  %q", before, after)
+	}
+}
+
 // TestDetectAndDismissKnownDialog_DismissesTrustDialog verifies the positive
 // case: a real dialog is detected and its specific key sequence is sent.
 func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
@@ -297,10 +374,24 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// `read` blocks until a key arrives, holding the dialog text on screen;
-	// once dismissed it clears and prints a marker so verification sees the
-	// dialog text is genuinely gone (not just re-printed by a loop).
-	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg; clear; echo dialog-dismissed"); err != nil {
+	// `read` blocks until a key arrives, holding the dialog text on screen.
+	// The first read captures whatever preceded that key raw (so a stray Down
+	// or other key sent BEFORE Enter shows up as literal bytes in _line, not
+	// silently discarded); a second, non-blocking read with a short timeout
+	// then checks for anything sent AFTER Enter. Only when both are empty
+	// does the script print the "exact-single-enter" marker — a substring
+	// check for a fixed marker string alone cannot distinguish "exactly one
+	// Enter" from "Down then Enter" or "Enter then a stray extra key", since
+	// both leave that same marker text present somewhere in the pane (codex
+	// finding: startup_dialog_test.go:326 — "positive tests assert
+	// substrings, not the complete key stream").
+	script := "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'\n" +
+		"IFS= read -r _line\n" +
+		"IFS= read -rsn1 -t 0.2 _extra\n" +
+		"clear\n" +
+		"if [ -z \"$_line\" ] && [ -z \"$_extra\" ]; then printf 'exact-single-enter\\n'; " +
+		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi"
+	if err := tm.SendKeys(sessionName, script); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -314,17 +405,17 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	}
 
 	// Assert the EXACT key effect, not just the returned status: the trust
-	// dialog's own key is a single Enter, which the `read` in the fixture
-	// consumes, printing the marker. A return status alone cannot tell a
-	// correctly-dismissed dialog from one that merely stopped matching the
-	// classifier for an unrelated reason (codex finding on this file).
-	time.Sleep(200 * time.Millisecond)
+	// dialog's own key is a single Enter, nothing before and nothing after.
+	// A return status alone cannot tell a correctly-dismissed dialog from
+	// one that merely stopped matching the classifier for an unrelated
+	// reason (codex finding on this file).
+	time.Sleep(400 * time.Millisecond)
 	after, err := tm.CapturePane(sessionName, 30)
 	if err != nil {
 		t.Fatalf("CapturePane (after): %v", err)
 	}
-	if !strings.Contains(after, "dialog-dismissed") {
-		t.Errorf("pane does not show the post-dismiss marker — Enter was not the key actually sent\npane: %q", after)
+	if !strings.Contains(after, "exact-single-enter") {
+		t.Errorf("dismiss did not send exactly one Enter and nothing else\npane: %q", after)
 	}
 }
 
@@ -346,11 +437,23 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	// ESC-[-B escape sequence, which the tty driver does not interpret as a
 	// control character — it lands as literal bytes in the line, terminated
 	// by the Enter that follows. `cat -v` renders the ESC byte visibly
-	// (^[) so the test can assert BOTH keys were sent, in order, not just
-	// that the dialog text disappeared.
-	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Bypass Permissions mode'; "+
-		"printf '%s\\n' '1. No'; printf '%s\\n' '2. Yes, I accept'; "+
-		"IFS= read -r _line; clear; printf '%s' \"$_line\" | cat -v; printf ':end\\n'"); err != nil {
+	// (^[) so the test can assert BOTH keys were sent, in order. A second,
+	// non-blocking read with a short timeout then checks for anything sent
+	// AFTER that Enter, so a stray extra key following dismissal is caught
+	// too — a bare substring check on "^[[B:end" alone would still pass with
+	// trailing garbage appended after it (codex finding: startup_dialog_test.go:326
+	// — "positive tests assert substrings, not the complete key stream").
+	script := "clear; printf '%s\\n' 'Bypass Permissions mode'\n" +
+		"printf '%s\\n' '1. No'\n" +
+		"printf '%s\\n' '2. Yes, I accept'\n" +
+		"IFS= read -r _line\n" +
+		"IFS= read -rsn1 -t 0.2 _extra\n" +
+		"clear\n" +
+		"printf '%s' \"$_line\" | cat -v\n" +
+		"printf ':end:'\n" +
+		"if [ -n \"$_extra\" ]; then printf 'stray-key'; else printf 'clean'; fi\n" +
+		"printf '\\n'"
+	if err := tm.SendKeys(sessionName, script); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -363,13 +466,13 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 		t.Errorf("kind = %q, want %q", kind, DialogBypassPermissions)
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	after, err := tm.CapturePane(sessionName, 30)
 	if err != nil {
 		t.Fatalf("CapturePane (after): %v", err)
 	}
-	if !strings.Contains(after, "^[[B:end") {
-		t.Errorf("pane does not show the Down escape sequence before Enter — Down then Enter was not sent as expected\npane: %q", after)
+	if !strings.Contains(after, "^[[B:end:clean") {
+		t.Errorf("dismiss did not send exactly Down then Enter and nothing else\npane: %q", after)
 	}
 }
 
@@ -386,8 +489,19 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'; "+
-		"printf '%s\\n' '1. Dark mode'; printf '%s\\n' '2. Light mode'; read -r _dlg; clear; echo theme-dismissed"); err != nil {
+	// Same exact-stream technique as the trust dialog test above: only a
+	// single Enter, nothing before it and nothing after, prints the marker
+	// (codex finding: startup_dialog_test.go:326 — "positive tests assert
+	// substrings, not the complete key stream").
+	script := "clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'\n" +
+		"printf '%s\\n' '1. Dark mode'\n" +
+		"printf '%s\\n' '2. Light mode'\n" +
+		"IFS= read -r _line\n" +
+		"IFS= read -rsn1 -t 0.2 _extra\n" +
+		"clear\n" +
+		"if [ -z \"$_line\" ] && [ -z \"$_extra\" ]; then printf 'exact-single-enter\\n'; " +
+		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi"
+	if err := tm.SendKeys(sessionName, script); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -400,13 +514,13 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 		t.Errorf("kind = %q, want %q", kind, DialogThemePicker)
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	after, err := tm.CapturePane(sessionName, 30)
 	if err != nil {
 		t.Fatalf("CapturePane (after): %v", err)
 	}
-	if !strings.Contains(after, "theme-dismissed") {
-		t.Errorf("pane does not show the post-dismiss marker — Enter was not sent as expected\npane: %q", after)
+	if !strings.Contains(after, "exact-single-enter") {
+		t.Errorf("dismiss did not send exactly one Enter and nothing else\npane: %q", after)
 	}
 }
 

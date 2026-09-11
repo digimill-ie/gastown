@@ -172,6 +172,36 @@ func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName strin
 	}
 }
 
+// writeTestStartupHeartbeat writes a heartbeat carrying
+// polecat.StartupHeartbeatContext — the launcher's own untouched placeholder
+// (session_manager.go), as opposed to one a `gt` command's persistentPreRun
+// has since overwritten. Stamps the live session's real incarnation so
+// MatchesIncarnation passes, isolating the Context distinction under test.
+func writeTestStartupHeartbeat(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState) {
+	t.Helper()
+	created, err := tmux.NewTmux().GetSessionCreatedUnix(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionCreatedUnix(%s): %v", sessionName, err)
+	}
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hb := polecat.SessionHeartbeat{
+		Timestamp:   ts,
+		State:       state,
+		Context:     polecat.StartupHeartbeatContext,
+		Incarnation: created,
+	}
+	data, err := json.Marshal(hb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeMalformedHeartbeat(t *testing.T, townRoot, sessionName string) {
 	t.Helper()
 	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
@@ -202,6 +232,34 @@ func TestDetectStalledPolecats_StaleWorkingHeartbeat_ZeroKeys(t *testing.T) {
 	}
 	if len(result.Stalled) != 0 {
 		t.Errorf("Stalled = %+v, want empty (stale-working heartbeat must never be remediated)", result.Stalled)
+	}
+}
+
+// TestDetectStalledPolecats_StaleStartupHeartbeat_NotSuppressed is the sibling
+// polarity to the test above, for the codex Medium finding on
+// handlers.go:2357: a heartbeat still carrying StartupHeartbeatContext — the
+// launcher's own placeholder, never overwritten by a `gt` command — must NOT
+// get the same indefinite trust as a genuinely agent-driven stale-working
+// heartbeat. AcceptStartupDialogs/WaitForRuntimeReady are non-fatal, so this
+// is exactly what a session parked on an unhandled startup dialog looks
+// like: state=working forever, with nobody ever having run a `gt` command to
+// prove it. It must fall through to the dialog-content check below instead
+// of being skipped forever.
+func TestDetectStalledPolecats_StaleStartupHeartbeat_NotSuppressed(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	writeTestStartupHeartbeat(t, f.townRoot, f.sessionName, time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking)
+	time.Sleep(50 * time.Millisecond)
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if result.Checked != 1 {
+		t.Fatalf("Checked = %d, want 1", result.Checked)
+	}
+	// No known dialog is showing (plain idle shell), so a correctly
+	// distrusted startup placeholder must fall through and be reported —
+	// not silently skipped as if it were agent-verified working.
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "no-known-dialog" {
+		t.Errorf("Stalled = %+v, want one entry with Action=no-known-dialog "+
+			"(an untouched startup heartbeat must not suppress detection forever)", result.Stalled)
 	}
 }
 

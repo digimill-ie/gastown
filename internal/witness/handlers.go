@@ -2354,7 +2354,18 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 			if time.Since(hb.Timestamp) < polecat.SessionHeartbeatStaleThreshold {
 				continue // Fresh v2 heartbeat — agent is alive, not stalled
 			}
-			if hb.EffectiveState() == polecat.HeartbeatWorking {
+			// The launcher's own startup heartbeat (StartupHeartbeatContext)
+			// is written unconditionally, even when AcceptStartupDialogs or
+			// WaitForRuntimeReady failed non-fatally (session_manager.go:512,521)
+			// — so "state=working" here can mean either a genuinely busy
+			// agent, or one parked on a dialog that never ran a single `gt`
+			// command to refresh it. A real agent-driven heartbeat (Context
+			// overwritten by persistentPreRun's first touch) is still
+			// trusted indefinitely while stale-but-working; an untouched,
+			// stale startup placeholder is not — it falls through to the
+			// content/dialog checks below instead of being skipped forever
+			// (codex Medium, handlers.go:2357).
+			if hb.EffectiveState() == polecat.HeartbeatWorking && hb.Context != polecat.StartupHeartbeatContext {
 				continue // Stale but self-reported working — never a stall
 			}
 		}

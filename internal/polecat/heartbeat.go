@@ -98,6 +98,21 @@ func TouchSessionHeartbeat(townRoot, sessionName string) {
 	TouchSessionHeartbeatWithState(townRoot, sessionName, HeartbeatWorking, "", "")
 }
 
+// StartupHeartbeatContext marks the ONE heartbeat the launcher itself writes,
+// at the end of session startup (session_manager.go), before the agent has
+// run a single `gt` command. Every heartbeat after that — including the very
+// first one a `gt` command's own persistentPreRun writes — overwrites this
+// with Context="". Readers use that to tell "the agent has made at least one
+// verified move since launch" apart from "nothing has happened since the
+// launcher's own optimistic write": AcceptStartupDialogs and
+// WaitForRuntimeReady are both non-fatal (session_manager.go:512,521), so a
+// process left parked on an unhandled dialog gets this same state="working"
+// heartbeat as a session that started cleanly — an untouched, stale one of
+// these must not be trusted to suppress stall detection forever the way a
+// genuinely agent-driven stale/working heartbeat is (codex Medium,
+// handlers.go:2357).
+const StartupHeartbeatContext = "session-startup"
+
 // TouchSessionHeartbeatWithState writes a heartbeat with explicit state information.
 // Used by gt done (state="exiting") and gt heartbeat (state="stuck"). See gt-3vr5.
 // This is best-effort: errors are silently ignored.

@@ -121,21 +121,29 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Log command usage telemetry (fire-and-forget, excludes tap/signal)
-	logCommandUsage(cmd, args)
+	// A command that declares its own boolean --dry-run flag and has it set
+	// must not mutate anything on disk — including every shared pre-run side
+	// effect below: the command-usage telemetry append, the registry.json
+	// fallback write, and this session's own heartbeat touch. See gtn-m7s /
+	// hq-ooijo revision 2, which named these specifically for
+	// `gt patrol scan --dry-run`. Computed before the first of those writes
+	// (telemetry) so dry-run suppresses ALL of them, not just the two named
+	// there — a dry-run invocation was still appending to cmd-usage.jsonl
+	// because this check used to run after that write (codex finding,
+	// root.go:137).
+	dryRun := isDryRunInvocation(cmd)
+
+	// Log command usage telemetry (fire-and-forget, excludes tap/signal).
+	// Skipped under --dry-run: see above.
+	if !dryRun {
+		logCommandUsage(cmd, args)
+	}
 
 	// Initialize session prefix registry and agent registry from town root.
 	// Try CWD detection first, then fall back to GT_TOWN_ROOT / GT_ROOT env vars.
 	// Env var fallback ensures commands invoked from outside the town directory
 	// (e.g., "gt agents menu" via a cross-socket tmux binding) still connect to
 	// the correct town socket rather than silently using the wrong server.
-	// A command that declares its own boolean --dry-run flag and has it set
-	// must not mutate anything on disk — including the shared pre-run side
-	// effects below (registry.json fallback write, this session's own
-	// heartbeat touch). See gtn-m7s / hq-ooijo revision 2, which named these
-	// two specifically for `gt patrol scan --dry-run`.
-	dryRun := isDryRunInvocation(cmd)
-
 	if townRoot := detectTownRootFromCwd(); townRoot != "" {
 		var err error
 		if dryRun {
