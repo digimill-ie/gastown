@@ -385,13 +385,26 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	// both leave that same marker text present somewhere in the pane (codex
 	// finding: startup_dialog_test.go:326 — "positive tests assert
 	// substrings, not the complete key stream").
-	script := "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'\n" +
+	//
+	// A real SCRIPT FILE, run via `bash <path>` — not a multi-line string
+	// handed straight to SendKeys — because SendKeys pastes its whole
+	// argument as one literal burst: a `read` mid-script would consume the
+	// NEXT queued line of that same paste as its own input instead of
+	// blocking on a separately-sent key, corrupting the intended sequence
+	// (same reasoning as TestDismissDialog_BypassDialogClearedBetweenDownAndEnter
+	// below).
+	script := "#!/bin/bash\n" +
+		"clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'\n" +
 		"IFS= read -r _line\n" +
 		"IFS= read -rsn1 -t 0.2 _extra\n" +
 		"clear\n" +
 		"if [ -z \"$_line\" ] && [ -z \"$_extra\" ]; then printf 'exact-single-enter\\n'; " +
-		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi"
-	if err := tm.SendKeys(sessionName, script); err != nil {
+		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi\n"
+	scriptPath := filepath.Join(t.TempDir(), "trust.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := tm.SendKeys(sessionName, "clear; bash "+scriptPath); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -443,7 +456,11 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	// too — a bare substring check on "^[[B:end" alone would still pass with
 	// trailing garbage appended after it (codex finding: startup_dialog_test.go:326
 	// — "positive tests assert substrings, not the complete key stream").
-	script := "clear; printf '%s\\n' 'Bypass Permissions mode'\n" +
+	//
+	// A script FILE, not an inline multi-line string handed to SendKeys —
+	// see the trust dialog test above for why.
+	script := "#!/bin/bash\n" +
+		"clear; printf '%s\\n' 'Bypass Permissions mode'\n" +
 		"printf '%s\\n' '1. No'\n" +
 		"printf '%s\\n' '2. Yes, I accept'\n" +
 		"IFS= read -r _line\n" +
@@ -452,8 +469,12 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 		"printf '%s' \"$_line\" | cat -v\n" +
 		"printf ':end:'\n" +
 		"if [ -n \"$_extra\" ]; then printf 'stray-key'; else printf 'clean'; fi\n" +
-		"printf '\\n'"
-	if err := tm.SendKeys(sessionName, script); err != nil {
+		"printf '\\n'\n"
+	scriptPath := filepath.Join(t.TempDir(), "bypass.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := tm.SendKeys(sessionName, "clear; bash "+scriptPath); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -489,19 +510,26 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// Same exact-stream technique as the trust dialog test above: only a
-	// single Enter, nothing before it and nothing after, prints the marker
-	// (codex finding: startup_dialog_test.go:326 — "positive tests assert
-	// substrings, not the complete key stream").
-	script := "clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'\n" +
+	// Same exact-stream technique as the trust dialog test above — including
+	// running it as a script FILE, not an inline multi-line string handed to
+	// SendKeys (same reasoning as that test) — only a single Enter, nothing
+	// before it and nothing after, prints the marker (codex finding:
+	// startup_dialog_test.go:326 — "positive tests assert substrings, not
+	// the complete key stream").
+	script := "#!/bin/bash\n" +
+		"clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'\n" +
 		"printf '%s\\n' '1. Dark mode'\n" +
 		"printf '%s\\n' '2. Light mode'\n" +
 		"IFS= read -r _line\n" +
 		"IFS= read -rsn1 -t 0.2 _extra\n" +
 		"clear\n" +
 		"if [ -z \"$_line\" ] && [ -z \"$_extra\" ]; then printf 'exact-single-enter\\n'; " +
-		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi"
-	if err := tm.SendKeys(sessionName, script); err != nil {
+		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi\n"
+	scriptPath := filepath.Join(t.TempDir(), "theme.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := tm.SendKeys(sessionName, "clear; bash "+scriptPath); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
