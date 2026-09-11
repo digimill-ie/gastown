@@ -123,6 +123,12 @@ func ListDeadLetters(townRoot, session string) ([]DeadLetterEntry, error) {
 // fresh nudge (new expiry, attempts reset to zero, original ID preserved so
 // it can still be traced back to this dead-letter record), and removes the
 // dead-letter file. Returns an error if no entry with that ID exists.
+//
+// Claims the entry file (atomic rename) before acting on it, so two
+// concurrent replays of the same ID cannot both re-enqueue it: only one
+// rename succeeds, the loser sees ENOENT/a missing match and returns "not
+// found" rather than double-queuing the payload (codex, deadletter.go:160,
+// changes-requested at 08964387).
 func ReplayDeadLetter(townRoot, session, id string) error {
 	dir := deadLetterDir(townRoot, session)
 
@@ -151,6 +157,14 @@ func ReplayDeadLetter(townRoot, session, id string) error {
 			continue
 		}
 
+		// Atomically claim this entry before acting on it. If a concurrent
+		// replay already renamed it away, this fails and we fall through to
+		// "not found" instead of racing to re-enqueue the same payload twice.
+		claimPath := path + ".replaying"
+		if err := os.Rename(path, claimPath); err != nil {
+			return fmt.Errorf("dead-letter entry %q for session %q is already being replayed", id, session)
+		}
+
 		replay := e.QueuedNudge
 		replay.Attempts = 0
 		replay.LastError = ""
@@ -158,9 +172,12 @@ func ReplayDeadLetter(townRoot, session, id string) error {
 		replay.ExpiresAt = time.Time{} // Enqueue recomputes from Priority + Timestamp
 
 		if err := Enqueue(townRoot, session, replay); err != nil {
+			// Restore the claim so the entry isn't stranded under a
+			// ".replaying" name with no way to list or retry it.
+			_ = os.Rename(claimPath, path)
 			return fmt.Errorf("re-enqueuing dead-letter entry %s: %w", id, err)
 		}
-		if err := os.Remove(path); err != nil {
+		if err := os.Remove(claimPath); err != nil {
 			return fmt.Errorf("removing dead-letter entry %s after replay: %w", id, err)
 		}
 		return nil

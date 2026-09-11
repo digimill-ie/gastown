@@ -175,8 +175,40 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 	return nil
 }
 
+// Claim is a durably-claimed queue entry returned by DrainClaims: the
+// underlying file has been atomically renamed out of the pending queue (so
+// no other Drain/DrainClaims call can pick it up) but NOT yet deleted. The
+// caller resolves it by calling Ack once the entry's outcome — successful
+// delivery, a durable dead-letter write, or a durable requeue write — is
+// itself durable. An unresolved Claim is not lost: it sits on disk under its
+// .claimed name, and a future Drain/DrainClaims call's orphan sweep restores
+// it to the pending queue once staleClaimThreshold has passed.
+type Claim struct {
+	Nudge QueuedNudge
+	path  string
+}
+
+// Ack removes the claim's underlying file. Call this only AFTER the entry's
+// outcome is itself durable (written to the dead-letter store, rewritten to
+// the queue via Enqueue, or successfully delivered) — acking first and
+// crashing before that write is exactly the queue.go:305 ordering bug this
+// type exists to close (hq-g52db rework, codex changes-requested at
+// 08964387). Removing an already-removed file is not an error.
+func (c Claim) Ack() error {
+	if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("acking nudge claim: %w", err)
+	}
+	return nil
+}
+
 // Drain reads and removes all queued nudges for a session, returning them
-// in FIFO order. This is called by the hook to pick up pending nudges.
+// in FIFO order. This is called by the hook to pick up pending nudges: the
+// hook always "delivers" by returning formatted content to the caller, which
+// cannot itself fail the way a tmux injection can, so immediate deletion is
+// safe here. Callers that attempt a tmux injection (which CAN fail, and
+// whose failure must be durably dead-lettered or requeued before the
+// original entry disappears) should use DrainClaims instead — see its doc
+// and Claim.Ack.
 //
 // Uses rename-then-process to prevent concurrent Drain calls from delivering
 // the same nudge twice: each file is atomically renamed to a .claimed suffix
@@ -184,16 +216,40 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 //
 // Expired nudges (past ExpiresAt) are silently discarded during drain.
 // Orphaned .claimed files from crashed drainers are swept if older than 5 minutes.
-//
-// CAVEAT (named at review, hq-g52db): the claimed file is removed as soon as
-// it is unmarshaled, before the caller attempts delivery. If the process dies
-// between that removal and the caller's dead-letter or requeue write, the
-// entry is lost with no durable trace. Callers should write dead-letter (or
-// requeue) as the very next step after a failed delivery to keep this window
-// as short as possible; closing it fully would require deferring the removal
-// until the caller acks, which is a wider change to every Drain caller
-// (including the turn-boundary hook drain) and is out of scope here.
 func Drain(townRoot, session string) ([]QueuedNudge, error) {
+	claims, err := DrainClaims(townRoot, session)
+	if err != nil {
+		return nil, err
+	}
+	nudges := make([]QueuedNudge, 0, len(claims))
+	for _, c := range claims {
+		nudges = append(nudges, c.Nudge)
+		if ackErr := c.Ack(); ackErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove processed claim: %v\n", ackErr)
+		}
+	}
+	return nudges, nil
+}
+
+// DrainClaims is like Drain but does not delete each entry's claim file —
+// it returns Claims that the caller must explicitly Ack once the entry's
+// outcome is durable. This closes the crash window Drain's immediate
+// deletion left open for callers that attempt tmux delivery: previously the
+// claimed file was removed as soon as it was unmarshaled, before the caller
+// even attempted delivery, so a crash between that removal and the caller's
+// dead-letter or requeue write lost the entry with no durable trace
+// (queue.go:305 vs cmd/nudge_failure.go:57, codex changes-requested at
+// 08964387). With DrainClaims, a crash before Ack leaves the original
+// .claimed file in place: a future Drain/DrainClaims call's orphan sweep
+// restores it to the pending queue once staleClaimThreshold has passed, so
+// the entry survives in whichever of the two places (a fresh dead-letter/
+// queue write, or the still-present original claim) the crash landed before.
+//
+// Expired nudges (past ExpiresAt) are discarded immediately (no ack needed —
+// there is nothing more to deliver). Deferred nudges are unclaimed and left
+// in the queue. Orphaned .claimed files from crashed drainers are swept if
+// older than staleClaimThreshold.
+func DrainClaims(townRoot, session string) ([]Claim, error) {
 	dir := queueDir(townRoot, session)
 
 	entries, err := os.ReadDir(dir)
@@ -238,7 +294,7 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 		return entries[i].Name() < entries[j].Name()
 	})
 
-	var nudges []QueuedNudge
+	var claims []Claim
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -299,15 +355,10 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 			continue
 		}
 
-		nudges = append(nudges, n)
-
-		// Remove the claimed file after successful processing
-		if rmErr := os.Remove(claimPath); rmErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to remove processed claim %s: %v\n", entry.Name(), rmErr)
-		}
+		claims = append(claims, Claim{Nudge: n, path: claimPath})
 	}
 
-	return nudges, nil
+	return claims, nil
 }
 
 // Pending returns the count of queued nudges for a session without draining.
