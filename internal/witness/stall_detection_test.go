@@ -278,7 +278,7 @@ func TestDetectStalledPolecats_DryRun_NeverSendsKeys(t *testing.T) {
 	if err := f.tm.SendKeys(f.sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg; clear; echo dialog-dismissed"); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
 
 	result := DetectStalledPolecats(f.townRoot, f.rigName, true)
 	if len(result.Stalled) != 1 {
