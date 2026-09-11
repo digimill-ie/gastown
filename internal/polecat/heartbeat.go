@@ -424,20 +424,33 @@ func IsStartupWindowOpen(townRoot, sessionName, sessionID string, created int64)
 	if malformed {
 		return StartupWindowStatus{Open: false, Reason: "heartbeat file unreadable or malformed"}
 	}
-	if hb != nil && hb.Writer == HeartbeatWriterAgent {
-		if hb.SessionID == "" || hb.Incarnation == 0 {
-			return StartupWindowStatus{Open: false, Reason: "agent heartbeat has unknown identity"}
+	if hb != nil {
+		if hb.Writer == "" {
+			// A PRESENT heartbeat with no Writer field at all was written by
+			// a pre-v2.2 binary that predates this distinction entirely —
+			// we cannot tell whether it came from a launcher or an agent.
+			// Fail CLOSED rather than widen: treating an unattributable
+			// legacy heartbeat the same as our own launcher placeholder
+			// (the prior behavior) left the window open indefinitely for
+			// any session still running the previous binary, which is
+			// exactly the case where a dismiss must NOT fire blind
+			// (regression 1, gtn-s8i / codex review 5640759300).
+			return StartupWindowStatus{Open: false, Reason: "legacy heartbeat has no writer field, failing closed"}
 		}
-		if hb.SessionID == sessionID && hb.Incarnation == created {
-			return StartupWindowStatus{Open: false, Reason: "startup window closed (agent heartbeat)"}
+		if hb.Writer == HeartbeatWriterAgent {
+			if hb.SessionID == "" || hb.Incarnation == 0 {
+				return StartupWindowStatus{Open: false, Reason: "agent heartbeat has unknown identity"}
+			}
+			if hb.SessionID == sessionID && hb.Incarnation == created {
+				return StartupWindowStatus{Open: false, Reason: "startup window closed (agent heartbeat)"}
+			}
+			// Different incarnation — irrelevant.
 		}
-		// Different incarnation — irrelevant.
+		// hb.Writer == HeartbeatWriterLauncher never closes the window by
+		// itself (item 3): AcceptStartupDialogs/WaitForRuntimeReady are
+		// non-fatal, so the launcher writes this even when a dialog is left
+		// unhandled.
 	}
-	// hb.Writer == HeartbeatWriterLauncher, or Writer is empty (a pre-v2.2
-	// or legacy heartbeat we cannot attribute to the agent), never closes
-	// the window by itself (item 3): AcceptStartupDialogs/WaitForRuntimeReady
-	// are non-fatal, so the launcher writes this even when a dialog is left
-	// unhandled.
 
 	return StartupWindowStatus{Open: true, Reason: "no evidence the agent has started"}
 }

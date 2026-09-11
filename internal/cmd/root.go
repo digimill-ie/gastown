@@ -121,23 +121,8 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// A command that declares its own boolean --dry-run flag and has it set
-	// must not mutate anything on disk — including every shared pre-run side
-	// effect below: the command-usage telemetry append, the registry.json
-	// fallback write, and this session's own heartbeat touch. See gtn-m7s /
-	// hq-ooijo revision 2, which named these specifically for
-	// `gt patrol scan --dry-run`. Computed before the first of those writes
-	// (telemetry) so dry-run suppresses ALL of them, not just the two named
-	// there — a dry-run invocation was still appending to cmd-usage.jsonl
-	// because this check used to run after that write (codex finding,
-	// root.go:137).
-	dryRun := isDryRunInvocation(cmd)
-
-	// Log command usage telemetry (fire-and-forget, excludes tap/signal).
-	// Skipped under --dry-run: see above.
-	if !dryRun {
-		logCommandUsage(cmd, args)
-	}
+	// Log command usage telemetry (fire-and-forget, excludes tap/signal)
+	logCommandUsage(cmd, args)
 
 	// Initialize session prefix registry and agent registry from town root.
 	// Try CWD detection first, then fall back to GT_TOWN_ROOT / GT_ROOT env vars.
@@ -145,13 +130,7 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// (e.g., "gt agents menu" via a cross-socket tmux binding) still connect to
 	// the correct town socket rather than silently using the wrong server.
 	if townRoot := detectTownRootFromCwd(); townRoot != "" {
-		var err error
-		if dryRun {
-			err = session.InitRegistryReadOnly(townRoot)
-		} else {
-			err = session.InitRegistry(townRoot)
-		}
-		if err != nil {
+		if err := session.InitRegistry(townRoot); err != nil {
 			fmt.Fprintf(os.Stderr, "WARNING: failed to initialize town registry: %v\n", err)
 		}
 	}
@@ -172,10 +151,8 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Touch polecat session heartbeat on every gt command (gt-qjtq: ZFC liveness fix).
 	// This is best-effort and non-blocking — the heartbeat file signals that the agent
 	// is alive and actively running gt commands. Used by isSessionProcessDead to
-	// determine liveness without PID signal probing. Skipped under --dry-run.
-	if !dryRun {
-		touchPolecatHeartbeat()
-	}
+	// determine liveness without PID signal probing.
+	touchPolecatHeartbeat()
 
 	// Skip beads check for exempt commands
 	if beadsExempt || isRoleCommand(cmd) {
@@ -189,23 +166,6 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "   Run %s for details.\n\n", style.Dim.Render("gt doctor"))
 	}
 	return nil
-}
-
-// isDryRunInvocation reports whether the invoked command declares a boolean
-// --dry-run flag and it is set. Generic by design — any command that opts
-// into a --dry-run contract gets the shared pre-run mutation suppression
-// (registry fallback write, heartbeat touch) for free, without hardcoding
-// individual command names here.
-func isDryRunInvocation(cmd *cobra.Command) bool {
-	if cmd == nil {
-		return false
-	}
-	if flag := cmd.Flags().Lookup("dry-run"); flag != nil {
-		if v, err := cmd.Flags().GetBool("dry-run"); err == nil {
-			return v
-		}
-	}
-	return false
 }
 
 func isCommandOrAncestorExempt(cmd *cobra.Command, exemptions map[string]bool) bool {

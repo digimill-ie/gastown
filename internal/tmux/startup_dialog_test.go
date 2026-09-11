@@ -241,16 +241,6 @@ func TestContainsBackgroundTaskHint(t *testing.T) {
 			want:    true,
 		},
 		{
-			// codex review 5637995408, Medium, tmux.go:2296: this guard
-			// duplicated its own "esc to interrupt" substring check instead
-			// of reusing hasBusyIndicator, so it went stale the same way —
-			// current Claude Code (v2.1.268) renders neither text while
-			// thinking. Measured live, gtn-bl1.
-			name:    "claude spinner busy, no esc-to-interrupt text anywhere",
-			content: "❯ write the essay\n\n· Billowing… (29s · thinking more)\n\n" + claudeComposerRule + "\n❯ ",
-			want:    true,
-		},
-		{
 			name:    "ordinary idle prompt",
 			content: "> ",
 			want:    false,

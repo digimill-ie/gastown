@@ -42,7 +42,7 @@ var HungSessionThresholdMinutes = int(constants.HungSessionThreshold.Minutes())
 // loaded for liveness checks.
 func initRegistryFromWorkDir(workDir string) {
 	if townRoot, err := workspace.Find(workDir); err == nil && townRoot != "" {
-		initRegistryFromTownRoot(townRoot, false)
+		initRegistryFromTownRoot(townRoot)
 	}
 }
 
@@ -116,21 +116,10 @@ func defaultBDRun(workDir string, args ...string) error {
 
 // initRegistryFromTownRoot initializes registries from a known town root,
 // logging any errors so that misconfiguration is observable.
-//
-// readOnly skips the registry's rigs.json fallback-copy write
-// (session.InitRegistryReadOnly instead of session.InitRegistry) — required
-// by a dry-run caller, which must not mutate anything on disk (gtn-m7s /
-// hq-ooijo revision 2: "a dry-run flag must suppress ALL scan mutations").
-func initRegistryFromTownRoot(townRoot string, readOnly bool) {
+func initRegistryFromTownRoot(townRoot string) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
-	var err error
-	if readOnly {
-		err = session.InitRegistryReadOnly(townRoot)
-	} else {
-		err = session.InitRegistry(townRoot)
-	}
-	if err != nil {
+	if err := session.InitRegistry(townRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "witness: failed to initialize town registry: %v\n", err)
 	}
 }
@@ -737,7 +726,7 @@ func findMRBeadForBranch(bd *BdCli, workDir, branch string) string {
 // nudges would be stuck forever. Direct delivery is safe: if the
 // agent is busy, text buffers in tmux and is processed at next prompt.
 func nudgeRefinery(townRoot, rigName string) error {
-	initRegistryFromTownRoot(townRoot, false)
+	initRegistryFromTownRoot(townRoot)
 	sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
 
 	// Check if refinery is running
@@ -1642,7 +1631,7 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot, false)
+	initRegistryFromTownRoot(townRoot)
 
 	// Load witness thresholds from config (fallback to compiled-in defaults).
 	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
@@ -2280,7 +2269,7 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot, dryRun)
+	initRegistryFromTownRoot(townRoot)
 
 	// Load witness thresholds from config (fallback to compiled-in defaults).
 	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
@@ -2532,7 +2521,7 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot, false)
+	initRegistryFromTownRoot(townRoot)
 
 	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
 	entries, err := os.ReadDir(polecatsDir)
@@ -3029,7 +3018,7 @@ func DetectOrphanedBeads(bd *BdCli, workDir, rigName string, router *mail.Router
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot, false)
+	initRegistryFromTownRoot(townRoot)
 
 	// Scan both in_progress and hooked beads — resetAbandonedBead handles both
 	// states, and orphaned beads can be stuck in either.
@@ -3167,7 +3156,7 @@ func DetectOrphanedMolecules(bd *BdCli, workDir, rigName string, router *mail.Ro
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot, false)
+	initRegistryFromTownRoot(townRoot)
 
 	// Step 1: List beads that could have attached molecules.
 	// Slung beads start as status=hooked; polecats may change them to in_progress.

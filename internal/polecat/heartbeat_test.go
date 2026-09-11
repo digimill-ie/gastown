@@ -521,16 +521,18 @@ func TestIsStartupWindowOpen_LauncherHeartbeatMatchesCurrent_Open(t *testing.T) 
 	}
 }
 
-// TestIsStartupWindowOpen_LegacyHeartbeatNoWriter_Open covers a pre-v2.2
-// heartbeat file with no Writer field at all (Writer == ""): must be
-// treated the same as a launcher write — never proof the agent has run.
-func TestIsStartupWindowOpen_LegacyHeartbeatNoWriter_Open(t *testing.T) {
+// TestIsStartupWindowOpen_LegacyHeartbeatNoWriter_Closed covers a pre-v2.2
+// heartbeat file with no Writer field at all (Writer == ""): we cannot tell
+// launcher from agent, so this must fail CLOSED — never send keys into a
+// session we cannot positively attribute to our own fresh launcher
+// placeholder (regression 1, gtn-s8i / codex review 5640759300).
+func TestIsStartupWindowOpen_LegacyHeartbeatNoWriter_Closed(t *testing.T) {
 	townRoot := t.TempDir()
 	writeTestHeartbeatForWindow(t, townRoot, "gt-test-legacy-hb", "$3", 5000, "")
 
 	status := IsStartupWindowOpen(townRoot, "gt-test-legacy-hb", "$3", 5000)
-	if !status.Open {
-		t.Errorf("Open = false (%s), want true — a legacy heartbeat with no Writer field must not close the window", status.Reason)
+	if status.Open {
+		t.Error("Open = true, want false — a legacy heartbeat with no Writer field must fail closed")
 	}
 }
 

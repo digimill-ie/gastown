@@ -2420,14 +2420,13 @@ func containsThemePickerDialog(content string) bool {
 // tmux activity fields read (gtn-k43, measured 2026-09-11 on gastown/furiosa).
 //
 // Streaming detection is delegated to hasBusyIndicator — the SAME check
-// WaitForIdle/IsIdle use — rather than a second hardcoded "esc to
-// interrupt" substring test. The two used to diverge, and diverging is how
-// this guard went stale: current Claude Code (v2.1.268) no longer renders
-// "esc to interrupt" at all while thinking or running a tool (measured
-// live, gtn-bl1: "· Billowing… (29s · thinking more)",
-// "Bash(...)\n  ⎿  Running… (11s · timeout 1m)"), so a Claude polecat
-// mid-turn could read as idle for the guard's entire stall threshold
-// (codex review 5637995408, Medium; witness measurement, hq-wisp-y46vn).
+// WaitForIdle/IsIdle use — rather than a second hardcoded "esc to interrupt"
+// substring test, so the two never diverge. Known gap, out of scope for
+// this fix: current Claude Code (v2.1.268) does not always render "esc to
+// interrupt" while thinking or running a tool, so a Claude polecat mid-turn
+// can still read as idle here. Widening hasBusyIndicator itself would
+// change IsIdle/WaitForIdle for every agent town-wide; that is not this
+// fix's blast radius (gtn-s8i / codex review 5640759300).
 func ContainsBackgroundTaskHint(content string) bool {
 	if strings.Contains(content, "Running in the background") {
 		return true
@@ -3813,9 +3812,9 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 // renders in its status bar while actively generating. Detection of "is the
 // agent working?" scrapes the pane for any of these (see hasBusyIndicator), and
 // that signal underpins IsIdle, WaitForIdle, and the nudge Escape-suppression in
-// shouldSendEscape. Codex still surfaces "esc to interrupt" (measured live,
-// v0.154.0: "Working (9s • esc to interrupt)"); if an agent uses different
-// wording, add it here — that is the only place that needs to change.
+// shouldSendEscape. Claude Code, Codex, and Gemini all surface "esc to
+// interrupt"; if an agent uses different wording, add it here — that is the only
+// place that needs to change.
 //
 // FRAGILITY (gastownhall/gastown#4240): this couples to upstream TUI status
 // text. Scraping the status bar cannot detect a silent upstream rename on its
@@ -3827,26 +3826,10 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 // counterpart.
 var busyIndicators = []string{"esc to interrupt"}
 
-// claudeSpinnerPattern matches Claude Code's own "actively working" status
-// line, independent of "esc to interrupt": current Claude Code (v2.1.268)
-// no longer renders that text at all, while thinking OR while running a
-// tool. Measured live (gtn-bl1): "· Billowing… (29s · thinking more)",
-// "✢ Pontificating… (16s · ↓ 276 tokens)", "Running… (11s · timeout 1m)".
-// Claude Code randomizes the leading glyph and the gerund verb every turn,
-// so no fixed substring survives across turns — but every observed variant
-// shares one shape: an ellipsis, then a parenthesized elapsed-duration
-// group. That shape is not something a person or an agent types in
-// ordinary composer text (codex review 5637995408, Medium; witness
-// measurement 2026-09-11, hq-wisp-y46vn).
-var claudeSpinnerPattern = regexp.MustCompile(`…\s*\(\d+(h|m|s)\b`)
-
 func hasBusyIndicator(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return false
-	}
-	if claudeSpinnerPattern.MatchString(trimmed) {
-		return true
 	}
 	for _, marker := range busyIndicators {
 		marker = strings.TrimSpace(marker)
