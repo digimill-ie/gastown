@@ -59,18 +59,18 @@ func hasPython3() bool {
 	return err == nil
 }
 
-// startFakeComposerSession launches a tmux session running fakeComposerScript
-// as its sole process (no shell), pre-rendering "❯ <needle>" as a static,
-// stranded composer line. Returns the session name; the caller is
-// responsible for killing it.
-func startFakeComposerSession(t *testing.T, tm *Tmux, needle string) string {
+// startFakeComposerSession launches a tmux session running the given fake
+// composer script (fakeComposerScript or fakeStaticComposerScript) as its
+// sole process (no shell), pre-rendering "❯ <needle>" as a static composer
+// line. Returns the session name; the caller is responsible for killing it.
+func startFakeComposerSession(t *testing.T, tm *Tmux, script, needle string) string {
 	t.Helper()
 	if !hasPython3() {
 		t.Skip("python3 not installed")
 	}
 
 	scriptPath := filepath.Join(t.TempDir(), "fake_composer.py")
-	if err := os.WriteFile(scriptPath, []byte(fakeComposerScript), 0644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(script), 0644); err != nil {
 		t.Fatalf("writing fake composer script: %v", err)
 	}
 
@@ -106,7 +106,7 @@ func startFakeComposerSession(t *testing.T, tm *Tmux, needle string) string {
 // concurrent, unrelated write left the composer holding something else.
 func TestSubmitComposer_DirtyStateHeldAfterEnter(t *testing.T) {
 	tm := newTestTmux(t)
-	sessionName := startFakeComposerSession(t, tm, "an unrelated draft")
+	sessionName := startFakeComposerSession(t, tm, fakeStaticComposerScript, "an unrelated draft")
 
 	err := tm.submitComposer(sessionName, "resume the patrol", DefaultReadyPromptPrefix, false)
 	if err == nil {
@@ -128,7 +128,7 @@ func TestSubmitComposer_DirtyStateHeldAfterEnter(t *testing.T) {
 func TestSubmitComposer_StrandedComposerRecovered(t *testing.T) {
 	tm := newTestTmux(t)
 	const needle = "resume the patrol"
-	sessionName := startFakeComposerSession(t, tm, needle)
+	sessionName := startFakeComposerSession(t, tm, fakeComposerScript, needle)
 
 	// recoveryValidated=true: this is the runtime-validated path (the
 	// production caller gates this on recoveryKeystrokesValidatedForSession,

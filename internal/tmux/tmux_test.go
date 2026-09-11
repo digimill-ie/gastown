@@ -2608,6 +2608,96 @@ func TestSessionPrefixPattern_AlwaysIncludesGTAndHQ(t *testing.T) {
 	}
 }
 
+// TestRecoveryKeystrokesValidatedForSession_ExplicitlyBlankFailsClosed
+// covers the empty-vs-unset inversion fix: a GT_AGENT registered but
+// explicitly blank is NOT the same as "never set" and must fail closed
+// (codex, tmux.go:3441, changes-requested at 08964387/95f841e6 rework).
+func TestRecoveryKeystrokesValidatedForSession_ExplicitlyBlankFailsClosed(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-blank-agent-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", ""); err != nil {
+		t.Fatalf("SetEnvironment: %v", err)
+	}
+
+	if got := recoveryKeystrokesValidatedForSession(tm, sessionName); got {
+		t.Error(`recoveryKeystrokesValidatedForSession() = true for an explicitly blank GT_AGENT, want false (unknown runtime, not "no GT_AGENT set")`)
+	}
+}
+
+// TestRecoveryKeystrokesValidatedForSession_UnsetDefaultsTrue is the
+// companion true case: GT_AGENT never registered for the session at all
+// (a genuine tmux "unknown variable" response, not a lookup failure) keeps
+// the historic majority-Claude default.
+func TestRecoveryKeystrokesValidatedForSession_UnsetDefaultsTrue(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-unset-agent-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(200 * time.Millisecond)
+
+	if got := recoveryKeystrokesValidatedForSession(tm, sessionName); !got {
+		t.Error("recoveryKeystrokesValidatedForSession() = false for a session with no GT_AGENT registered at all, want true (historic Claude default)")
+	}
+}
+
+// TestSkipEscapeForSession_ExplicitlyBlankFailsSafe covers the Escape-side
+// fix: an unknown runtime (lookup failure OR explicitly blank GT_AGENT)
+// must fail toward skip=true (do NOT send Escape), the opposite polarity
+// from recoveryKeystrokesValidatedForSession's safe direction, since
+// Escape — not C-j — is the destructive action for a runtime where it
+// cancels in-flight generation (codex, tmux.go:1797/1844/1946,
+// changes-requested at 08964387/95f841e6 rework).
+func TestSkipEscapeForSession_ExplicitlyBlankFailsSafe(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-blank-escape-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", ""); err != nil {
+		t.Fatalf("SetEnvironment: %v", err)
+	}
+
+	if got := skipEscapeForSession(tm, sessionName); !got {
+		t.Error("skipEscapeForSession() = false for an explicitly blank GT_AGENT, want true (unknown runtime, fail toward not sending Escape)")
+	}
+}
+
+func TestSkipEscapeForSession_LookupFailureFailsSafe(t *testing.T) {
+	tm := NewTmuxWithSocket("gt-test-no-such-socket-skip-escape")
+	if got := skipEscapeForSession(tm, "any-session"); !got {
+		t.Error("skipEscapeForSession() = false on a lookup failure, want true")
+	}
+}
+
+func TestSkipEscapeForSession_KnownClaudeSession(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-claude-escape-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", "claude"); err != nil {
+		t.Fatalf("SetEnvironment: %v", err)
+	}
+
+	if got := skipEscapeForSession(tm, sessionName); got {
+		t.Error("skipEscapeForSession() = true for a known Claude session, want false (Escape is safe/expected for Claude)")
+	}
+}
+
 func TestGetKeyBinding_NoExistingBinding(t *testing.T) {
 	tm := newTestTmux(t)
 	// Query a key that almost certainly has no binding

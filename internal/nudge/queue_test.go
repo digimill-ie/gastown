@@ -988,6 +988,114 @@ func TestEnqueuePreservesExplicitID(t *testing.T) {
 	}
 }
 
+// TestPollerRestart_RecoversAndDeliversExactlyOnce is one of the six
+// REVISION-3-required tests codex found not covered: a poller restart mid-
+// entry. TestDrainClaims_UnackedClaimSurvivesACrash (line ~467) checks only
+// that the claim survives and is RESTORED to the queue — codex named that
+// PARTIAL, because it stops short of a restarted consumer actually
+// completing delivery (codex: "queue_test.go:467 checks retention, not a
+// restarted consumer"). This test carries the same crash scenario all the
+// way through: MarkAttempt (the durable pre-injection persist a real
+// poller performs — see Claim.MarkAttempt), a simulated crash with no Ack,
+// staleness-driven recovery, and a second "poller instance" that
+// successfully claims, sees the CORRECT persisted Attempts count, and
+// completes delivery. The payload is checked to have been claimable
+// exactly once at every step — never twice, never zero.
+func TestPollerRestart_RecoversAndDeliversExactlyOnce(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-restart-test"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "resume"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// First "poller instance": drains, persists an incremented Attempts
+	// count as it would just before a live tmux injection attempt (Claim.
+	// MarkAttempt), then crashes before Ack.
+	claims1, err := DrainClaims(townRoot, session)
+	if err != nil || len(claims1) != 1 {
+		t.Fatalf("first DrainClaims: claims=%d err=%v", len(claims1), err)
+	}
+	if err := claims1[0].MarkAttempt(); err != nil {
+		t.Fatalf("MarkAttempt: %v", err)
+	}
+	// ... crash here: no Ack, no dead-letter, no requeue ...
+
+	// Nothing is deliverable yet — the entry is claimed, not queued or
+	// stale, so a second drainer must not see it (exactly-once, part 1).
+	if pending, _ := Pending(townRoot, session); pending != 0 {
+		t.Fatalf("Pending = %d, want 0 (entry is claimed, not queued)", pending)
+	}
+	tooSoon, err := DrainClaims(townRoot, session)
+	if err != nil {
+		t.Fatalf("DrainClaims before staleness: %v", err)
+	}
+	if len(tooSoon) != 0 {
+		t.Fatalf("DrainClaims before staleness got %d claims, want 0 (still owned by the crashed attempt)", len(tooSoon))
+	}
+
+	// Age the crashed claim past staleClaimThreshold, simulating enough
+	// wall-clock time for a restarted poller to treat it as orphaned.
+	dir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".claimed") {
+			old := time.Now().Add(-staleClaimThreshold - time.Minute)
+			if err := os.Chtimes(filepath.Join(dir, e.Name()), old, old); err != nil {
+				t.Fatalf("Chtimes: %v", err)
+			}
+		}
+	}
+
+	// "Restarted poller": the orphan sweep restores the entry on this call
+	// (not yet delivered in the same call — see TestDrainSweepsOrphanedClaims),
+	// so nothing is claimed here either (exactly-once, part 2: the sweep
+	// itself never double-delivers).
+	sweepOnly, err := DrainClaims(townRoot, session)
+	if err != nil {
+		t.Fatalf("post-restart DrainClaims (sweep only): %v", err)
+	}
+	if len(sweepOnly) != 0 {
+		t.Fatalf("post-restart sweep call delivered %d claims, want 0", len(sweepOnly))
+	}
+
+	// A second call after the sweep actually claims and would deliver it.
+	claims2, err := DrainClaims(townRoot, session)
+	if err != nil || len(claims2) != 1 {
+		t.Fatalf("post-restart redelivery: claims=%d err=%v", len(claims2), err)
+	}
+	if claims2[0].Nudge.Message != "resume" {
+		t.Fatalf("recovered nudge = %#v", claims2[0].Nudge)
+	}
+	// The persisted Attempts count survived the crash: the restarted
+	// poller sees 1 (from the crashed attempt), not a fresh 0 — this is
+	// what bounds MaxInjectionAttempts across a restart instead of
+	// resetting the budget every time a poller dies mid-injection.
+	if claims2[0].Nudge.Attempts != 1 {
+		t.Fatalf("Attempts after restart = %d, want 1 (persisted from the crashed attempt via MarkAttempt)", claims2[0].Nudge.Attempts)
+	}
+
+	// This time delivery succeeds: ack it.
+	if err := claims2[0].Ack(); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	// Exactly once, part 3: nothing left to deliver anywhere, ever again.
+	if pending, _ := Pending(townRoot, session); pending != 0 {
+		t.Fatalf("Pending after ack = %d, want 0", pending)
+	}
+	final, err := DrainClaims(townRoot, session)
+	if err != nil {
+		t.Fatalf("final DrainClaims: %v", err)
+	}
+	if len(final) != 0 {
+		t.Fatalf("final DrainClaims got %d claims, want 0 (delivered exactly once)", len(final))
+	}
+}
+
 // TestRequeuePreservesAttemptsAndID covers hq-g52db fix 2: the attempt count
 // must persist across a requeue (which is what happens on every poller
 // restart, since it is read back from the on-disk queue file) so retries are
