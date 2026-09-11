@@ -2221,7 +2221,7 @@ const SpawnGracePeriod = 5 * time.Minute
 type StalledResult struct {
 	PolecatName   string // e.g., "alpha"
 	StallType     string // "startup-stall", "unknown-prompt"
-	Action        string // "auto-dismissed", "escalated"
+	Action        string // "auto-dismissed", "escalated", "would-dismiss", "no-known-dialog"
 	AgentState    string // Agent state from beads (e.g., "idle", "working")
 	HasHookedWork bool   // Whether this polecat has hooked work assigned
 	Error         error
@@ -2239,16 +2239,29 @@ type DetectStalledPolecatsResult struct {
 // Unlike zombie detection which looks for dead sessions/agents, this targets
 // alive-but-stuck agents that will never make progress without intervention.
 //
-// Detection uses structured tmux signals (session creation time + last activity)
-// rather than screen-scraping pane content. A session is considered stalled when:
+// A session is a REMEDIATION CANDIDATE only when ALL of the following hold:
 //   - It is older than StartupStallThreshold (90s)
-//   - Its last tmux activity is older than StartupActivityGrace (60s)
+//   - It has no v2 heartbeat reporting state "working" (even a STALE one —
+//     the heartbeat is refreshed only by `gt` command invocations, root.go's
+//     persistentPreRun, so a long tool-only turn can leave it stale while the
+//     agent is genuinely busy; a reported working state is never evidence of
+//     a stall, gtn-k43 / hq-ooijo)
+//   - Its pane shows no background-task or actively-streaming hint
+//   - Its window_activity (NOT session_activity, which freezes at creation on
+//     every detached session — hq-wisp-y46vn) is older than StartupActivityGrace
 //
-// When a startup stall is detected, DismissStartupDialogsBlind is called to
-// send blind key sequences that dismiss known blocking dialogs (workspace trust,
-// bypass permissions) without screen-scraping pane content. This avoids coupling
-// to third-party TUI strings that can change with any Claude Code update.
-func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult {
+// Even then, DetectStalledPolecats never sends keys on silence alone: it only
+// acts when ClassifyVisibleDialog identifies a SPECIFIC known dialog by its
+// pane content (workspace trust, bypass permissions, theme picker), and it
+// sends only that dialog's own key sequence. A session that is old and silent
+// but shows no known dialog text is reported, not acted on — window silence
+// alone never authorises input. This replaces the previous blind
+// Enter/Down/Enter sequence, which fired into working polecats whenever
+// session_activity read stale (measured 2026-09-11 on gastown/furiosa).
+//
+// When dryRun is true, candidates are still classified and reported, but no
+// keys are ever sent — for a witness that needs to survey without acting.
+func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledPolecatsResult {
 	result := &DetectStalledPolecatsResult{}
 
 	// Find town root for path resolution and session naming
@@ -2296,51 +2309,162 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			continue // Dead agent — zombie detection handles this
 		}
 
-		// Heartbeat v2 check (gt-3vr5): if the agent has a fresh heartbeat,
-		// it's alive and making progress — skip stall detection entirely.
-		// This replaces tmux activity scraping for v2 agents.
-		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() {
-			if time.Since(hb.Timestamp) < polecat.SessionHeartbeatStaleThreshold {
-				continue // Fresh v2 heartbeat — agent is alive, not stalled
-			}
-		}
-
-		// Legacy: Use structured signals to detect startup stalls:
-		// session_created (age) + session_activity (last output).
+		// Session created time and session id are fetched FIRST: together
+		// they identify THIS session incarnation, needed both to bind
+		// heartbeat trust (below) and to gate dismiss authorization later
+		// (IsStartupWindowOpen) — and to compute session age.
+		// session_created is stable regardless of attach state, unlike
+		// session_activity below. sessionID is best-effort: a query failure
+		// leaves it empty, which every match against it below correctly
+		// treats as a non-match rather than a wildcard.
 		createdUnix, err := t.GetSessionCreatedUnix(sessionName)
 		if err != nil {
 			result.Errors = append(result.Errors,
 				fmt.Errorf("getting session created time for %s: %w", sessionName, err))
 			continue
 		}
+		sessionID, _ := t.GetSessionID(sessionName)
+
+		// Heartbeat v2 check (gt-3vr5): if the agent has a fresh heartbeat,
+		// it's alive and making progress — skip stall detection entirely.
+		// This replaces tmux activity scraping for v2 agents.
+		//
+		// A STALE v2 heartbeat reporting "working" still skips: the heartbeat
+		// timestamp only advances on a `gt` command invocation, so a long
+		// turn spent entirely on non-gt tool calls goes stale while the agent
+		// is genuinely busy (gtn-k43 / hq-ooijo revision 2). A malformed or
+		// missing heartbeat file reads as hb == nil and falls through to the
+		// content-based checks below, same as before.
+		//
+		// MatchesFullIncarnation binds trust to THIS session's current
+		// session_created AND session_id: a tmux session name can be reused
+		// (old session dies, a new one is created with the same name), and a
+		// stale "working" heartbeat left by the dead incarnation must never
+		// suppress recovery for the new one — the merge risk named on
+		// hq-ooijo revision 2, sharpened in revision 3 (gtn-qp7): matching on
+		// session_created alone lets a same-second replacement (identical
+		// name, identical created timestamp, different session id) inherit
+		// the dead incarnation's trust. A heartbeat that fails the
+		// incarnation check falls through to the content/activity checks
+		// below exactly like a missing heartbeat.
+		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() && hb.MatchesFullIncarnation(sessionID, createdUnix) {
+			if time.Since(hb.Timestamp) < polecat.SessionHeartbeatStaleThreshold {
+				continue // Fresh v2 heartbeat — agent is alive, not stalled
+			}
+			// The launcher's own startup heartbeat (StartupHeartbeatContext)
+			// is written unconditionally, even when AcceptStartupDialogs or
+			// WaitForRuntimeReady failed non-fatally (session_manager.go:512,521)
+			// — so "state=working" here can mean either a genuinely busy
+			// agent, or one parked on a dialog that never ran a single `gt`
+			// command to refresh it. A real agent-driven heartbeat (Context
+			// overwritten by persistentPreRun's first touch) is still
+			// trusted indefinitely while stale-but-working; an untouched,
+			// stale startup placeholder is not — it falls through to the
+			// content/dialog checks below instead of being skipped forever
+			// (codex Medium, handlers.go:2357).
+			if hb.EffectiveState() == polecat.HeartbeatWorking && hb.Context != polecat.StartupHeartbeatContext {
+				continue // Stale but self-reported working — never a stall
+			}
+		}
+
 		sessionAge := now.Sub(time.Unix(createdUnix, 0))
 		if sessionAge < stallThreshold {
 			continue // Too young — still in normal startup
 		}
 
-		activity, err := t.GetSessionActivity(sessionName)
+		// Resolve the AGENT pane once: the content and activity checks below
+		// must read the pane actually running the agent, not whichever pane
+		// or window happens to be active in the session. An idle auxiliary
+		// window/pane being active would otherwise hide a genuine busy hint
+		// and read the wrong window_activity (gtn-m7s / hq-ooijo revision 2).
+		agentTarget := t.AgentTarget(sessionName)
+
+		// Content check: a backgrounded command or an actively streaming
+		// turn is genuinely busy no matter what the tmux activity fields
+		// read. Best-effort — a capture error falls through to the activity
+		// check rather than blocking detection.
+		if content, err := t.CapturePane(agentTarget, 80); err == nil && tmux.ContainsBackgroundTaskHint(content) {
+			continue
+		}
+
+		// Liveness: window_activity, never session_activity. session_activity
+		// freezes at session-creation time on every detached session
+		// (hq-wisp-y46vn) — using it here is exactly the bug this fixes.
+		activity, err := t.GetWindowActivity(agentTarget)
 		if err != nil {
 			result.Errors = append(result.Errors,
-				fmt.Errorf("getting session activity for %s: %w", sessionName, err))
+				fmt.Errorf("getting window activity for %s: %w", sessionName, err))
 			continue
 		}
 		activityAge := now.Sub(activity)
 		if activityAge < activityGrace {
-			continue // Recent activity — agent is making progress
+			continue // Recent window output — agent is making progress
 		}
 
-		// Session is old enough and has no recent activity: startup stall.
-		// Send blind key sequences to dismiss any startup dialogs without
-		// screen-scraping pane content (avoids coupling to third-party TUI strings).
+		// Session is old, silent, self-reports nothing, and shows no
+		// background-task hint. Act only on a SPECIFIC known dialog detected
+		// by content — never on silence alone. ClassifyVisibleDialog and
+		// DismissDialog resolve the agent pane themselves (t.AgentTarget),
+		// so passing sessionName here still targets the right pane.
+		kind, err := t.ClassifyVisibleDialog(sessionName)
+		if err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Errorf("classifying pane for %s: %w", sessionName, err))
+			continue
+		}
+
+		// Startup-window gate (gtn-qp7 / hq-ooijo revision 3): dismiss keys
+		// may be sent ONLY while this session incarnation's startup window
+		// is still open — before the AGENT has written its own first
+		// heartbeat. This is checked BEFORE dialog content decides
+		// anything: text classification alone no longer authorises a
+		// send, it only picks which known dialog is present once the
+		// window has already authorised acting. sessionID was resolved
+		// above (best-effort; IsStartupWindowOpen treats an empty value the
+		// same as any other unresolvable identity and refuses to open).
+		windowStatus := polecat.IsStartupWindowOpen(townRoot, sessionName, sessionID, createdUnix)
+		authorized := func() bool {
+			return polecat.IsStartupWindowOpen(townRoot, sessionName, sessionID, createdUnix).Open
+		}
+
+		if !windowStatus.Open {
+			// After the window: report a genuine-looking dialog as an
+			// apparent blocker for explicit recovery, never dismiss it.
+			// Neither age, state, nor startup context reopens eligibility
+			// (revision 3, item 5).
+			action := "no-known-dialog"
+			if kind != tmux.DialogNone {
+				action = fmt.Sprintf("post-window-dialog:%s", kind)
+			}
+			result.Stalled = append(result.Stalled, StalledResult{
+				PolecatName: polecatName,
+				StallType:   "startup-stall",
+				Action:      action,
+				Error:       fmt.Errorf("startup window closed: %s", windowStatus.Reason),
+			})
+			continue
+		}
+
+		if kind == tmux.DialogNone {
+			result.Stalled = append(result.Stalled, StalledResult{
+				PolecatName: polecatName,
+				StallType:   "startup-stall",
+				Action:      "no-known-dialog",
+			})
+			continue
+		}
+
 		stalled := StalledResult{
 			PolecatName: polecatName,
 			StallType:   "startup-stall",
 		}
-		if err := t.DismissStartupDialogsBlind(sessionName); err != nil {
+		if dryRun {
+			stalled.Action = fmt.Sprintf("would-dismiss:%s", kind)
+		} else if err := t.DismissDialogGated(sessionName, kind, authorized); err != nil {
 			stalled.Action = "escalated"
-			stalled.Error = fmt.Errorf("blind dismiss failed: %w", err)
+			stalled.Error = fmt.Errorf("dismiss %s failed: %w", kind, err)
 		} else {
-			stalled.Action = "auto-dismissed"
+			stalled.Action = fmt.Sprintf("auto-dismissed:%s", kind)
 		}
 		result.Stalled = append(result.Stalled, stalled)
 	}

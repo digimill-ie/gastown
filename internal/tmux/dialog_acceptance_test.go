@@ -291,6 +291,58 @@ Bypass Permissions mode
 			wantBlocked: true,
 			wantName:    "bypass permissions prompt",
 		},
+		{
+			// codex Medium, tmux.go:2089, REVISION 3: "the same-line fix
+			// does not reach CheckStartupBlocked". Before the fix, this
+			// function matched trust/bypass markers against the raw joined
+			// content directly, bypassing every same-line and open-composer
+			// exclusion classifyStartupDialog already applied — so a
+			// composer merely quoting "Bypass Permissions mode" still
+			// reported a blocker, and CheckStartupBlocked could kill a
+			// healthy session over it (session_manager.go:514).
+			name:        "composer line quotes bypass dialog text on the same line — must not report a blocker",
+			content:     "› explain Bypass Permissions mode",
+			wantBlocked: false,
+		},
+		{
+			name:        "composer line quotes workspace trust text on the same line — must not report a blocker",
+			content:     "› what happens if I decline to trust this folder?",
+			wantBlocked: false,
+		},
+		{
+			name:        "composer holding a multi-line quotation of the bypass marker — must not report a blocker",
+			content:     "› explain this to me:\n  Bypass Permissions mode",
+			wantBlocked: false,
+		},
+		{
+			name:        "Claude composer with its chrome rule holding numbered text quoting the bypass marker — must not report a blocker",
+			content:     claudeComposerRule + "\n❯ 1. What does Bypass Permissions mode do?",
+			wantBlocked: false,
+		},
+		{
+			// codex review 5637995408, Medium, tmux.go:2063: the codex
+			// update banner was matched against the whole content
+			// unconditionally, so a real prompt/composer rendered AFTER it
+			// (proving it was already dismissed) never resolved it —
+			// unlike every other dialog, which classifyStartupDialog
+			// already resolves this way. CheckStartupBlocked polling this
+			// would never return, and its caller can kill a healthy
+			// session over it (internal/polecat/session_manager.go:514,523).
+			name: "codex update banner already resolved by a later composer — must not report a blocker",
+			content: `Update available! 0.137.0 -> 0.138.0
+Update now
+Skip until next version
+› ready`,
+			wantBlocked: false,
+		},
+		{
+			name: "codex update banner still showing, no later prompt — reports a blocker",
+			content: `Update available! 0.137.0 -> 0.138.0
+Update now
+Skip until next version`,
+			wantBlocked: true,
+			wantName:    "codex update prompt",
+		},
 	}
 
 	for _, tt := range tests {

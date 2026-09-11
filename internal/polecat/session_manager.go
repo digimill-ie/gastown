@@ -601,8 +601,12 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	_ = session.TrackSessionPID(townRoot, sessionID, m.tmux)
 
 	// Touch initial heartbeat so liveness detection works from the start (gt-qjtq).
-	// Subsequent touches happen on every gt command via persistentPreRun.
-	TouchSessionHeartbeat(townRoot, sessionID)
+	// Subsequent touches happen on every gt command via persistentPreRun and
+	// overwrite Context, replacing this launcher-written placeholder with a
+	// genuine agent-driven one (see StartupHeartbeatContext: AcceptStartupDialogs
+	// and WaitForRuntimeReady above are both non-fatal, so this write happens
+	// even when startup left a dialog unhandled).
+	TouchLauncherStartupHeartbeat(townRoot, sessionID)
 
 	// Stream polecat's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {

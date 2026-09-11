@@ -2043,93 +2043,260 @@ func containsWorkspaceTrustDialog(content string) bool {
 		strings.Contains(content, "Do you trust the contents of this directory?")
 }
 
+// containsBlockingStartupDialog reports whether content shows a known
+// startup modal that must fail CheckStartupBlocked fast. Trust and bypass
+// detection is delegated to classifyStartupDialog — the SAME line-scoped,
+// composer-aware classifier DetectAndDismissKnownDialog uses — rather than
+// matching markers against the raw joined content directly. The two used to
+// diverge: raw whole-content substring checks here ignored every same-line
+// and open-composer exclusion classifyStartupDialog already applied, so a
+// composer merely quoting "Bypass Permissions mode" still reported a
+// blocker and could kill a healthy session (codex Medium, tmux.go:2089 /
+// session_manager.go:514).
+//
+// codex-update is checked separately: its own three markers ("Update
+// available!", "Update now", "Skip until next version") render on three
+// separate lines, so it has never been a per-line match — this preserves
+// that pre-existing, unchanged behavior rather than folding it into
+// classifyStartupDialog's per-line switch, which is out of this fix's scope.
 func containsBlockingStartupDialog(content string) (string, bool) {
-	if promptAppearsAfterStartupBlocker(content) {
+	if blockerLine, ok := lastCodexUpdateDialogLine(content); ok {
+		// Same resolved-by-a-later-prompt check classifyStartupDialog
+		// applies to every other dialog: an update banner that has already
+		// scrolled past a real prompt/composer is answered, not blocking.
+		// Without this, a composer that opened AFTER the banner — e.g.
+		// "Update available!\nUpdate now\nSkip until next version\n› ready"
+		// — stayed reported as blocked forever, and CheckStartupBlocked's
+		// caller can terminate a healthy session on that false positive
+		// (codex review 5637995408, Medium; internal/polecat/session_manager.go:514,523).
+		if promptLine := lastPromptIndicatorLine(content); promptLine <= blockerLine {
+			return "codex update prompt", true
+		}
+	}
+	switch classifyStartupDialog(content) {
+	case DialogWorkspaceTrust:
+		return "workspace trust prompt", true
+	case DialogBypassPermissions:
+		return "bypass permissions prompt", true
+	default:
 		return "", false
 	}
-	if containsCodexUpdateDialog(content) {
-		return "codex update prompt", true
-	}
-	if containsWorkspaceTrustDialog(content) {
-		return "workspace trust prompt", true
-	}
-	if strings.Contains(content, "Bypass Permissions mode") {
-		return "bypass permissions prompt", true
-	}
-	return "", false
 }
 
-func promptAppearsAfterStartupBlocker(content string) bool {
-	promptLine := lastPromptIndicatorLine(content)
-	if promptLine < 0 {
-		return false
-	}
-	blockerLine := lastStartupBlockerLine(content)
-	return blockerLine >= 0 && promptLine > blockerLine
-}
+// codexUpdateDialogMarkers are Codex's own "new version available" startup
+// banner, each rendered on its own line — never a single per-line match
+// (see lastCodexUpdateDialogLine's doc comment).
+var codexUpdateDialogMarkers = []string{"Update available!", "Update now", "Skip until next version"}
 
-func lastStartupBlockerLine(content string) int {
-	markers := []string{
-		"Update available!",
-		"Update now",
-		"Skip until next version",
-		"trust this folder",
-		"Quick safety check",
-		"Do you trust the contents of this directory?",
-		"Bypass Permissions mode",
-	}
+// lastCodexUpdateDialogLine returns the index of the LAST line carrying any
+// of codexUpdateDialogMarkers, and true, only if ALL three markers are
+// present somewhere in content — matching containsCodexUpdateDialog's old
+// all-three-present contract, but now exposing WHERE the banner ends so
+// containsBlockingStartupDialog can tell whether it has already been
+// resolved by a later prompt.
+func lastCodexUpdateDialogLine(content string) (int, bool) {
+	seen := make([]bool, len(codexUpdateDialogMarkers))
 	last := -1
 	for i, line := range strings.Split(content, "\n") {
-		for _, marker := range markers {
+		for m, marker := range codexUpdateDialogMarkers {
 			if strings.Contains(line, marker) {
+				seen[m] = true
 				last = i
-				break
 			}
 		}
 	}
-	return last
+	for _, ok := range seen {
+		if !ok {
+			return -1, false
+		}
+	}
+	return last, true
 }
 
-func containsCodexUpdateDialog(content string) bool {
-	return strings.Contains(content, "Update available!") &&
-		strings.Contains(content, "Update now") &&
-		strings.Contains(content, "Skip until next version")
-}
-
-// promptSuffixes are strings that indicate a shell or agent prompt is visible.
-// Claude prompt ends with ">", Codex uses "›", and shells often end with
-// "$", "%", "#", or "❯".
+// promptSuffixes are strings that indicate a shell or agent prompt is visible
+// EMPTY, waiting for input. Claude prompt ends with ">", Codex uses "›", and
+// shells often end with "$", "%", "#", or "❯".
 var promptSuffixes = []string{">", "›", "$", "%", "#", "❯"}
 
-// containsPromptIndicator checks if pane content contains a prompt indicator
-// that signals a shell or agent is ready (no dialog blocking it).
-func containsPromptIndicator(content string) bool {
-	for _, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
+// composerPrefixes are prompt-lead characters that begin a live input
+// composer line, whether or not it already has typed text after them (e.g.
+// "> ", "› review this"). promptSuffixes alone misses this case: a composer
+// with real typed content does not END with the prompt character, so an old
+// dialog marker followed by a non-empty composer line was reading as "the
+// dialog is still showing" and would send that dialog's keys into the
+// composer (gtn-m7s / hq-ooijo revision 2, codex finding on
+// classifyStartupDialog / tmux.go:2289).
+var composerPrefixes = []string{">", "›", "❯"}
+
+// dialogOptionLinePattern matches a numbered option immediately after a
+// composer-lead glyph (e.g. "1. Dark mode", "2. Yes, I accept"). A dialog's
+// own selection cursor is drawn with the same glyph shape as a live composer
+// ("❯ 1. Dark mode"), so without this check a still-showing dialog's own
+// option line reads as an already-answered composer and suppresses
+// detection of the dialog that is rendering it (codex finding, tmux.go:2145
+// — "a selection cursor reads as composer"; startup_dialog_test.go:38,43
+// omitted this case entirely).
+//
+// This exclusion applies ONLY to the '❯' glyph in lineIsPromptIndicator —
+// never to '>' or '›', the real composer leads for Claude and Codex
+// respectively (see composerPrefixes). '❯' is the TUI's own selection-cursor
+// glyph and is never used to render live, user-typed composer input, so a
+// numbered '❯' line can only be the dialog's cursor. '>' and '›' ARE real
+// composer leads, so numbered text after either is ordinary typed content
+// (e.g. a user typing "1. Explain Quick safety check") — excluding it there
+// let that composer skip prompt-indicator status entirely, which let its own
+// numbered content re-classify as a still-showing dialog (codex High,
+// tmux.go:2175).
+var dialogOptionLinePattern = regexp.MustCompile(`^\d+\.\s`)
+
+// ruleLinePattern matches Claude Code's own horizontal-rule chrome: a line
+// consisting solely of the box-drawing character U+2500 ('─'), repeated.
+// Claude draws this rule immediately above (and, content permitting,
+// immediately below) its live input box in EVERY permission mode — auto,
+// accept-edits, plan, bypass-permissions — measured live against Claude
+// Code v2.1.268 (gtn-bl1). No known startup dialog (workspace trust,
+// bypass-permissions warning, theme picker) renders this rule adjacent to
+// its own option list; each either has no adjacent rule at all or is
+// followed by a plain hint line ("Enter to confirm · Esc to cancel"). The
+// minimum length guards against a coincidental short run of the character
+// in ordinary output; a real chrome rule always spans nearly the full pane
+// width.
+var ruleLinePattern = regexp.MustCompile(`^─{10,}$`)
+
+func isRuleLine(line string) bool {
+	return ruleLinePattern.MatchString(strings.TrimSpace(line))
+}
+
+// isClaudeComposerOpen reports whether lines[i] is Claude's OWN live input
+// line — as opposed to a dialog's selection cursor rendered with the
+// identical '❯' glyph. Text alone cannot tell these apart: a multi-line
+// composer draft (a soft-newline continuation, e.g. after typing "1. ..."
+// then a newline then "2. ...") renders pixel-for-pixel like a real
+// dialog's own numbered option list (measured live). What differs is the
+// FRAME: Claude always draws its horizontal-rule chrome line immediately
+// above its live input box; no known dialog's option list has one there.
+// This is checked ahead of lineIsPromptIndicator's numbered-option
+// exclusion so a structurally-confirmed composer line is never mistaken
+// for a dialog's cursor, regardless of whether its content is numbered,
+// quoted, or otherwise shaped like one (codex review 5637995408, High,
+// tmux.go:2162; gtn-bl1).
+func isClaudeComposerOpen(lines []string, i int) bool {
+	trimmed := strings.TrimSpace(lines[i])
+	if trimmed != "❯" && !strings.HasPrefix(trimmed, "❯ ") {
+		return false
+	}
+	return i > 0 && isRuleLine(lines[i-1])
+}
+
+// claudeComposerFooterPattern matches the second line of Claude Code's own
+// status footer, rendered directly below its input box's closing rule in
+// EVERY permission mode (measured live, v2.1.268): e.g. "⏵⏵ bypass
+// permissions on (shift+tab to cycle) · ← 2 agents", "⏸ plan mode on
+// (shift+tab to cycle)". This is Claude's own app chrome, drawn once per
+// frame — never something a dialog or user-typed composer content renders.
+var claudeComposerFooterPattern = regexp.MustCompile(`\(shift\+tab to cycle\)`)
+
+// isClaudeComposerStale reports whether the composer confirmed open at
+// lines[i] (isClaudeComposerOpen) is leftover scrollback from a process
+// that has since respawned, rather than the CURRENTLY live input box. A
+// genuinely open composer's own frame — the composer line(s), a closing
+// rule, then its status footer — is always the LAST thing rendered in a
+// captured pane. If further non-blank content follows that closing frame,
+// this composer belongs to a prior process incarnation and must not
+// suppress a dialog rendered after it (codex review 5637995408, Medium,
+// tmux.go:2342: an old submitted composer line left in scrollback,
+// followed by a freshly rendered dialog after a process respawn, read as
+// still-open and blocked legitimate recovery).
+//
+// When the expected frame shape (composer, rule, footer) is not found
+// within the capture, this conservatively reports "not stale" — the
+// pre-existing, safer behavior (suppress to end of content) applies rather
+// than guessing.
+func isClaudeComposerStale(lines []string, i int) bool {
+	j := i + 1
+	for j < len(lines) && !isRuleLine(lines[j]) {
+		j++
+	}
+	if j >= len(lines) {
+		return false
+	}
+	footerLine := -1
+	for k := j + 1; k < len(lines) && k <= j+2; k++ {
+		if claudeComposerFooterPattern.MatchString(lines[k]) {
+			footerLine = k
+			break
 		}
-		for _, suffix := range promptSuffixes {
-			if strings.HasSuffix(trimmed, suffix) {
-				return true
-			}
+	}
+	if footerLine == -1 {
+		return false
+	}
+	for _, rest := range lines[footerLine+1:] {
+		if strings.TrimSpace(rest) != "" {
+			return true
 		}
 	}
 	return false
 }
 
-func lastPromptIndicatorLine(content string) int {
-	last := -1
-	for i, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
+// containsPromptIndicator checks if pane content contains a prompt indicator
+// that signals a shell or agent is ready (no dialog blocking it).
+func containsPromptIndicator(content string) bool {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if lineIsPromptIndicator(line) || isClaudeComposerOpen(lines, i) {
+			return true
+		}
+	}
+	return false
+}
+
+// lineIsPromptIndicator reports whether a single (already-trimmed-for-check)
+// line reads as an active prompt or composer: either an EMPTY prompt ending
+// in a known suffix, or a composer line — empty or with typed text — that
+// STARTS with a known composer lead character.
+func lineIsPromptIndicator(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, suffix := range promptSuffixes {
+		if strings.HasSuffix(trimmed, suffix) {
+			return true
+		}
+	}
+	for _, prefix := range composerPrefixes {
+		if trimmed == prefix {
+			return true
+		}
+		// Require the prefix followed by a space before any typed text
+		// ("› review this") — not merely HasPrefix — so a dialog option
+		// glyph that happens to start with the same character (a TUI
+		// selection cursor immediately butted against other text) isn't
+		// misread as a live composer.
+		rest, ok := strings.CutPrefix(trimmed, prefix+" ")
+		if !ok {
 			continue
 		}
-		for _, suffix := range promptSuffixes {
-			if strings.HasSuffix(trimmed, suffix) {
-				last = i
-				break
-			}
+		// A numbered option right after the '❯' cursor glyph is the dialog's
+		// own selection cursor pointing at one of its choices, not user-typed
+		// composer content — reject it so a still-showing dialog's option
+		// list can't read as an already-answered prompt. Scoped to '❯' only:
+		// see dialogOptionLinePattern's doc comment for why '>' and '›' must
+		// NOT get this exclusion.
+		if prefix == "❯" && dialogOptionLinePattern.MatchString(rest) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func lastPromptIndicatorLine(content string) int {
+	lines := strings.Split(content, "\n")
+	last := -1
+	for i, line := range lines {
+		if lineIsPromptIndicator(line) || isClaudeComposerOpen(lines, i) {
+			last = i
 		}
 	}
 	return last
@@ -2213,6 +2380,354 @@ func (t *Tmux) DismissStartupDialogsBlind(session string) error {
 	}
 
 	return nil
+}
+
+// StartupDialogKind identifies a specific known Claude Code / Codex startup
+// dialog by its pane content. The empty value (DialogNone) means no known
+// dialog is currently visible.
+type StartupDialogKind string
+
+const (
+	// DialogNone means no known startup dialog is visible.
+	DialogNone StartupDialogKind = ""
+	// DialogWorkspaceTrust is the "trust this folder" / "Quick safety check"
+	// prompt. Dismissed with a single Enter (the safe option is pre-selected).
+	DialogWorkspaceTrust StartupDialogKind = "workspace-trust"
+	// DialogBypassPermissions is the "Bypass Permissions mode" warning shown
+	// with --dangerously-skip-permissions. Dismissed with Down then Enter.
+	DialogBypassPermissions StartupDialogKind = "bypass-permissions"
+	// DialogThemePicker is the first-run "Choose the text style" theme
+	// selection screen. Dismissed with a single Enter (default is
+	// pre-highlighted), matching AcceptWorkspaceTrustDialog's convention.
+	DialogThemePicker StartupDialogKind = "theme-picker"
+)
+
+// containsThemePickerDialog reports whether content shows the first-run
+// theme picker. This dialog was previously undetected: the helpers above
+// (AcceptWorkspaceTrustDialog, AcceptBypassPermissionsWarning) cover trust
+// and bypass only (gtn-k43 / hq-ooijo revision 2, codex finding).
+func containsThemePickerDialog(content string) bool {
+	if strings.Contains(content, "Choose the text style") {
+		return true
+	}
+	return strings.Contains(content, "Dark mode") && strings.Contains(content, "Light mode")
+}
+
+// ContainsBackgroundTaskHint reports whether content shows tmux/Claude Code's
+// own indicator that a command is running in the background, or that the
+// agent is actively streaming output. A session showing either is genuinely
+// busy: it must never be treated as a startup stall no matter how stale the
+// tmux activity fields read (gtn-k43, measured 2026-09-11 on gastown/furiosa).
+//
+// Streaming detection is delegated to hasBusyIndicator — the SAME check
+// WaitForIdle/IsIdle use — rather than a second hardcoded "esc to interrupt"
+// substring test, so the two never diverge. Known gap, out of scope for
+// this fix: current Claude Code (v2.1.268) does not always render "esc to
+// interrupt" while thinking or running a tool, so a Claude polecat mid-turn
+// can still read as idle here. Widening hasBusyIndicator itself would
+// change IsIdle/WaitForIdle for every agent town-wide; that is not this
+// fix's blast radius (gtn-s8i / codex review 5640759300).
+func ContainsBackgroundTaskHint(content string) bool {
+	if strings.Contains(content, "Running in the background") {
+		return true
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if hasBusyIndicator(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// isOpenCodexComposerLine reports whether line is Codex's own live
+// input-echo ("› ..." or a bare "›") rather than Claude's composer or
+// Codex's static informational banner text — both of which use '>', the
+// SAME character Codex's own trust-dialog banner prints immediately above
+// the real dialog question ("> You are in <dir>"). '>' therefore must never
+// be treated as marking an open composer, or a genuine, never-yet-answered
+// Codex trust dialog would stop being detected. Only '›' — documented as
+// Codex's composer lead in composerPrefixes, and never used for static
+// banner text — is safe to treat this way.
+func isOpenCodexComposerLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed == "›" || strings.HasPrefix(trimmed, "› ")
+}
+
+// lastKnownDialogLine scans content line by line and returns the line index
+// and kind of the LAST known dialog marker found, or (-1, DialogNone) if
+// none appear.
+func lastKnownDialogLine(content string) (int, StartupDialogKind) {
+	lines := strings.Split(content, "\n")
+	lastLine := -1
+	lastKind := DialogNone
+	composerOpen := false
+	for i, line := range lines {
+		// Claude's own live input line, confirmed by its chrome rule
+		// (isClaudeComposerOpen) rather than by content shape, is checked
+		// BEFORE the generic prompt-indicator/numbered-option logic below.
+		// A numbered or multi-line composer draft ("❯ 1. Explain Quick
+		// safety check", or a soft-newline continuation quoting "Bypass
+		// Permissions mode" on its own line) is otherwise indistinguishable
+		// by text alone from a real dialog's own numbered cursor line —
+		// measured live against Claude Code v2.1.268, both render with the
+		// identical glyph and indentation (codex review 5637995408, High,
+		// tmux.go:2162, :2342; gtn-bl1). Once confirmed, everything from
+		// here to the end of content is that SAME open composer, exactly
+		// as isOpenCodexComposerLine already guarantees for Codex's '›'.
+		if !composerOpen && isClaudeComposerOpen(lines, i) && !isClaudeComposerStale(lines, i) {
+			composerOpen = true
+			continue
+		}
+		// A live composer line that QUOTES dialog text on the same line
+		// (e.g. "› explain Bypass Permissions mode") is not the dialog —
+		// it is typed content that happens to mention it. The old
+		// line-order check ("does a prompt appear on a LATER line") only
+		// caught historical text in earlier scrollback; it never rejected
+		// the marker and its resolving prompt sharing one line, so
+		// detection AND revalidation both authorised keys into that
+		// composer (codex High, tmux.go:2313, REVISION 2).
+		if lineIsPromptIndicator(line) {
+			// An OPEN Codex composer is always the last thing rendered in
+			// a captured pane — nothing else can appear below it until it
+			// is submitted or dismissed. So once one is found, every line
+			// from here to the end of content is that SAME open composer,
+			// even a multi-line paste whose later lines verbatim quote a
+			// dialog marker on their own line ("› explain this:" then
+			// "Bypass Permissions mode" below it puts the marker on a
+			// LATER line than the composer, which the old line-order
+			// check never rejected — codex High, tmux.go:2355, "the
+			// marker is on a later line than the prompt").
+			if isOpenCodexComposerLine(line) {
+				composerOpen = true
+			}
+			continue
+		}
+		if composerOpen {
+			continue
+		}
+		switch {
+		case containsWorkspaceTrustDialog(line):
+			lastLine, lastKind = i, DialogWorkspaceTrust
+		case strings.Contains(line, "Bypass Permissions mode"):
+			lastLine, lastKind = i, DialogBypassPermissions
+		case containsThemePickerDialog(line):
+			lastLine, lastKind = i, DialogThemePicker
+		}
+	}
+	return lastLine, lastKind
+}
+
+// classifyStartupDialog identifies which known startup dialog, if any, is
+// CURRENTLY showing in captured pane content. It rejects historical or
+// quoted dialog text still sitting in scrollback: if a prompt indicator
+// appears on a later line than the dialog marker, the dialog has already
+// been answered. (lastKnownDialogLine separately rejects a marker that
+// appears AFTER an open Codex composer starts, for the reverse ordering.)
+func classifyStartupDialog(content string) StartupDialogKind {
+	blockerLine, kind := lastKnownDialogLine(content)
+	if kind == DialogNone {
+		return DialogNone
+	}
+	if promptLine := lastPromptIndicatorLine(content); promptLine > blockerLine {
+		return DialogNone
+	}
+	return kind
+}
+
+// dialogDismissKeys returns the exact key sequence a given dialog kind
+// needs. Sending a kind's own sequence — never a blind Enter/Down/Enter — is
+// the fix for gtn-k43 / hq-ooijo: a session with no visible dialog now
+// receives zero keys instead of whatever the blind sequence used to send.
+func (t *Tmux) dialogDismissKeys(target string, kind StartupDialogKind) error {
+	switch kind {
+	case DialogWorkspaceTrust, DialogThemePicker:
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	case DialogBypassPermissions:
+		if _, err := t.run("send-keys", "-t", target, "Down"); err != nil {
+			return fmt.Errorf("sending Down for %s: %w", kind, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		// Revalidate before the second key: something else (the agent
+		// itself, or an unrelated actor) may have dismissed the dialog in
+		// the gap between Down and Enter. Sending Enter blind here would
+		// submit whatever now has focus — e.g. a real composer the Down
+		// already scrolled through (gtn-m7s / hq-ooijo revision 2, codex
+		// finding on the unvalidated 200ms gap).
+		recheck, err := t.CapturePane(target, 80)
+		if err != nil {
+			return fmt.Errorf("revalidating %s before Enter: %w", kind, err)
+		}
+		if classifyStartupDialog(recheck) != kind {
+			return fmt.Errorf("%s dialog no longer visible after Down, refusing to send Enter", kind)
+		}
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	default:
+		return fmt.Errorf("unknown dialog kind %q", kind)
+	}
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// AgentTarget resolves the pane that actually runs the agent, falling back
+// to the session name when no agent pane can be identified (single-pane
+// sessions, or legacy sessions without GT_PANE_ID). Callers that capture
+// pane content or read activity fields to judge whether an agent is busy
+// must resolve this first — the session/window's ACTIVE pane can be a
+// different, idle auxiliary pane (gtn-m7s / hq-ooijo revision 2).
+func (t *Tmux) AgentTarget(session string) string {
+	if pane, err := t.FindAgentPane(session); err == nil && pane != "" {
+		return pane
+	}
+	return session
+}
+
+// ClassifyVisibleDialog captures the agent pane's CURRENT content and
+// reports which known startup dialog, if any, is showing. It never sends
+// keys — pure detection, safe to call for dry-run surveys.
+func (t *Tmux) ClassifyVisibleDialog(session string) (StartupDialogKind, error) {
+	content, err := t.CapturePane(t.AgentTarget(session), 80)
+	if err != nil {
+		return DialogNone, fmt.Errorf("capturing pane: %w", err)
+	}
+	return classifyStartupDialog(content), nil
+}
+
+// DismissDialog sends the key sequence for kind, but only after revalidating
+// that the dialog is still showing at the moment of the send: a dialog can
+// disappear between detection and action (the agent dismissed it itself, or
+// the screen moved on), and a stale detection must never fire keys into
+// whatever replaced it. After sending, it re-captures the pane and confirms
+// the dialog actually cleared; if it did not, the caller should escalate
+// rather than report success.
+func (t *Tmux) DismissDialog(session string, kind StartupDialogKind) error {
+	target := t.AgentTarget(session)
+
+	recheck, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("revalidating pane: %w", err)
+	}
+	if classifyStartupDialog(recheck) != kind {
+		return fmt.Errorf("%s dialog no longer visible at send time", kind)
+	}
+
+	if err := t.dialogDismissKeys(target, kind); err != nil {
+		return err
+	}
+
+	after, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("verifying dismiss: %w", err)
+	}
+	if classifyStartupDialog(after) == kind {
+		return fmt.Errorf("%s dialog still visible after dismiss keys", kind)
+	}
+	return nil
+}
+
+// DismissDialogGated behaves like DismissDialog, but takes an authorized
+// func that must return true immediately before EVERY key in the sequence
+// is sent, aborting the whole sequence — never sending the remaining keys —
+// the instant it returns false. This binds a multi-key dismiss (Down then
+// Enter for the bypass-permissions dialog) to an authorization that can
+// close mid-sequence: the caller supplies a fresh, re-evaluated check (e.g.
+// the startup window closing because the agent wrote its first heartbeat
+// between the two keys), not a value captured once at entry
+// (gtn-qp7 / hq-ooijo revision 3, item 4).
+func (t *Tmux) DismissDialogGated(session string, kind StartupDialogKind, authorized func() bool) error {
+	target := t.AgentTarget(session)
+
+	if !authorized() {
+		return fmt.Errorf("not authorized to dismiss %s: startup window closed", kind)
+	}
+	recheck, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("revalidating pane: %w", err)
+	}
+	if classifyStartupDialog(recheck) != kind {
+		return fmt.Errorf("%s dialog no longer visible at send time", kind)
+	}
+
+	if err := t.dialogDismissKeysGated(target, kind, authorized); err != nil {
+		return err
+	}
+
+	after, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("verifying dismiss: %w", err)
+	}
+	if classifyStartupDialog(after) == kind {
+		return fmt.Errorf("%s dialog still visible after dismiss keys", kind)
+	}
+	return nil
+}
+
+// dialogDismissKeysGated is dialogDismissKeys with the same per-key
+// authorized() re-check DismissDialogGated documents. The bypass-permissions
+// sequence rechecks authorized() a SECOND time in the gap between Down and
+// Enter, in addition to the pre-existing dialog-still-showing recheck: the
+// two guard different failures (the dialog was dismissed by something else,
+// vs. the startup window closed because the agent has since proven it is
+// running) and either one aborts the sequence.
+func (t *Tmux) dialogDismissKeysGated(target string, kind StartupDialogKind, authorized func() bool) error {
+	switch kind {
+	case DialogWorkspaceTrust, DialogThemePicker:
+		if !authorized() {
+			return fmt.Errorf("not authorized to send Enter for %s: startup window closed", kind)
+		}
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	case DialogBypassPermissions:
+		if !authorized() {
+			return fmt.Errorf("not authorized to send Down for %s: startup window closed", kind)
+		}
+		if _, err := t.run("send-keys", "-t", target, "Down"); err != nil {
+			return fmt.Errorf("sending Down for %s: %w", kind, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if !authorized() {
+			return fmt.Errorf("not authorized to send Enter for %s: startup window closed mid-sequence", kind)
+		}
+		// Revalidate before the second key: something else (the agent
+		// itself, or an unrelated actor) may have dismissed the dialog in
+		// the gap between Down and Enter. Sending Enter blind here would
+		// submit whatever now has focus.
+		recheck, err := t.CapturePane(target, 80)
+		if err != nil {
+			return fmt.Errorf("revalidating %s before Enter: %w", kind, err)
+		}
+		if classifyStartupDialog(recheck) != kind {
+			return fmt.Errorf("%s dialog no longer visible after Down, refusing to send Enter", kind)
+		}
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	default:
+		return fmt.Errorf("unknown dialog kind %q", kind)
+	}
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// DetectAndDismissKnownDialog inspects the agent pane's current content and,
+// only when a specific known dialog is detected, sends the exact key
+// sequence that dialog needs. If no known dialog is visible it is a no-op —
+// window silence alone never authorises input (gtn-k43 / hq-ooijo). This
+// replaces DismissStartupDialogsBlind for stall remediation; that function
+// is retained for its original startup-time callers.
+func (t *Tmux) DetectAndDismissKnownDialog(session string) (StartupDialogKind, error) {
+	kind, err := t.ClassifyVisibleDialog(session)
+	if err != nil || kind == DialogNone {
+		return kind, err
+	}
+	if err := t.DismissDialog(session, kind); err != nil {
+		return kind, err
+	}
+	return kind, nil
 }
 
 // GetPaneCommand returns the current command running in a pane.
@@ -2366,6 +2881,26 @@ func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
 	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("parsing session activity: %w", err)
+	}
+	return time.Unix(timestamp, 0), nil
+}
+
+// GetWindowActivity returns the last activity time for a session's active
+// window (#{window_activity}). Unlike GetSessionActivity's #{session_activity},
+// which freezes at session-creation time on every session with no attached
+// client (hq-wisp-y46vn, measured on four live sessions), window_activity
+// keeps moving whenever the window's pane produces output — attached or not.
+// Use this, never GetSessionActivity, to decide whether a detached agent
+// session is still doing anything.
+func (t *Tmux) GetWindowActivity(session string) (time.Time, error) {
+	out, err := t.run("display-message", "-t", session, "-p", "#{window_activity}")
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing window activity: %w", err)
 	}
 	return time.Unix(timestamp, 0), nil
 }
@@ -4261,6 +4796,25 @@ func EnsureBindingsOnSocket(socket, townSocket string) error {
 	}
 
 	return nil
+}
+
+// GetSessionID returns tmux's own session identifier (#{session_id}, e.g.
+// "$3") for session. Session IDs are never reused for the lifetime of the
+// tmux server, unlike session NAMES, which can be reused after a session
+// dies and a new one is created with the identical name. #{session_created}
+// alone cannot always distinguish that reuse: a replacement created within
+// the same second carries an identical timestamp. Combining session id with
+// created timestamp closes that gap (gtn-qp7 / hq-ooijo revision 3).
+func (t *Tmux) GetSessionID(session string) (string, error) {
+	out, err := t.run("display-message", "-t", session, "-p", "#{session_id}")
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(out)
+	if id == "" {
+		return "", fmt.Errorf("empty session id for session %s", session)
+	}
+	return id, nil
 }
 
 // GetSessionCreatedUnix returns the Unix timestamp when a session was created.

@@ -1725,7 +1725,7 @@ func TestDetectStalledPolecatsResult_Empty(t *testing.T) {
 func TestDetectStalledPolecats_NoPolecats(t *testing.T) {
 	t.Parallel()
 	// Should handle missing polecats directory gracefully
-	result := DetectStalledPolecats("/nonexistent/path", "testrig")
+	result := DetectStalledPolecats("/nonexistent/path", "testrig", false)
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for nonexistent dir", result.Checked)
@@ -1748,7 +1748,7 @@ func TestDetectStalledPolecats_EmptyPolecatsDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(tmpDir, rigName, false)
 
 	if result.Checked != 0 {
 		t.Errorf("Checked = %d, want 0 for empty polecats dir", result.Checked)
@@ -1759,7 +1759,18 @@ func TestDetectStalledPolecats_EmptyPolecatsDir(t *testing.T) {
 }
 
 func TestDetectStalledPolecats_NoSession(t *testing.T) {
-	t.Parallel()
+	// NOTE: cannot use t.Parallel() — t.Setenv below is required, not
+	// optional: this test's polecat names ("alpha", "bravo") are exactly
+	// the session names DetectStalledPolecats' internal session.InitRegistry
+	// call would target on the REAL town socket if GT_TMUX_SOCKET is
+	// inherited from a live enclosing session (this test's rig "testrig" is
+	// unregistered, so PolecatSessionName falls back to the "gt" legacy
+	// prefix: "gt-alpha", "gt-bravo" — names real sessions can hold). The
+	// comment below ("no real tmux in test") is an assumption this makes
+	// TRUE by construction rather than by luck (gtn-m7s / hq-ooijo revision
+	// 2, codex finding naming this exact test).
+	t.Setenv("GT_TMUX_SOCKET", "")
+
 	// When tmux sessions don't exist (no real tmux in test),
 	// HasSession returns false so polecats are skipped (not errors).
 	tmpDir := t.TempDir()
@@ -1781,7 +1792,7 @@ func TestDetectStalledPolecats_NoSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := DetectStalledPolecats(tmpDir, rigName)
+	result := DetectStalledPolecats(tmpDir, rigName, false)
 
 	// Should count 2 polecats (skip hidden)
 	if result.Checked != 2 {
