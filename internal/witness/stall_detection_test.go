@@ -305,6 +305,91 @@ func TestDetectStalledPolecats_StaleStartupHeartbeat_ComposerQuotesDialogText_Ze
 	}
 }
 
+// claudeComposerRule is Claude Code's own horizontal-rule chrome line,
+// rendered immediately above its live input box in every permission mode
+// (measured live, v2.1.268). The fixtures below print it ahead of a "❯"
+// line so the structural composer check (isClaudeComposerOpen) — which the
+// numbered-exclusion alone cannot satisfy — recognizes the line as the
+// live composer, exactly as a real captured pane would.
+const claudeComposerRule = "────────────────────────────────────────────────────────────────────────────"
+
+// TestDetectStalledPolecats_StaleStartupHeartbeat_ClaudeComposerNumberedQuote_ZeroKeys
+// is the Claude form of the sibling test above, and the exact shape codex
+// named for the surviving High (codex review 5637995408: "internal/tmux/tmux.go:2162
+// — ... a Claude composer holding `❯ 1. Explain Quick safety check` ...
+// passes classification"). Claude's own dialog cursor and its composer
+// prompt render with the IDENTICAL '❯' glyph, so a fix scoped to Codex's
+// '›' never touches this case — this test only passes once the fix reaches
+// Claude's glyph too.
+func TestDetectStalledPolecats_StaleStartupHeartbeat_ClaudeComposerNumberedQuote_ZeroKeys(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	writeTestStartupHeartbeat(t, f.townRoot, f.sessionName, time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking)
+
+	cmd := "clear; printf '%s\\n' '" + claudeComposerRule + "'; printf '%s' '❯ 1. Explain Quick safety check'; read -r _dlg"
+	if err := f.tm.SendKeys(f.sessionName, cmd); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	before, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (before): %v", err)
+	}
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+
+	after, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if before != after {
+		t.Errorf("pane content changed — a key reached the Claude composer quoting dialog text\nbefore: %q\nafter:  %q", before, after)
+	}
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "no-known-dialog" {
+		t.Errorf("Stalled = %+v, want one entry with Action=no-known-dialog "+
+			"(a Claude composer's numbered draft must never classify as that dialog's own cursor)", result.Stalled)
+	}
+}
+
+// TestDetectStalledPolecats_StaleStartupHeartbeat_ClaudeComposerMultilineQuote_ZeroKeys
+// covers the OTHER half of the same High: a multi-line composer draft whose
+// SECOND line — not the numbered one — quotes a dialog marker verbatim on
+// its own line (codex review 5637995408: "internal/tmux/tmux.go:2342 —
+// ... a multi-line Claude draft ... classifies as the dialog"). Before this
+// fix, composerOpen tracking only latched for Codex's '›' lead
+// (isOpenCodexComposerLine); a Claude '❯' composer's continuation line was
+// never exempted, so this second line matched the Bypass Permissions
+// banner directly.
+func TestDetectStalledPolecats_StaleStartupHeartbeat_ClaudeComposerMultilineQuote_ZeroKeys(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	writeTestStartupHeartbeat(t, f.townRoot, f.sessionName, time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking)
+
+	cmd := "clear; printf '%s\\n' '" + claudeComposerRule + "'; printf '%s\\n' '❯ explain this:'; printf '%s' '  Bypass Permissions mode'; read -r _dlg"
+	if err := f.tm.SendKeys(f.sessionName, cmd); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	before, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (before): %v", err)
+	}
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+
+	after, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if before != after {
+		t.Errorf("pane content changed — a key reached the Claude composer's multi-line draft\nbefore: %q\nafter:  %q", before, after)
+	}
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "no-known-dialog" {
+		t.Errorf("Stalled = %+v, want one entry with Action=no-known-dialog "+
+			"(a multi-line Claude composer draft's later line must never classify as a dialog banner)", result.Stalled)
+	}
+}
+
 // TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppressed
 // is the merge risk named on hq-ooijo revision 2: a tmux session name can be
 // REUSED (the old session dies, a new one is created with the identical

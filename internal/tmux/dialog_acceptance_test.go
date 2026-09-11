@@ -314,6 +314,35 @@ Bypass Permissions mode
 			content:     "› explain this to me:\n  Bypass Permissions mode",
 			wantBlocked: false,
 		},
+		{
+			name:        "Claude composer with its chrome rule holding numbered text quoting the bypass marker — must not report a blocker",
+			content:     claudeComposerRule + "\n❯ 1. What does Bypass Permissions mode do?",
+			wantBlocked: false,
+		},
+		{
+			// codex review 5637995408, Medium, tmux.go:2063: the codex
+			// update banner was matched against the whole content
+			// unconditionally, so a real prompt/composer rendered AFTER it
+			// (proving it was already dismissed) never resolved it —
+			// unlike every other dialog, which classifyStartupDialog
+			// already resolves this way. CheckStartupBlocked polling this
+			// would never return, and its caller can kill a healthy
+			// session over it (internal/polecat/session_manager.go:514,523).
+			name: "codex update banner already resolved by a later composer — must not report a blocker",
+			content: `Update available! 0.137.0 -> 0.138.0
+Update now
+Skip until next version
+› ready`,
+			wantBlocked: false,
+		},
+		{
+			name: "codex update banner still showing, no later prompt — reports a blocker",
+			content: `Update available! 0.137.0 -> 0.138.0
+Update now
+Skip until next version`,
+			wantBlocked: true,
+			wantName:    "codex update prompt",
+		},
 	}
 
 	for _, tt := range tests {

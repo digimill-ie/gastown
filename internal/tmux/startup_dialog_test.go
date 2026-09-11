@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+// claudeComposerRule is Claude Code's own horizontal-rule chrome line,
+// rendered immediately above its live input box in every permission mode
+// (measured live, v2.1.268). Fixtures print it ahead of a "❯" line so the
+// structural composer check (isClaudeComposerOpen) recognizes the line as
+// the live composer, exactly as a real captured pane would — the numbered-
+// option exclusion alone cannot tell it apart from a dialog's own cursor.
+const claudeComposerRule = "────────────────────────────────────────────────────────────────────────────"
+
 // TestClassifyStartupDialog covers both polarities required by gtn-k43 /
 // hq-ooijo: a specific known dialog is detected by content, and everything
 // else — including a working session, a busy/background hint, and a dialog
@@ -151,6 +159,57 @@ func TestClassifyStartupDialog(t *testing.T) {
 			content: "› explain this to me:\n  Bypass Permissions mode",
 			want:    DialogNone,
 		},
+		{
+			// codex review 5637995408, High, tmux.go:2162: Claude's
+			// ReadyPromptPrefix IS "❯ " (internal/config/agents.go:251), so
+			// a Claude composer holding numbered text renders pixel-for-
+			// pixel like a dialog's own cursor line. Text alone cannot
+			// distinguish them; structural confirmation (a preceding chrome
+			// rule line, isClaudeComposerOpen) is required. Measured live,
+			// Claude Code v2.1.268.
+			name:    "Claude composer holding numbered text quoting a dialog marker, with its chrome rule — must not authorise a dismissal",
+			content: claudeComposerRule + "\n❯ 1. Explain Quick safety check",
+			want:    DialogNone,
+		},
+		{
+			name:    "Claude composer holding numbered text quoting the bypass marker, with its chrome rule — must not authorise a dismissal",
+			content: claudeComposerRule + "\n❯ 1. What does Bypass Permissions mode do?",
+			want:    DialogNone,
+		},
+		{
+			// codex review 5637995408, High, tmux.go:2342: the multi-line
+			// suppression (composerOpen) only ever latched for Codex's '›'
+			// lead; a Claude '❯' composer's own continuation line — no
+			// glyph of its own — fell straight through to the dialog-marker
+			// switch.
+			name:    "Claude composer holding a multi-line quotation of the bypass marker, with its chrome rule — must not authorise a dismissal",
+			content: claudeComposerRule + "\n❯ explain this:\n  Bypass Permissions mode",
+			want:    DialogNone,
+		},
+		{
+			// Regression guard for the opposite polarity: WITHOUT a
+			// preceding chrome rule, a numbered '❯' line is still read as a
+			// dialog's own selection cursor, exactly as the theme-picker
+			// and bypass-dialog cases above require. The structural check
+			// must never fire on every '❯' line unconditionally.
+			name:    "bypass dialog cursor with no preceding rule line still classifies as the dialog",
+			content: "Bypass Permissions mode\n❯ 1. No\n  2. Yes, I accept",
+			want:    DialogBypassPermissions,
+		},
+		{
+			// codex review 5637995408, Medium, tmux.go:2342 (Codex form):
+			// stale scrollback left by a killed process must not
+			// permanently block a dialog that genuinely renders later.
+			// Claude's version of this is verified directly against
+			// isClaudeComposerStale in TestIsClaudeComposerStale below; this
+			// case exercises it through the full classifier.
+			name: "stale Claude composer from a prior incarnation does not suppress a dialog rendered after a respawn",
+			content: claudeComposerRule + "\n❯ \n" + claudeComposerRule + "\n" +
+				"  [gastown/polecats/morsov]  dd@host  /tmp/demo  Fable 5.1  18:15\n" +
+				"  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents\n\n" +
+				"Choose the text style that looks best with your terminal:\n❯ 1. Dark mode\n  2. Light mode",
+			want: DialogThemePicker,
+		},
 	}
 
 	for _, tt := range tests {
@@ -179,6 +238,16 @@ func TestContainsBackgroundTaskHint(t *testing.T) {
 		{
 			name:    "streaming/interrupt hint present",
 			content: "Thinking... (esc to interrupt)",
+			want:    true,
+		},
+		{
+			// codex review 5637995408, Medium, tmux.go:2296: this guard
+			// duplicated its own "esc to interrupt" substring check instead
+			// of reusing hasBusyIndicator, so it went stale the same way —
+			// current Claude Code (v2.1.268) renders neither text while
+			// thinking. Measured live, gtn-bl1.
+			name:    "claude spinner busy, no esc-to-interrupt text anywhere",
+			content: "❯ write the essay\n\n· Billowing… (29s · thinking more)\n\n" + claudeComposerRule + "\n❯ ",
 			want:    true,
 		},
 		{
@@ -397,6 +466,53 @@ func TestDetectAndDismissKnownDialog_QuotedDialogTextInComposerSendsNoKeys(t *te
 	}
 }
 
+// TestDetectAndDismissKnownDialog_ClaudeComposerNumberedQuoteSendsNoKeys is
+// the Claude runtime's counterpart to the Codex test above, and the exact
+// shape codex named for the surviving High (codex review 5637995408:
+// "internal/tmux/tmux.go:2162 — ... a Claude composer holding `❯ 1.
+// Explain Quick safety check` ... passes classification"). Claude's own
+// dialog cursor and its live composer prompt render with the IDENTICAL '❯'
+// glyph (internal/config/agents.go:251), so this can only pass once
+// recognition is structural (a preceding chrome rule), not textual.
+func TestDetectAndDismissKnownDialog_ClaudeComposerNumberedQuoteSendsNoKeys(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-detect-claude-numbered-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	cmd := "clear; printf '%s\\n' '" + claudeComposerRule + "'; printf '%s' '❯ 1. Explain Quick safety check'; read -r _dlg"
+	if err := tm.SendKeys(sessionName, cmd); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	before, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (before): %v", err)
+	}
+
+	kind, err := tm.DetectAndDismissKnownDialog(sessionName)
+	if err != nil {
+		t.Fatalf("DetectAndDismissKnownDialog: %v", err)
+	}
+	if kind != DialogNone {
+		t.Fatalf("kind = %q, want DialogNone (a Claude composer's numbered draft must not authorise a dismissal)", kind)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	after, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if before != after {
+		t.Errorf("pane content changed — a key reached the Claude composer quoting dialog text\nbefore: %q\nafter:  %q", before, after)
+	}
+}
+
 // TestDetectAndDismissKnownDialog_DismissesTrustDialog verifies the positive
 // case: a real dialog is detected and its specific key sequence is sent.
 func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
@@ -562,7 +678,12 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading verdict marker: %v", err)
 	}
-	if !strings.Contains(string(verdict), "^[[B:end:clean") {
+	// Exact equality, not Contains: "^[[B^[[B:end:clean" (an accidental
+	// extra Down before the real one) CONTAINS the accepted suffix
+	// "^[[B:end:clean" as a substring, so a Contains check here would still
+	// pass with a duplicate key on the wire (codex review 5637995408,
+	// Medium, startup_dialog_test.go:565).
+	if string(verdict) != "^[[B:end:clean" {
 		t.Errorf("dismiss did not send exactly Down then Enter and nothing else: %q", verdict)
 	}
 }
@@ -765,5 +886,118 @@ func TestDismissDialog_InvalidKind(t *testing.T) {
 	err := tm.DismissDialog(sessionName, StartupDialogKind("bogus"))
 	if err == nil {
 		t.Fatal("expected error for unknown dialog kind, got nil")
+	}
+}
+
+// TestIsRuleLine pins the structural signature isClaudeComposerOpen and
+// isClaudeComposerStale both depend on: Claude Code's own horizontal-rule
+// chrome line. If this stops matching the real rule, both structural
+// checks silently stop firing and the numbered-composer High (tmux.go:2162)
+// reopens.
+func TestIsRuleLine(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"real chrome rule", claudeComposerRule, true},
+		{"real chrome rule with surrounding whitespace", "  " + claudeComposerRule + "  ", true},
+		{"short dash run", "──────", false},
+		{"ascii hyphens, not the rule glyph", strings.Repeat("-", 80), false},
+		{"ordinary text", "❯ 1. Explain Quick safety check", false},
+		{"empty", "", false},
+		{"theme picker's own divider glyph, not the composer rule", strings.Repeat("╌", 80), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRuleLine(tt.line); got != tt.want {
+				t.Errorf("isRuleLine(%q) = %v, want %v", tt.line, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsClaudeComposerOpen covers both polarities of the structural check
+// itself, isolated from the full classifier: a numbered "❯" line reads as
+// the live composer ONLY when a chrome rule immediately precedes it —
+// otherwise it must still read as a dialog's own selection cursor (codex
+// review 5637995408, High, tmux.go:2162).
+func TestIsClaudeComposerOpen(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		i     int
+		want  bool
+	}{
+		{"bare composer preceded by rule", []string{claudeComposerRule, "❯ "}, 1, true},
+		{"numbered composer preceded by rule", []string{claudeComposerRule, "❯ 1. Explain Quick safety check"}, 1, true},
+		{"numbered dialog cursor with NO preceding rule", []string{"Bypass Permissions mode", "❯ 1. No"}, 1, false},
+		{"numbered dialog cursor preceded by banner text, not a rule", []string{"Choose the text style:", "❯ 2. Dark mode"}, 1, false},
+		{"composer as the very first line — no line to precede it", []string{"❯ hello"}, 0, false},
+		{"not a composer lead at all", []string{claudeComposerRule, "  2. Yes, I accept"}, 1, false},
+		{"codex composer lead is not this check's concern", []string{claudeComposerRule, "› hello"}, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isClaudeComposerOpen(tt.lines, tt.i); got != tt.want {
+				t.Errorf("isClaudeComposerOpen(%v, %d) = %v, want %v", tt.lines, tt.i, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsClaudeComposerStale covers both polarities of the respawn-recovery
+// fix (codex review 5637995408, Medium, tmux.go:2342): a composer whose own
+// closing frame (rule, then status footer) is followed by further content
+// is leftover scrollback from a prior process, not the live input box.
+func TestIsClaudeComposerStale(t *testing.T) {
+	footer := "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents"
+	tests := []struct {
+		name  string
+		lines []string
+		i     int
+		want  bool
+	}{
+		{
+			name:  "live composer, nothing after its own frame",
+			lines: []string{claudeComposerRule, "❯ ", claudeComposerRule, footer},
+			i:     1,
+			want:  false,
+		},
+		{
+			name:  "live composer, only blank lines after its own frame",
+			lines: []string{claudeComposerRule, "❯ ", claudeComposerRule, footer, "", ""},
+			i:     1,
+			want:  false,
+		},
+		{
+			name: "stale composer followed by a freshly rendered dialog after respawn",
+			lines: []string{
+				claudeComposerRule, "❯ ", claudeComposerRule, footer, "",
+				"Choose the text style that looks best with your terminal:",
+				"❯ 1. Dark mode", "  2. Light mode",
+			},
+			i:    1,
+			want: true,
+		},
+		{
+			name:  "no closing rule found within the capture — conservative default",
+			lines: []string{claudeComposerRule, "❯ some very long unterminated draft"},
+			i:     1,
+			want:  false,
+		},
+		{
+			name:  "closing rule present but not followed by the expected footer shape",
+			lines: []string{claudeComposerRule, "❯ ", claudeComposerRule, "unexpected content"},
+			i:     1,
+			want:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isClaudeComposerStale(tt.lines, tt.i); got != tt.want {
+				t.Errorf("isClaudeComposerStale(_, %d) = %v, want %v", tt.i, got, tt.want)
+			}
+		})
 	}
 }

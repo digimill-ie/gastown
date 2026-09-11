@@ -2287,6 +2287,17 @@ func TestHasBusyIndicator(t *testing.T) {
 		{"codex status busy", "• Working (2m 18s • esc to interrupt)", true},
 		{"idle line", "› Review ready notification", false},
 		{"blank", "", false},
+		// codex review 5637995408, Medium: current Claude Code (v2.1.268)
+		// no longer renders "esc to interrupt" at all, while thinking OR
+		// while running a tool — measured live, gtn-bl1. The spinner
+		// randomizes its glyph and verb every turn, so detection keys on
+		// the shared ellipsis+duration shape instead of a fixed word.
+		{"claude spinner busy, thinking, no esc-to-interrupt text", "· Billowing… (29s · thinking more)", true},
+		{"claude spinner busy, tool running, no esc-to-interrupt text", "  ⎿  Running… (11s · timeout 1m)", true},
+		{"claude spinner busy, token count, no esc-to-interrupt text", "✢ Pontificating… (16s · ↓ 276 tokens)", true},
+		{"claude spinner busy, minutes elapsed", "· Spinning… (14m 50s · ↓ 82.7k tokens · thinking)", true},
+		{"ellipsis with no duration is not a busy indicator", "Let's get started…", false},
+		{"parenthesized non-duration text is not a busy indicator", "See the docs… (details)", false},
 	}
 
 	for _, tt := range tests {

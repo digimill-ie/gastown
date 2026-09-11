@@ -2060,8 +2060,18 @@ func containsWorkspaceTrustDialog(content string) bool {
 // that pre-existing, unchanged behavior rather than folding it into
 // classifyStartupDialog's per-line switch, which is out of this fix's scope.
 func containsBlockingStartupDialog(content string) (string, bool) {
-	if containsCodexUpdateDialog(content) {
-		return "codex update prompt", true
+	if blockerLine, ok := lastCodexUpdateDialogLine(content); ok {
+		// Same resolved-by-a-later-prompt check classifyStartupDialog
+		// applies to every other dialog: an update banner that has already
+		// scrolled past a real prompt/composer is answered, not blocking.
+		// Without this, a composer that opened AFTER the banner — e.g.
+		// "Update available!\nUpdate now\nSkip until next version\n› ready"
+		// — stayed reported as blocked forever, and CheckStartupBlocked's
+		// caller can terminate a healthy session on that false positive
+		// (codex review 5637995408, Medium; internal/polecat/session_manager.go:514,523).
+		if promptLine := lastPromptIndicatorLine(content); promptLine <= blockerLine {
+			return "codex update prompt", true
+		}
 	}
 	switch classifyStartupDialog(content) {
 	case DialogWorkspaceTrust:
@@ -2073,10 +2083,34 @@ func containsBlockingStartupDialog(content string) (string, bool) {
 	}
 }
 
-func containsCodexUpdateDialog(content string) bool {
-	return strings.Contains(content, "Update available!") &&
-		strings.Contains(content, "Update now") &&
-		strings.Contains(content, "Skip until next version")
+// codexUpdateDialogMarkers are Codex's own "new version available" startup
+// banner, each rendered on its own line — never a single per-line match
+// (see lastCodexUpdateDialogLine's doc comment).
+var codexUpdateDialogMarkers = []string{"Update available!", "Update now", "Skip until next version"}
+
+// lastCodexUpdateDialogLine returns the index of the LAST line carrying any
+// of codexUpdateDialogMarkers, and true, only if ALL three markers are
+// present somewhere in content — matching containsCodexUpdateDialog's old
+// all-three-present contract, but now exposing WHERE the banner ends so
+// containsBlockingStartupDialog can tell whether it has already been
+// resolved by a later prompt.
+func lastCodexUpdateDialogLine(content string) (int, bool) {
+	seen := make([]bool, len(codexUpdateDialogMarkers))
+	last := -1
+	for i, line := range strings.Split(content, "\n") {
+		for m, marker := range codexUpdateDialogMarkers {
+			if strings.Contains(line, marker) {
+				seen[m] = true
+				last = i
+			}
+		}
+	}
+	for _, ok := range seen {
+		if !ok {
+			return -1, false
+		}
+	}
+	return last, true
 }
 
 // promptSuffixes are strings that indicate a shell or agent prompt is visible
@@ -2115,11 +2149,101 @@ var composerPrefixes = []string{">", "›", "❯"}
 // tmux.go:2175).
 var dialogOptionLinePattern = regexp.MustCompile(`^\d+\.\s`)
 
+// ruleLinePattern matches Claude Code's own horizontal-rule chrome: a line
+// consisting solely of the box-drawing character U+2500 ('─'), repeated.
+// Claude draws this rule immediately above (and, content permitting,
+// immediately below) its live input box in EVERY permission mode — auto,
+// accept-edits, plan, bypass-permissions — measured live against Claude
+// Code v2.1.268 (gtn-bl1). No known startup dialog (workspace trust,
+// bypass-permissions warning, theme picker) renders this rule adjacent to
+// its own option list; each either has no adjacent rule at all or is
+// followed by a plain hint line ("Enter to confirm · Esc to cancel"). The
+// minimum length guards against a coincidental short run of the character
+// in ordinary output; a real chrome rule always spans nearly the full pane
+// width.
+var ruleLinePattern = regexp.MustCompile(`^─{10,}$`)
+
+func isRuleLine(line string) bool {
+	return ruleLinePattern.MatchString(strings.TrimSpace(line))
+}
+
+// isClaudeComposerOpen reports whether lines[i] is Claude's OWN live input
+// line — as opposed to a dialog's selection cursor rendered with the
+// identical '❯' glyph. Text alone cannot tell these apart: a multi-line
+// composer draft (a soft-newline continuation, e.g. after typing "1. ..."
+// then a newline then "2. ...") renders pixel-for-pixel like a real
+// dialog's own numbered option list (measured live). What differs is the
+// FRAME: Claude always draws its horizontal-rule chrome line immediately
+// above its live input box; no known dialog's option list has one there.
+// This is checked ahead of lineIsPromptIndicator's numbered-option
+// exclusion so a structurally-confirmed composer line is never mistaken
+// for a dialog's cursor, regardless of whether its content is numbered,
+// quoted, or otherwise shaped like one (codex review 5637995408, High,
+// tmux.go:2162; gtn-bl1).
+func isClaudeComposerOpen(lines []string, i int) bool {
+	trimmed := strings.TrimSpace(lines[i])
+	if trimmed != "❯" && !strings.HasPrefix(trimmed, "❯ ") {
+		return false
+	}
+	return i > 0 && isRuleLine(lines[i-1])
+}
+
+// claudeComposerFooterPattern matches the second line of Claude Code's own
+// status footer, rendered directly below its input box's closing rule in
+// EVERY permission mode (measured live, v2.1.268): e.g. "⏵⏵ bypass
+// permissions on (shift+tab to cycle) · ← 2 agents", "⏸ plan mode on
+// (shift+tab to cycle)". This is Claude's own app chrome, drawn once per
+// frame — never something a dialog or user-typed composer content renders.
+var claudeComposerFooterPattern = regexp.MustCompile(`\(shift\+tab to cycle\)`)
+
+// isClaudeComposerStale reports whether the composer confirmed open at
+// lines[i] (isClaudeComposerOpen) is leftover scrollback from a process
+// that has since respawned, rather than the CURRENTLY live input box. A
+// genuinely open composer's own frame — the composer line(s), a closing
+// rule, then its status footer — is always the LAST thing rendered in a
+// captured pane. If further non-blank content follows that closing frame,
+// this composer belongs to a prior process incarnation and must not
+// suppress a dialog rendered after it (codex review 5637995408, Medium,
+// tmux.go:2342: an old submitted composer line left in scrollback,
+// followed by a freshly rendered dialog after a process respawn, read as
+// still-open and blocked legitimate recovery).
+//
+// When the expected frame shape (composer, rule, footer) is not found
+// within the capture, this conservatively reports "not stale" — the
+// pre-existing, safer behavior (suppress to end of content) applies rather
+// than guessing.
+func isClaudeComposerStale(lines []string, i int) bool {
+	j := i + 1
+	for j < len(lines) && !isRuleLine(lines[j]) {
+		j++
+	}
+	if j >= len(lines) {
+		return false
+	}
+	footerLine := -1
+	for k := j + 1; k < len(lines) && k <= j+2; k++ {
+		if claudeComposerFooterPattern.MatchString(lines[k]) {
+			footerLine = k
+			break
+		}
+	}
+	if footerLine == -1 {
+		return false
+	}
+	for _, rest := range lines[footerLine+1:] {
+		if strings.TrimSpace(rest) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // containsPromptIndicator checks if pane content contains a prompt indicator
 // that signals a shell or agent is ready (no dialog blocking it).
 func containsPromptIndicator(content string) bool {
-	for _, line := range strings.Split(content, "\n") {
-		if lineIsPromptIndicator(line) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if lineIsPromptIndicator(line) || isClaudeComposerOpen(lines, i) {
 			return true
 		}
 	}
@@ -2168,9 +2292,10 @@ func lineIsPromptIndicator(line string) bool {
 }
 
 func lastPromptIndicatorLine(content string) int {
+	lines := strings.Split(content, "\n")
 	last := -1
-	for i, line := range strings.Split(content, "\n") {
-		if lineIsPromptIndicator(line) {
+	for i, line := range lines {
+		if lineIsPromptIndicator(line) || isClaudeComposerOpen(lines, i) {
 			last = i
 		}
 	}
@@ -2293,9 +2418,26 @@ func containsThemePickerDialog(content string) bool {
 // agent is actively streaming output. A session showing either is genuinely
 // busy: it must never be treated as a startup stall no matter how stale the
 // tmux activity fields read (gtn-k43, measured 2026-09-11 on gastown/furiosa).
+//
+// Streaming detection is delegated to hasBusyIndicator — the SAME check
+// WaitForIdle/IsIdle use — rather than a second hardcoded "esc to
+// interrupt" substring test. The two used to diverge, and diverging is how
+// this guard went stale: current Claude Code (v2.1.268) no longer renders
+// "esc to interrupt" at all while thinking or running a tool (measured
+// live, gtn-bl1: "· Billowing… (29s · thinking more)",
+// "Bash(...)\n  ⎿  Running… (11s · timeout 1m)"), so a Claude polecat
+// mid-turn could read as idle for the guard's entire stall threshold
+// (codex review 5637995408, Medium; witness measurement, hq-wisp-y46vn).
 func ContainsBackgroundTaskHint(content string) bool {
-	return strings.Contains(content, "Running in the background") ||
-		strings.Contains(content, "esc to interrupt")
+	if strings.Contains(content, "Running in the background") {
+		return true
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if hasBusyIndicator(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // isOpenCodexComposerLine reports whether line is Codex's own live
@@ -2316,10 +2458,27 @@ func isOpenCodexComposerLine(line string) bool {
 // and kind of the LAST known dialog marker found, or (-1, DialogNone) if
 // none appear.
 func lastKnownDialogLine(content string) (int, StartupDialogKind) {
+	lines := strings.Split(content, "\n")
 	lastLine := -1
 	lastKind := DialogNone
 	composerOpen := false
-	for i, line := range strings.Split(content, "\n") {
+	for i, line := range lines {
+		// Claude's own live input line, confirmed by its chrome rule
+		// (isClaudeComposerOpen) rather than by content shape, is checked
+		// BEFORE the generic prompt-indicator/numbered-option logic below.
+		// A numbered or multi-line composer draft ("❯ 1. Explain Quick
+		// safety check", or a soft-newline continuation quoting "Bypass
+		// Permissions mode" on its own line) is otherwise indistinguishable
+		// by text alone from a real dialog's own numbered cursor line —
+		// measured live against Claude Code v2.1.268, both render with the
+		// identical glyph and indentation (codex review 5637995408, High,
+		// tmux.go:2162, :2342; gtn-bl1). Once confirmed, everything from
+		// here to the end of content is that SAME open composer, exactly
+		// as isOpenCodexComposerLine already guarantees for Codex's '›'.
+		if !composerOpen && isClaudeComposerOpen(lines, i) && !isClaudeComposerStale(lines, i) {
+			composerOpen = true
+			continue
+		}
 		// A live composer line that QUOTES dialog text on the same line
 		// (e.g. "› explain Bypass Permissions mode") is not the dialog —
 		// it is typed content that happens to mention it. The old
@@ -3569,9 +3728,9 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 // renders in its status bar while actively generating. Detection of "is the
 // agent working?" scrapes the pane for any of these (see hasBusyIndicator), and
 // that signal underpins IsIdle, WaitForIdle, and the nudge Escape-suppression in
-// shouldSendEscape. Claude Code, Codex, and Gemini all surface "esc to
-// interrupt"; if an agent uses different wording, add it here — that is the only
-// place that needs to change.
+// shouldSendEscape. Codex still surfaces "esc to interrupt" (measured live,
+// v0.154.0: "Working (9s • esc to interrupt)"); if an agent uses different
+// wording, add it here — that is the only place that needs to change.
 //
 // FRAGILITY (gastownhall/gastown#4240): this couples to upstream TUI status
 // text. Scraping the status bar cannot detect a silent upstream rename on its
@@ -3583,10 +3742,26 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 // counterpart.
 var busyIndicators = []string{"esc to interrupt"}
 
+// claudeSpinnerPattern matches Claude Code's own "actively working" status
+// line, independent of "esc to interrupt": current Claude Code (v2.1.268)
+// no longer renders that text at all, while thinking OR while running a
+// tool. Measured live (gtn-bl1): "· Billowing… (29s · thinking more)",
+// "✢ Pontificating… (16s · ↓ 276 tokens)", "Running… (11s · timeout 1m)".
+// Claude Code randomizes the leading glyph and the gerund verb every turn,
+// so no fixed substring survives across turns — but every observed variant
+// shares one shape: an ellipsis, then a parenthesized elapsed-duration
+// group. That shape is not something a person or an agent types in
+// ordinary composer text (codex review 5637995408, Medium; witness
+// measurement 2026-09-11, hq-wisp-y46vn).
+var claudeSpinnerPattern = regexp.MustCompile(`…\s*\(\d+(h|m|s)\b`)
+
 func hasBusyIndicator(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return false
+	}
+	if claudeSpinnerPattern.MatchString(trimmed) {
+		return true
 	}
 	for _, marker := range busyIndicators {
 		marker = strings.TrimSpace(marker)
