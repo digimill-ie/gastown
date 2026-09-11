@@ -75,7 +75,7 @@ func TestHandleFailedInjection_ComposerDirtyDeadLettersImmediately(t *testing.T)
 	drained := []nudge.QueuedNudge{
 		{ID: "dirty1", Sender: "test", Message: "stuck payload", Timestamp: time.Now()},
 	}
-	deliverErr := fmt.Errorf("%w: %w (composer contains other text after Enter)", tmux.ErrSubmitNotVerified, tmux.ErrComposerDirty)
+	deliverErr := fmt.Errorf("%w (composer contains other text after Enter)", tmux.ErrSubmitNotVerified)
 
 	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
 
@@ -369,7 +369,7 @@ func TestHandleFailedInjection_DirtyDeadLetterWriteFailureRetainsRatherThanReque
 	drained := []nudge.QueuedNudge{
 		{ID: "dirty-and-unwritable", Sender: "test", Message: "must not be retyped", Timestamp: time.Now()},
 	}
-	deliverErr := fmt.Errorf("%w: %w", tmux.ErrSubmitNotVerified, tmux.ErrComposerDirty)
+	deliverErr := fmt.Errorf("%w (composer contains other text after Enter)", tmux.ErrSubmitNotVerified)
 
 	unresolved := handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
 	if len(unresolved) != 1 || unresolved[0].ID != "dirty-and-unwritable" {

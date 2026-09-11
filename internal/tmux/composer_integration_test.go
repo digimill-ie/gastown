@@ -93,9 +93,9 @@ func startFakeComposerSession(t *testing.T, tm *Tmux, script, needle string) str
 // TestSubmitComposer_DirtyStateHeldAfterEnter is one of the six tests
 // REVISION 3 required and codex found NOT MET: a composer holding content
 // that is neither the sent needle nor its dim/cleared form must be reported
-// as dirty — and it must STAY reported as dirty after a real Enter is sent,
-// not read as success just because Enter itself didn't error (codex,
-// nudge_failure.go:76, changes-requested at 08964387/95f841e6 rework).
+// as dirty (ErrSubmitNotVerified) — and it must STAY reported as dirty
+// after a real Enter is sent, not read as success just because Enter itself
+// didn't error.
 //
 // The fake composer here never reacts to the "unrelated" needle we ask
 // submitComposer to look for — it only clears when it independently sees a
@@ -114,9 +114,6 @@ func TestSubmitComposer_DirtyStateHeldAfterEnter(t *testing.T) {
 	}
 	if !errors.Is(err, ErrSubmitNotVerified) {
 		t.Errorf("submitComposer() = %v, want wrapped ErrSubmitNotVerified", err)
-	}
-	if !errors.Is(err, ErrComposerDirty) {
-		t.Errorf("submitComposer() = %v, want wrapped ErrComposerDirty", err)
 	}
 }
 

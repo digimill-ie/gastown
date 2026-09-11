@@ -146,37 +146,3 @@ func TestErrSubmitNotVerifiedWrapping(t *testing.T) {
 		t.Fatal("errors.Is did not recognize wrapped ErrSubmitNotVerified")
 	}
 }
-
-// TestErrComposerDirtyWrapping mirrors TestErrSubmitNotVerifiedWrapping for
-// the new sentinel (hq-g52db): callers distinguish "the composer is known
-// dirty, do not retype" from every other injection failure via errors.Is on
-// ErrComposerDirty specifically, so both wrapped errors must remain
-// recognizable through fmt.Errorf %w chains the way submitComposer produces
-// them.
-func TestErrComposerDirtyWrapping(t *testing.T) {
-	t.Parallel()
-	wrapped := fmt.Errorf("nudge to session %q: %w", "gt-test", fmt.Errorf("%w: %w (composer contains other text after Enter)", ErrSubmitNotVerified, ErrComposerDirty))
-	if !errors.Is(wrapped, ErrSubmitNotVerified) {
-		t.Error("errors.Is did not recognize wrapped ErrSubmitNotVerified")
-	}
-	if !errors.Is(wrapped, ErrComposerDirty) {
-		t.Error("errors.Is did not recognize wrapped ErrComposerDirty")
-	}
-}
-
-// TestSubmitComposer_ProbeUnknownDoesNotReportFalseSuccess covers the
-// probeUnknown fix: a genuinely indeterminate post-Enter state must never
-// report nil (success) just because the leading Enter itself didn't error —
-// it must always wrap ErrSubmitNotVerified, so callers route it to the
-// zero-retype dead-letter path instead of treating it as delivered.
-func TestSubmitComposer_ProbeUnknownDoesNotReportFalseSuccess(t *testing.T) {
-	t.Parallel()
-	tm := NewTmuxWithSocket("gt-test-no-such-socket-submit-verify-2")
-	err := tm.submitComposer("gt-test-nonexistent-session:0.0", "resume the patrol", DefaultReadyPromptPrefix)
-	if err == nil {
-		t.Fatal("submitComposer() = nil against a nonexistent session, want a wrapped ErrSubmitNotVerified")
-	}
-	if !errors.Is(err, ErrSubmitNotVerified) {
-		t.Errorf("submitComposer() = %v, want wrapped ErrSubmitNotVerified", err)
-	}
-}

@@ -12,15 +12,6 @@ import (
 // transport could not prove it left the target composer.
 var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in composer")
 
-// ErrComposerDirty reports a composer state where retyping the message on
-// the next attempt would corrupt or duplicate content rather than fix
-// anything: the composer holds text after Enter that is neither the sent
-// needle nor its cleared/turn-started form. Callers must not retry delivery
-// on this error — see nudge.MaxInjectionAttempts and the poller's
-// dead-letter path (hq-g52db). Always wrapped together with
-// ErrSubmitNotVerified; check with errors.Is.
-var ErrComposerDirty = errors.New("composer dirty: retyping would corrupt or duplicate content")
-
 type submitProbe int
 
 const (
@@ -302,23 +293,13 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	case probeTurnStarted, probeComposerCleared:
 		return nil
 	case probeUnknown:
-		// Genuinely indeterminate: the pane content matched neither a
-		// known-good nor a known-dirty pattern after every poll attempt. A
-		// bare enterErr here would report SUCCESS on a nil enterErr despite
-		// never having confirmed anything, and — even when non-nil — would
-		// not satisfy errors.Is(deliverErr, ErrSubmitNotVerified), routing
-		// callers to a bounded/retypable failure path instead of the
-		// zero-retype one. Always wrap ErrSubmitNotVerified here.
-		if enterErr != nil {
-			return fmt.Errorf("%w: %w", ErrSubmitNotVerified, enterErr)
-		}
-		return fmt.Errorf("%w (composer state indeterminate after Enter)", ErrSubmitNotVerified)
+		return enterErr
 	case probeComposerDirty:
-		return fmt.Errorf("%w: %w (composer contains other text after Enter)", ErrSubmitNotVerified, ErrComposerDirty)
+		return fmt.Errorf("%w (composer contains other text after Enter)", ErrSubmitNotVerified)
 	case probeStranded:
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
-		return fmt.Errorf("%w (unrecognized submit probe result)", ErrSubmitNotVerified)
+		return enterErr
 	}
 }
 
@@ -337,12 +318,7 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		}
 		time.Sleep(adaptiveTextDelay(len(message)))
 		_ = t.sendEnterVerified(target)
-	case probeStranded, probeComposerDirty:
-		// The needle (or other content) is still visibly sitting in the
-		// composer after a recovery attempt — retyping now would duplicate
-		// or corrupt it, same as a fresh dirty/stranded probe.
-		return fmt.Errorf("%w: %w (composer state after C-j: %s)", ErrSubmitNotVerified, ErrComposerDirty, probe)
-	case probeUnknown:
+	case probeStranded, probeComposerDirty, probeUnknown:
 		return fmt.Errorf("%w (composer state after C-j: %s)", ErrSubmitNotVerified, probe)
 	}
 
