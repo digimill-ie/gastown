@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -14,6 +15,35 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// drainAndPrintQueuedNudges claims queued nudges for sessionName, writes
+// them to w, and only then acks the claims — never the reverse. Drain acks
+// (deletes) each entry the instant it is read, BEFORE a caller even
+// attempts to deliver it, so a crash or w.Write simply failing (e.g. a
+// closed stdout) lost the nudge with no durable trace, and the write error
+// was silently ignored besides (codex, mail_check.go:106, changes-requested
+// at REVISION 3 — High 5). Order everywhere: claim, deliver, THEN ack —
+// same discipline as nudge_poller.go and watchAndDeliver. Claims whose
+// write fails are left un-acked so a future orphan sweep restores them
+// instead of losing them.
+func drainAndPrintQueuedNudges(townRoot, sessionName string, w io.Writer) {
+	claims, drainErr := nudge.DrainClaims(townRoot, sessionName)
+	if drainErr != nil {
+		fmt.Fprintf(os.Stderr, "gt mail check: nudge queue drain error: %v\n", drainErr)
+		return
+	}
+	if len(claims) == 0 {
+		return
+	}
+	out := nudge.FormatForInjection(claimNudges(claims))
+	if _, writeErr := io.WriteString(w, out); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "gt mail check: failed to print queued nudges, leaving claims unacked for recovery: %v\n", writeErr)
+		return
+	}
+	nudge.AckClaims(claims, nil, func(c nudge.Claim, ackErr error) {
+		fmt.Fprintf(os.Stderr, "gt mail check: failed to ack nudge claim for %s: %v\n", c.Nudge.ID, ackErr)
+	})
+}
 
 func runMailCheck(cmd *cobra.Command, args []string) error {
 	// Determine which inbox (priority: --identity flag, auto-detect)

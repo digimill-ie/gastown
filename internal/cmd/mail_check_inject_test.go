@@ -1,11 +1,81 @@
 package cmd
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/nudge"
 )
+
+// failingWriter always errors, simulating a closed stdout.
+type failingWriter struct{}
+
+func (failingWriter) Write(p []byte) (int, error) {
+	return 0, errors.New("simulated write failure (closed stdout)")
+}
+
+// TestDrainAndPrintQueuedNudges_WriteFailureRetainsClaim covers High 5
+// (mail_check.go:106): the hook drain must claim, deliver, THEN ack — not
+// ack immediately on read (the old nudge.Drain call). If the write fails
+// (a closed stdout, or any other I/O error), the claim must be left
+// un-acked so a future orphan sweep can recover it, instead of being lost
+// the instant it was read.
+func TestDrainAndPrintQueuedNudges_WriteFailureRetainsClaim(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-mailcheck-writefail"
+
+	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+		ID: "wf-1", Sender: "test", Message: "must survive a failed print",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	drainAndPrintQueuedNudges(townRoot, session, failingWriter{})
+
+	// Not acked: the claim must still exist (as a retained claim), not a
+	// fresh pending .json (Drain used to delete it before ever trying to
+	// print it).
+	has, err := nudge.PendingOrClaimed(townRoot, session)
+	if err != nil {
+		t.Fatalf("PendingOrClaimed: %v", err)
+	}
+	if !has {
+		t.Fatal("claim was lost when the write failed — drainAndPrintQueuedNudges must retain it for recovery")
+	}
+	if pending, _ := nudge.Pending(townRoot, session); pending != 0 {
+		t.Fatalf("Pending = %d, want 0 (the claim must stay claimed, not be visible as a plain pending entry)", pending)
+	}
+}
+
+// TestDrainAndPrintQueuedNudges_SuccessAcksClaim is the true-case
+// companion: a successful write must ack the claim so the nudge is not
+// redelivered on the next check.
+func TestDrainAndPrintQueuedNudges_SuccessAcksClaim(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-mailcheck-success"
+
+	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+		ID: "ok-1", Sender: "test", Message: "delivered nudge",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	var buf strings.Builder
+	drainAndPrintQueuedNudges(townRoot, session, &buf)
+
+	if !strings.Contains(buf.String(), "delivered nudge") {
+		t.Fatalf("output = %q, want it to contain the nudge message", buf.String())
+	}
+	has, err := nudge.PendingOrClaimed(townRoot, session)
+	if err != nil {
+		t.Fatalf("PendingOrClaimed: %v", err)
+	}
+	if has {
+		t.Fatal("claim was left behind after a successful print — must be acked")
+	}
+}
 
 func TestFormatInjectOutput(t *testing.T) {
 	// Helper to build test messages with a given priority.
