@@ -445,7 +445,19 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			// Ack only the RESOLVED claims — see the matching comment in
 			// nudge_poller.go.
 			ackClaims(sourceIdleWatcher, sessionName, claims, unresolved)
-			return
+			if len(unresolved) == 0 {
+				return
+			}
+			// An unconditional return here (the prior behavior) exits the
+			// watcher the instant it drains ANY batch, even one that left
+			// entries unresolved (a dead-letter/requeue write that itself
+			// failed, or a claim retained after a busy/crashed prior
+			// attempt) — stranding recovery on a brand-new `gt nudge`
+			// invocation for the rest of idleWatcherTimeout's remaining
+			// window, when this watcher could keep polling and give
+			// DrainClaims' own orphan sweep a chance instead (codex,
+			// nudge.go:415, changes-requested at REVISION 3 — Medium).
+			// Falls through to the outer loop rather than returning.
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.

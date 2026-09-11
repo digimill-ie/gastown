@@ -39,12 +39,20 @@ func TestNudgeFlock_PaneAndSessionDeliveryShareLockPath(t *testing.T) {
 	townRoot := t.TempDir()
 	sessionLockPath := nudgeFlockPath(townRoot, sessionName)
 
-	unlock, err := acquireFlockLock(sessionLockPath, time.Second)
+	unlock, err := acquireFlockLock(sessionLockPath, 5*time.Second)
 	if err != nil {
 		t.Fatalf("acquireFlockLock: %v", err)
 	}
 
-	const holdTime = 500 * time.Millisecond
+	// holdTime must clear the delivery protocol's OWN fixed internal
+	// delays (adaptiveTextDelay ~500ms + the 600ms post-Escape wait, an
+	// unconditional ~1.1s floor with no flock involved at all), or the
+	// threshold below passes trivially regardless of whether the flock
+	// blocked anything — exactly the gap codex found: 450ms as a
+	// threshold is BELOW that floor, so these tests passed even with the
+	// flock removed (codex, nudge_flock_test.go:66,:110, changes-requested
+	// at REVISION 3 — Medium). 3s gives a wide margin above that floor.
+	const holdTime = 3 * time.Second
 	released := make(chan struct{})
 	go func() {
 		time.Sleep(holdTime)
@@ -63,7 +71,7 @@ func TestNudgeFlock_PaneAndSessionDeliveryShareLockPath(t *testing.T) {
 	if deliverErr != nil {
 		t.Fatalf("NudgePaneWithOpts: %v", deliverErr)
 	}
-	if elapsed < holdTime-50*time.Millisecond {
+	if elapsed < holdTime-200*time.Millisecond {
 		t.Errorf("NudgePaneWithOpts completed after %v while the session's cross-process flock was held for %v — it did not serialize on the same lock path as NudgeSessionWithOpts would", elapsed, holdTime)
 	}
 }
@@ -86,12 +94,17 @@ func TestNudgeFlock_SessionDeliveryBlocksOnHeldLock(t *testing.T) {
 	townRoot := t.TempDir()
 	lockPath := nudgeFlockPath(townRoot, sessionName)
 
-	unlock, err := acquireFlockLock(lockPath, time.Second)
+	unlock, err := acquireFlockLock(lockPath, 5*time.Second)
 	if err != nil {
 		t.Fatalf("acquireFlockLock: %v", err)
 	}
 
-	const holdTime = 500 * time.Millisecond
+	// See the matching comment in
+	// TestNudgeFlock_PaneAndSessionDeliveryShareLockPath: holdTime must
+	// clear the delivery protocol's own ~1.1s fixed-delay floor or this
+	// threshold passes even with the flock removed (codex,
+	// nudge_flock_test.go:110, changes-requested at REVISION 3 — Medium).
+	const holdTime = 3 * time.Second
 	released := make(chan struct{})
 	go func() {
 		time.Sleep(holdTime)
@@ -107,7 +120,7 @@ func TestNudgeFlock_SessionDeliveryBlocksOnHeldLock(t *testing.T) {
 	if deliverErr != nil {
 		t.Fatalf("NudgeSessionWithOpts: %v", deliverErr)
 	}
-	if elapsed < holdTime-50*time.Millisecond {
+	if elapsed < holdTime-200*time.Millisecond {
 		t.Errorf("NudgeSessionWithOpts completed after %v while its own session flock was held for %v — it did not block on the lock", elapsed, holdTime)
 	}
 }
