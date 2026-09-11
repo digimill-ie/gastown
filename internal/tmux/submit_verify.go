@@ -344,18 +344,8 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		}
 		time.Sleep(adaptiveTextDelay(len(message)))
 		_ = t.sendEnterVerified(target)
-	case probeStranded, probeComposerDirty:
-		// The composer still visibly holds the needle (stranded) or other
-		// content (dirty) after the C-j reset attempt: a caller that treats
-		// this as an ordinary bounded failure and retypes on the next
-		// attempt would type straight on top of it. Wrap ErrComposerDirty
-		// too, not just ErrSubmitNotVerified, so a caller keying on either
-		// error sees the same "do not retype" signal a fresh (non-recovery)
-		// dirty/stranded probe already gives (codex, submit_verify.go:348,
-		// changes-requested at 08964387).
-		return fmt.Errorf("%w: %w (composer state after C-j: %s)", ErrSubmitNotVerified, ErrComposerDirty, probe)
-	case probeUnknown:
-		return fmt.Errorf("%w (composer state after C-j: %s)", ErrSubmitNotVerified, probe)
+	default:
+		return recoveryProbeError(probe)
 	}
 
 	switch probe := t.pollSubmission(target, needle, promptPrefix, submitProbeAttempts); probe {
@@ -363,5 +353,28 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		return nil
 	default:
 		return fmt.Errorf("nudge submit to %q: %w (final state: %s)", target, ErrSubmitNotVerified, probe)
+	}
+}
+
+// recoveryProbeError builds the error for a post-C-j probe result that is
+// neither turn-started nor composer-cleared: probeStranded (the needle is
+// still visibly sitting in the composer) and probeComposerDirty (the
+// composer holds other content) both wrap ErrComposerDirty alongside
+// ErrSubmitNotVerified, so a caller keying on either error sees the same
+// "do not retype" signal a fresh (non-recovery) dirty/stranded probe already
+// gives; probeUnknown wraps ErrSubmitNotVerified alone, since it is
+// genuinely indeterminate rather than known-dirty. Split out as a pure
+// function so this classification is unit-testable without a live tmux
+// session — the inline version could only be exercised end-to-end (codex,
+// submit_verify.go:348 / submit_verify_test.go:158, changes-requested at
+// 08964387: the existing wrapping tests constructed their own error values
+// rather than calling production code, so they could not fail if this
+// classification broke).
+func recoveryProbeError(probe submitProbe) error {
+	switch probe {
+	case probeStranded, probeComposerDirty:
+		return fmt.Errorf("%w: %w (composer state after C-j: %s)", ErrSubmitNotVerified, ErrComposerDirty, probe)
+	default:
+		return fmt.Errorf("%w (composer state after C-j: %s)", ErrSubmitNotVerified, probe)
 	}
 }

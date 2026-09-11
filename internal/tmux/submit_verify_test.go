@@ -192,3 +192,62 @@ func TestRecoveryKeystrokesValidatedForAgent(t *testing.T) {
 		})
 	}
 }
+
+// TestRecoveryKeystrokesValidatedForSession_LookupFailureFailsClosed covers
+// the fix for a lookup FAILURE (tmux error, session gone) being treated the
+// same as "no GT_AGENT set" — the latter defaults to true (assume Claude),
+// but a failure is a genuinely unknown state and must default to false, not
+// fail open into an unvalidated recovery keystroke (codex, tmux.go:3379,
+// changes-requested at 08964387). A Tmux pointed at a socket with no real
+// server makes GetEnvironment fail deterministically without needing a live
+// tmux session.
+func TestRecoveryKeystrokesValidatedForSession_LookupFailureFailsClosed(t *testing.T) {
+	t.Parallel()
+	tm := NewTmuxWithSocket("gt-test-no-such-socket-submit-verify")
+	if got := recoveryKeystrokesValidatedForSession(tm, "any-session"); got {
+		t.Error("recoveryKeystrokesValidatedForSession() = true on a lookup failure, want false")
+	}
+}
+
+// TestRecoveryKeystrokesValidatedForPane_UnresolvableTargetFailsClosed is the
+// pane-target counterpart: an unresolvable pane (stale, no server) must not
+// default to true either (codex, tmux.go:3405, changes-requested at
+// 08964387).
+func TestRecoveryKeystrokesValidatedForPane_UnresolvableTargetFailsClosed(t *testing.T) {
+	t.Parallel()
+	tm := NewTmuxWithSocket("gt-test-no-such-socket-submit-verify")
+	if got := recoveryKeystrokesValidatedForPane(tm, "%999"); got {
+		t.Error("recoveryKeystrokesValidatedForPane() = true for an unresolvable pane, want false")
+	}
+}
+
+// TestRecoveryProbeError covers the pure classification behind
+// recoverStrandedComposer's post-C-j decision, split out specifically so it
+// is unit-testable without a live tmux session (codex,
+// submit_verify.go:348 / submit_verify_test.go:158, changes-requested at
+// 08964387: the prior wrapping tests constructed their own error values
+// rather than calling production code, so they could not fail if this
+// classification broke).
+func TestRecoveryProbeError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		probe           submitProbe
+		wantDirty       bool
+		wantNotVerified bool
+	}{
+		{probeStranded, true, true},
+		{probeComposerDirty, true, true},
+		{probeUnknown, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.probe.String(), func(t *testing.T) {
+			err := recoveryProbeError(tt.probe)
+			if !errors.Is(err, ErrSubmitNotVerified) {
+				t.Errorf("recoveryProbeError(%v) missing ErrSubmitNotVerified: %v", tt.probe, err)
+			}
+			if got := errors.Is(err, ErrComposerDirty); got != tt.wantDirty {
+				t.Errorf("recoveryProbeError(%v) errors.Is(ErrComposerDirty) = %v, want %v", tt.probe, got, tt.wantDirty)
+			}
+		})
+	}
+}
