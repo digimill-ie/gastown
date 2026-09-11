@@ -64,7 +64,7 @@ const deadLetterReplayStaleThreshold = 5 * time.Minute
 // sweep in DrainClaims. Best-effort: a rename race with a genuinely in-flight
 // replay just means this loses the race (ENOENT) and no-ops, which is safe —
 // the same race pattern the queue sweep already relies on.
-func sweepStaleDeadLetterReplays(dir string) {
+func sweepStaleDeadLetterReplays(townRoot, session, dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -83,6 +83,27 @@ func sweepStaleDeadLetterReplays(dir string) {
 		}
 		stalePath := filepath.Join(dir, entry.Name())
 		restoredPath := strings.TrimSuffix(stalePath, ".replaying")
+
+		// A crash between ReplayDeadLetter's Enqueue succeeding (:221) and
+		// its subsequent claim removal leaves exactly this shape: a stale
+		// .replaying claim whose payload is ALREADY live in the active
+		// queue. Restoring it here, as before, would silently re-enqueue a
+		// second copy the next time it is replayed — this claim isn't
+		// actually orphaned, it's finished (codex, deadletter.go:211,
+		// changes-requested at REVISION 3 — High 9). Read the claim's ID
+		// and check the active queue for a still-pending entry with the
+		// same ID first; if found, the crash landed after Enqueue and this
+		// claim is done — remove it rather than resurrect it.
+		if data, rerr := os.ReadFile(stalePath); rerr == nil {
+			var e DeadLetterEntry
+			if jerr := json.Unmarshal(data, &e); jerr == nil && e.ID != "" && queueHasPendingID(townRoot, session, e.ID) {
+				if rmErr := os.Remove(stalePath); rmErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to remove already-replayed dead-letter claim %s: %v\n", entry.Name(), rmErr)
+				}
+				continue
+			}
+		}
+
 		if err := os.Rename(stalePath, restoredPath); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to restore orphaned dead-letter replay %s: %v\n", entry.Name(), err)
 		}
@@ -134,7 +155,7 @@ func DeadLetter(townRoot, session string, n QueuedNudge, source, lastError, pane
 func ListDeadLetters(townRoot, session string) ([]DeadLetterEntry, error) {
 	dir := deadLetterDir(townRoot, session)
 
-	sweepStaleDeadLetterReplays(dir)
+	sweepStaleDeadLetterReplays(townRoot, session, dir)
 
 	files, err := os.ReadDir(dir)
 	if err != nil {
@@ -177,7 +198,7 @@ func ListDeadLetters(townRoot, session string) ([]DeadLetterEntry, error) {
 func ReplayDeadLetter(townRoot, session, id string) error {
 	dir := deadLetterDir(townRoot, session)
 
-	sweepStaleDeadLetterReplays(dir)
+	sweepStaleDeadLetterReplays(townRoot, session, dir)
 
 	files, err := os.ReadDir(dir)
 	if err != nil {
@@ -202,6 +223,22 @@ func ReplayDeadLetter(townRoot, session, id string) error {
 		}
 		if e.ID != id {
 			continue
+		}
+
+		// Reset the mtime on the ORIGINAL path before the rename, not
+		// after: otherwise the file carries its old dead-letter mtime for
+		// the gap between becoming visible under ".replaying" and a later
+		// Chtimes call, and an entry that had already sat in the
+		// dead-letter store past deadLetterReplayStaleThreshold (routine —
+		// operators don't always replay promptly) would read as an
+		// orphaned replay the INSTANT it is claimed, letting a concurrent
+		// ReplayDeadLetter/ListDeadLetters call's sweep restore it while
+		// this replay is still in flight and enqueue it a second time
+		// (codex, deadletter.go:211, changes-requested at REVISION 3 —
+		// High 9; same fix shape as queue.go:430).
+		claimTime := time.Now()
+		if err := os.Chtimes(path, claimTime, claimTime); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to reset dead-letter claim mtime for %s: %v\n", f.Name(), err)
 		}
 
 		// Atomically claim this entry before acting on it. If a concurrent

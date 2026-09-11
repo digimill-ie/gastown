@@ -142,23 +142,35 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 			// Entries that already exhausted MaxInjectionAttempts on a prior
 			// cycle (reached only via the dead-letter-write durability
-			// fallback) must not be retyped again — route them straight to
+			// fallback), or whose prior attempt never reported an outcome
+			// at all (InFlight, restored by the orphan sweep after a
+			// crash), must not be retyped again — route them straight to
 			// another dead-letter attempt.
-			toInject, exhausted := partitionForInjection(claims)
+			toInject, exhausted, staleInFlight := partitionForInjection(claims)
 			var unresolved []nudge.QueuedNudge
 			if len(exhausted) > 0 {
 				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(exhausted), errAttemptsExhausted)...)
+			}
+			if len(staleInFlight) > 0 {
+				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(staleInFlight), errPriorAttemptUnresolved)...)
 			}
 			if len(toInject) > 0 {
 				// Persist the incremented Attempts count to each claim
 				// BEFORE the batch injection attempt — see Claim.MarkAttempt
 				// — so a crash mid-injection leaves the correct count
-				// behind instead of a stale, pre-attempt one.
-				toInject = markAttempts(sourceNudgePoller, sessionName, toInject)
-				formatted := nudge.FormatForInjection(claimNudges(toInject))
-				if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
-					fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-					unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(toInject), err)...)
+				// behind instead of a stale, pre-attempt one. A claim whose
+				// persist itself fails is excluded from injection this
+				// cycle (see markAttempts) and left un-acked.
+				marked, failedPersist := markAttempts(sourceNudgePoller, sessionName, toInject)
+				if len(failedPersist) > 0 {
+					unresolved = append(unresolved, claimNudges(failedPersist)...)
+				}
+				if len(marked) > 0 {
+					formatted := nudge.FormatForInjection(claimNudges(marked))
+					if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
+						fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
+						unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(marked), err)...)
+					}
 				}
 			}
 

@@ -85,6 +85,18 @@ type QueuedNudge struct {
 	// across Requeue (on-disk, so it survives a poller restart) and bounds
 	// how many times a failed delivery is retried before dead-lettering.
 	Attempts int `json:"attempts,omitempty"`
+	// InFlight is true from the moment Claim.MarkAttempt persists it (just
+	// before a live injection attempt) until the attempt's outcome is
+	// recorded (dead-letter, requeue via Enqueue, or the claim is acked on
+	// success — Enqueue always clears it). Attempts alone cannot tell an
+	// unfinished delivery from a confirmed non-delivery: a poller killed
+	// after typing but before recording an outcome leaves a claim whose
+	// Attempts count looks like an ordinary, safe-to-retry failure, when in
+	// fact some or all of the message may already have reached the
+	// composer. A claim restored by the orphan sweep with InFlight still
+	// true is exactly that case, and must never be retyped (codex,
+	// nudge_failure.go:152, changes-requested at REVISION 3 — High 2).
+	InFlight bool `json:"in_flight,omitempty"`
 	// LastError records the most recent injection failure, for dead-letter
 	// inspection.
 	LastError string `json:"last_error,omitempty"`
@@ -144,6 +156,13 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	if nudge.ID == "" {
 		nudge.ID = randomSuffix() + randomSuffix()
 	}
+	// Every write into the pending queue represents a fresh, clean start:
+	// whatever the caller learned (or didn't) about a prior attempt is
+	// resolved by the time it calls Enqueue (directly, or via Requeue after
+	// a determined delivery failure) — this is the ONLY place InFlight is
+	// cleared, so a requeued entry never carries a stale in-flight marker
+	// into the pending queue (see QueuedNudge.InFlight).
+	nudge.InFlight = false
 
 	// Set expiry if not already specified by the caller.
 	if nudge.ExpiresAt.IsZero() {
@@ -264,6 +283,12 @@ func (c Claim) Persist() error {
 // watchAndDeliver.
 func (c *Claim) MarkAttempt() error {
 	c.Nudge.Attempts++
+	// Set BEFORE the attempt, alongside Attempts, and cleared only by a
+	// subsequent Enqueue (dead-letter and successful ack both remove the
+	// file instead). A claim whose persisted state still reads InFlight
+	// after a restart never went through either of those — the attempt
+	// that set it never reported an outcome — see QueuedNudge.InFlight.
+	c.Nudge.InFlight = true
 	return c.Persist()
 }
 
@@ -400,6 +425,29 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 
 		path := filepath.Join(dir, entry.Name())
 
+		// Reset the mtime BEFORE the rename, not after. Rename does not
+		// update mtime — a file freshly claimed would otherwise carry its
+		// original enqueue-time mtime for the whole gap between the rename
+		// and a later Chtimes call, and a nudge that sat in the queue
+		// longer than staleThreshold (routine for a normal 30-minute-TTL
+		// entry) would read as an orphaned claim the INSTANT it becomes
+		// visible under its .claimed name — a second, concurrent
+		// Drain/DrainClaims call's orphan sweep could restore and
+		// redeliver it while this claimer is still mid-delivery, exactly
+		// the double-delivery the staleness check exists to prevent, not
+		// enable. Touching the mtime on the ORIGINAL path first closes that
+		// window: by the time the file is visible under any .claimed name,
+		// its mtime is already current (codex, queue.go:430,
+		// changes-requested at REVISION 3 — High 3; the post-rename order
+		// was the prior, still-racy fix at queue.go:315,
+		// 08964387/95f841e6 rework). Best-effort: a Chtimes failure just
+		// means the claim relies on the original mtime as before, so it is
+		// logged, not fatal.
+		claimTime := time.Now()
+		if err := os.Chtimes(path, claimTime, claimTime); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to reset claim mtime for %s: %v\n", entry.Name(), err)
+		}
+
 		// Atomically claim the file by renaming it. If another Drain call
 		// is racing us, only one rename will succeed — the loser gets
 		// ENOENT and moves on. This prevents double-delivery.
@@ -413,22 +461,6 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 		if err := os.Rename(path, claimPath); err != nil {
 			// Another Drain got it first, or file was already removed
 			continue
-		}
-
-		// Rename does not update mtime — the claimed file still carries the
-		// original enqueue-time mtime. Without resetting it, a nudge that
-		// sat in the queue longer than staleThreshold (routine for a normal
-		// 30-minute-TTL entry) reads as an orphaned claim the INSTANT it is
-		// claimed, so a second, concurrent Drain/DrainClaims call's orphan
-		// sweep can restore and redeliver it while this claimer is still
-		// mid-delivery — the double-delivery the staleness check exists to
-		// prevent, not enable (codex, queue.go:315, changes-requested at
-		// 08964387/95f841e6 rework). Best-effort: a Chtimes failure just
-		// means the claim relies on the original mtime as before, so it is
-		// logged, not fatal.
-		claimTime := time.Now()
-		if err := os.Chtimes(claimPath, claimTime, claimTime); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to reset claim mtime for %s: %v\n", entry.Name(), err)
 		}
 
 		data, err := os.ReadFile(claimPath)
@@ -469,10 +501,67 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 			continue
 		}
 
-		claims = append(claims, Claim{Nudge: n, path: claimPath})
+		claim := Claim{Nudge: n, path: claimPath}
+
+		// A file queued by a version of this code before the ID field
+		// existed deserializes with n.ID == "". AckClaims (see its skip
+		// map below) and handleFailedInjection's unresolved-entry
+		// matching both key exclusively on ID, and both deliberately skip
+		// entries whose ID is empty — so a claim that still carries an
+		// empty ID here would never be recognized as unresolved and
+		// would be acked (deleted) even on a failed requeue/dead-letter
+		// write. Assign a fresh ID now, at claim time, so every claim
+		// leaving DrainClaims has a non-empty, comparable identity
+		// regardless of what shape the file on disk started in, and
+		// persist it immediately so a future orphan-sweep restore carries
+		// the same ID rather than reverting to blank (codex, queue.go:288,
+		// changes-requested at REVISION 3 — High 4).
+		if claim.Nudge.ID == "" {
+			claim.Nudge.ID = NewID()
+			if perr := claim.Persist(); perr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to persist assigned ID for %s: %v\n", entry.Name(), perr)
+			}
+		}
+
+		claims = append(claims, claim)
 	}
 
 	return claims, nil
+}
+
+// queueHasPendingID reports whether the active queue for session holds a
+// still-pending (.json, not yet claimed) entry with the given ID. Used by
+// the dead-letter replay sweep (deadletter.go) to tell a genuinely orphaned
+// ".replaying" claim from one whose Enqueue already succeeded before a
+// crash — see sweepStaleDeadLetterReplays. Malformed entries are skipped
+// rather than failing the scan; a read/parse error just means this entry
+// doesn't count as a match.
+func queueHasPendingID(townRoot, session, id string) bool {
+	if id == "" {
+		return false
+	}
+	dir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var n QueuedNudge
+		if err := json.Unmarshal(data, &n); err != nil {
+			continue
+		}
+		if n.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Pending returns the count of queued nudges for a session without draining.

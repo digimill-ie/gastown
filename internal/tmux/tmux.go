@@ -1366,8 +1366,18 @@ func releaseNudgeLock(session string) {
 
 // nudgeFlockPath returns the filesystem lock path for cross-process nudge serialization.
 // Lock files live alongside the nudge queue directory for self-documentation and cleanup.
+//
+// When townRoot is empty, falls back to a session-keyed path under the OS
+// temp directory instead of returning a path the caller would have to
+// special-case. NudgeOpts.TownRoot=="" is a real, reachable state (a caller
+// without a townRoot handy) and must still serialize, not silently skip the
+// flock (codex, tmux.go:1854/1983, changes-requested at REVISION 3 — Fix 4:
+// "an empty TownRoot must not skip the flock").
 func nudgeFlockPath(townRoot, session string) string {
 	safe := strings.ReplaceAll(session, "/", "_")
+	if townRoot == "" {
+		return filepath.Join(os.TempDir(), "gt-nudge-lock", safe+".lock")
+	}
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
 }
 
@@ -1795,7 +1805,14 @@ func skipEscapeForAgent(agentName string) bool {
 	if preset := config.GetAgentPresetByName(agentName); preset != nil {
 		return preset.EscapeCancelsRequest
 	}
-	return false
+	// A resolved but unrecognized agent name is a genuinely unknown
+	// runtime — the same class as a session-level lookup failure
+	// (skipEscapeForSession already fails toward skip=true there) — so
+	// this must fail toward NOT sending Escape too, rather than falling
+	// through to the Claude-only default that only applies to the
+	// explicit empty-agentName case above (codex, tmux.go:1798,
+	// changes-requested at REVISION 3).
+	return true
 }
 
 // skipEscapeForSession resolves skipEscapeForAgent's input from a live
@@ -1850,15 +1867,16 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// Each `gt nudge` CLI invocation is a separate process, so the in-process
 	// channel semaphore below provides no cross-process protection. Without
 	// this, concurrent nudges interleave send-keys/Enter and produce garbled
-	// or empty input. (GH#gt-ukl8)
-	if opts.TownRoot != "" {
-		lockPath := nudgeFlockPath(opts.TownRoot, session)
-		unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
-		if err != nil {
-			return fmt.Errorf("cross-process nudge lock for session %q: %w", session, err)
-		}
-		defer unlock()
+	// or empty input. (GH#gt-ukl8) Always taken, regardless of opts.TownRoot:
+	// nudgeFlockPath falls back to a session-keyed temp path when TownRoot is
+	// empty, so an empty root no longer skips the flock outright (codex,
+	// tmux.go:1854, changes-requested at REVISION 3 — Fix 4).
+	lockPath := nudgeFlockPath(opts.TownRoot, session)
+	unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
+	if err != nil {
+		return fmt.Errorf("cross-process nudge lock for session %q: %w", session, err)
 	}
+	defer unlock()
 
 	// In-process lock: serialize nudges within a single process (goroutine fast path).
 	if !acquireNudgeLock(session, nudgeLockTimeout) {
@@ -1957,39 +1975,41 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	return nil
 }
 
-// NudgePane sends a message to a specific pane reliably. Equivalent to
-// NudgePaneWithOpts(pane, message, NudgeOpts{}) — carries no TownRoot, so
-// it never takes the cross-process flock (see NudgePaneWithOpts). Prefer
-// NudgePaneWithOpts with a TownRoot whenever one is available.
-func (t *Tmux) NudgePane(pane, message string) error {
-	return t.NudgePaneWithOpts(pane, message, NudgeOpts{})
-}
-
 // NudgePaneWithOpts sends a message to a specific pane reliably. Same
 // pattern as NudgeSessionWithOpts but targets a pane ID (e.g., "%9")
 // instead of a session name. After sending, triggers SIGWINCH to wake
 // Claude in detached sessions. Nudges to the same pane are serialized to
 // prevent interleaving.
 //
-// opts.TownRoot, when set, takes the same cross-process flock
-// NudgeSessionWithOpts uses — keyed on the pane's OWNING SESSION (resolved
-// via sessionNameForTarget), the same key NudgeSessionWithOpts uses, so a
-// sling/dispatch nudge via this function and a concurrent nudge-poller
-// delivery or direct `gt nudge` to the SAME session actually serialize
-// against each other. Previously NudgePane's serialization was in-process
-// only, so those could interleave keystrokes in one composer (codex,
-// tmux.go:1934, changes-requested at 08964387/95f841e6 rework — Fix 4).
+// There is deliberately no option-less NudgePane wrapper: it had zero
+// remaining production callers and, like the removed NudgeSession wrapper,
+// existed only as an unlocked escape hatch a caller could reach for without
+// noticing it carried no TownRoot (codex, tmux.go:1964, changes-requested
+// at REVISION 3 — Fix 4: "NudgePane is still an option-less wrapper").
+//
+// The cross-process flock is always taken — keyed on the pane's OWNING
+// SESSION (resolved via sessionNameForTarget) when resolvable, the same key
+// NudgeSessionWithOpts uses, so a sling/dispatch nudge via this function and
+// a concurrent nudge-poller delivery or direct `gt nudge` to the SAME
+// session actually serialize against each other; falls back to the pane
+// identifier itself when the owning session can't be resolved, and to a
+// temp-dir path when opts.TownRoot is empty (see nudgeFlockPath).
+// Previously this was gated on opts.TownRoot != "" AND a resolvable session
+// name, so either an empty root or an unresolvable pane skipped the flock
+// entirely — the exact interleaving NudgePaneWithOpts exists to prevent
+// (codex, tmux.go:1934/1983, changes-requested at 08964387/95f841e6 rework
+// and REVISION 3 — Fix 4).
 func (t *Tmux) NudgePaneWithOpts(pane, message string, opts NudgeOpts) error {
-	if opts.TownRoot != "" {
-		if sessionName := t.sessionNameForTarget(pane); sessionName != "" {
-			lockPath := nudgeFlockPath(opts.TownRoot, sessionName)
-			unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
-			if err != nil {
-				return fmt.Errorf("cross-process nudge lock for pane %q: %w", pane, err)
-			}
-			defer unlock()
-		}
+	lockKey := t.sessionNameForTarget(pane)
+	if lockKey == "" {
+		lockKey = pane
 	}
+	lockPath := nudgeFlockPath(opts.TownRoot, lockKey)
+	unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
+	if err != nil {
+		return fmt.Errorf("cross-process nudge lock for pane %q: %w", pane, err)
+	}
+	defer unlock()
 
 	// Serialize nudges to this pane to prevent interleaving.
 	// Use a timed lock to avoid permanent blocking if a previous nudge hung.
@@ -3515,12 +3535,22 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 func recoveryKeystrokesValidatedForSession(t *Tmux, session string) bool {
 	agentName, err := t.GetEnvironment(session, "GT_AGENT")
 	if err != nil {
-		if errors.Is(err, ErrNoServer) || errors.Is(err, ErrSessionNotFound) {
-			return false
+		if isMissingEnvironmentError(err, "GT_AGENT") {
+			// Session is reachable; GT_AGENT simply was never registered
+			// (tmux's "unknown variable" response) — the historic default.
+			return true
 		}
-		// Session is reachable; GT_AGENT simply was never registered
-		// (tmux's "unknown variable" response) — the historic default.
-		return true
+		// Any OTHER lookup failure — session gone, no server, or some
+		// other tmux error unrelated to the variable being unset — is
+		// NOT the same as a genuinely unregistered variable, and was
+		// previously conflated with it by only checking
+		// ErrNoServer/ErrSessionNotFound: any other error type (a
+		// transient tmux failure, say) fell through to true and sent
+		// the recovery keystroke to a runtime that was never actually
+		// identified. Fail toward NOT sending it, same as
+		// skipEscapeForSession (codex, tmux.go:3523, changes-requested
+		// at REVISION 3).
+		return false
 	}
 	if agentName == "" {
 		return false

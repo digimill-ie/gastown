@@ -30,6 +30,20 @@ const (
 // nudge_failure.go:66/nudge_poller.go:134, changes-requested at 08964387).
 var errAttemptsExhausted = errors.New("nudge injection attempts exhausted, not retyping")
 
+// errPriorAttemptUnresolved marks an entry whose most recent injection
+// attempt (Claim.MarkAttempt persisted Attempts and QueuedNudge.InFlight
+// BEFORE that attempt) never reported an outcome — the poller or idle
+// watcher process was killed after starting the attempt but before
+// handleFailedInjection or a successful ack recorded what happened.
+// Attempts alone cannot tell this apart from an ordinary, safe-to-retry
+// failure: on restart the orphan sweep restores such a claim with its
+// InFlight flag still true, and Attempts may be well under the bound.
+// Because some or all of the message text may already have reached the
+// composer, this is handled with the same zero-retype policy as an
+// unverified tmux submission (codex, nudge_failure.go:152,
+// changes-requested at REVISION 3 — High 2). See partitionForInjection.
+var errPriorAttemptUnresolved = errors.New("nudge injection attempt from a prior cycle never resolved, not retyping")
+
 // handleFailedInjection is the shared failure policy for every caller that
 // drains the nudge queue and injects via tmux: the poller, the idle watcher,
 // and the wait-idle fallback. It replaces the old requeueDrainedNudges, which
@@ -72,15 +86,16 @@ var errAttemptsExhausted = errors.New("nudge injection attempts exhausted, not r
 //
 // Claims (not bare QueuedNudge values) are the caller's responsibility: this
 // function only decides and performs the dead-letter/requeue writes, and
-// returns the entries whose outcome did NOT durably land anywhere (a
+// returns the entries whose outcome did NOT durably land anywhere: a
 // bounded entry whose dead-letter write failed AND whose requeue-fallback
-// write also failed). Callers draining via nudge.DrainClaims must Ack every
-// OTHER original claim (see nudge.AckClaims) only AFTER this function
-// returns — an entry in the returned slice must be left un-acked, so a
-// crash-equivalent write failure leaves the original claim recoverable via
-// the orphan sweep instead of lost the moment the caller acks it anyway
-// (codex, nudge_poller.go:157, changes-requested at 08964387/95f841e6
-// rework).
+// write also failed, OR an unverified entry whose dead-letter write failed
+// (the double fault — R2, hq-g52db REVISION 3: retained, never dropped).
+// Callers draining via nudge.DrainClaims must Ack every OTHER original
+// claim (see nudge.AckClaims) only AFTER this function returns — an entry
+// in the returned slice must be left un-acked, so a crash-equivalent write
+// failure leaves the original claim recoverable via the orphan sweep
+// instead of lost the moment the caller acks it anyway (codex,
+// nudge_poller.go:157, changes-requested at 08964387/95f841e6 rework).
 func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, drained []nudge.QueuedNudge, deliverErr error) (unresolved []nudge.QueuedNudge) {
 	paneCapture, _ := t.CapturePane(t.ResolveAgentTarget(sessionName), 25)
 
@@ -88,7 +103,12 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 		fmt.Fprintf(os.Stderr, "%s: injection-error log for %s failed: %v\n", source, sessionName, err)
 	}
 
-	unverified := errors.Is(deliverErr, tmux.ErrSubmitNotVerified)
+	// "Zero retypes allowed" applies to both an unverified tmux submission
+	// AND an entry whose prior attempt never reported an outcome at all
+	// (errPriorAttemptUnresolved) — the two are indistinguishable in what
+	// they risk (unproven partial delivery), so they share the same
+	// dead-letter-immediately, retain-on-double-fault policy below.
+	unverified := errors.Is(deliverErr, tmux.ErrSubmitNotVerified) || errors.Is(deliverErr, errPriorAttemptUnresolved)
 
 	var toRequeue []nudge.QueuedNudge
 	for _, n := range drained {
@@ -112,12 +132,24 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 				// would resume the exact retype-into-uncertain-composer loop
 				// this fix exists to stop the moment the entry is drained
 				// again. This double fault (unverified submission AND
-				// dead-letter unwritable, e.g. a full disk) drops the
-				// message — logged loudly — in preference to reproducing
-				// the duplicate-spam bug. This is a deliberate drop, not an
-				// unresolved outcome: the original claim is still acked so
-				// the (now-abandoned) entry doesn't linger as a live claim.
-				fmt.Fprintf(os.Stderr, "%s: CRITICAL: dead-letter for unverified entry %s on %s failed and it will NOT be requeued (would resume the retype loop): %v\n", source, n.ID, sessionName, dlErr)
+				// dead-letter unwritable, e.g. a full disk) is RETAINED,
+				// never dropped (R2, hq-g52db REVISION 3 mayor ruling — the
+				// prior version of this comment called the drop
+				// "deliberate" and acked the original claim anyway, which
+				// is exactly the loss R2 prohibits). The entry is added to
+				// unresolved so the caller leaves its claim un-acked: it
+				// stays on disk as a live claim, and a future orphan sweep
+				// restores it once staleClaimThreshold passes. The
+				// already-persisted Attempts count (Claim.MarkAttempt,
+				// before this cycle's injection) is what bounds how many
+				// more live retypes it can still get — this path itself
+				// retypes nothing, it only keeps retrying the durability
+				// write. A nudge-free alert goes to the rig witness and the
+				// mayor so a human notices a dead-letter store that can't
+				// be written to.
+				fmt.Fprintf(os.Stderr, "%s: CRITICAL: dead-letter for unverified entry %s on %s failed, retaining claim (will NOT be dropped): %v\n", source, n.ID, sessionName, dlErr)
+				alertDoubleFault(townRoot, sessionName, source, n, dlErr)
+				unresolved = append(unresolved, n)
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "%s: dead-lettered entry %s for %s (%s)\n", source, n.ID, sessionName, dlPath)
@@ -138,24 +170,33 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 	return failed
 }
 
-// partitionForInjection splits claimed nudges into those still eligible for
-// a live tmux injection attempt and those that already exhausted
-// nudge.MaxInjectionAttempts on a prior cycle (reached only via the
+// partitionForInjection splits claimed nudges into three groups: still
+// eligible for a live tmux injection attempt (toInject); already exhausted
+// nudge.MaxInjectionAttempts on a prior cycle, reached only via the
 // dead-letter-write durability fallback in handleFailedInjection, which
-// requeues past the bound rather than losing the message). Exhausted entries
-// must be routed to handleFailedInjection with errAttemptsExhausted directly
-// — never retyped — so a persistently broken dead-letter store cannot turn
-// into an indefinite retype loop (codex, nudge_poller.go:134, "the poller
-// injects before checking attempts", changes-requested at 08964387).
-func partitionForInjection(claims []nudge.Claim) (toInject, exhausted []nudge.Claim) {
+// requeues past the bound rather than losing the message (exhausted); and
+// entries whose most recent attempt never reported an outcome at all —
+// InFlight still true, restored by the orphan sweep after a crash mid-
+// attempt (staleInFlight). Both exhausted and staleInFlight entries must be
+// routed to handleFailedInjection directly — never retyped — but with
+// DIFFERENT sentinel errors (errAttemptsExhausted vs
+// errPriorAttemptUnresolved) since they carry different risk: an exhausted
+// entry's prior failures were each definitively observed, while a
+// staleInFlight entry's last attempt might have partially typed (codex,
+// nudge_poller.go:134 / nudge_failure.go:152, changes-requested at
+// 08964387 and REVISION 3 — High 2).
+func partitionForInjection(claims []nudge.Claim) (toInject, exhausted, staleInFlight []nudge.Claim) {
 	for _, c := range claims {
-		if c.Nudge.Attempts >= nudge.MaxInjectionAttempts {
+		switch {
+		case c.Nudge.Attempts >= nudge.MaxInjectionAttempts:
 			exhausted = append(exhausted, c)
-		} else {
+		case c.Nudge.InFlight:
+			staleInFlight = append(staleInFlight, c)
+		default:
 			toInject = append(toInject, c)
 		}
 	}
-	return toInject, exhausted
+	return toInject, exhausted, staleInFlight
 }
 
 // claimNudges extracts the QueuedNudge payloads from a slice of claims, in
@@ -183,18 +224,31 @@ func ackClaims(source, sessionName string, claims []nudge.Claim, unresolved []nu
 
 // markAttempts persists an incremented Attempts count (see nudge.Claim.
 // MarkAttempt) on every claim in claims BEFORE the caller attempts a live
-// batch injection, and returns the same slice (mutated in place) so the
+// batch injection, and returns two slices: marked (mutated in place, so the
 // caller's subsequent claimNudges(...) extraction carries the already-
-// persisted Attempts value. Logs, rather than fails, a per-claim persist
-// error: a filesystem hiccup here must not block the injection attempt
-// itself, it only weakens the crash-recovery guarantee for that one entry.
-func markAttempts(source, sessionName string, claims []nudge.Claim) []nudge.Claim {
+// persisted Attempts/InFlight values) and failed (claims whose persist
+// write itself failed).
+//
+// A claim in failed must NOT be injected this cycle: attempting a live
+// delivery with no durable record that the attempt happened at all means a
+// crash mid-injection leaves a claim reading Attempts=0/InFlight=false —
+// indistinguishable from a never-attempted entry, which defeats the whole
+// point of persisting the increment before the attempt. The caller should
+// leave failed's claims un-acked (not dead-lettered or requeued either —
+// there is no delivery outcome to report here, only a filesystem write
+// failure) so a future orphan sweep retries them once the underlying
+// problem clears (codex, nudge_failure.go:193, changes-requested at
+// REVISION 3 — High 2, "ignores persist errors").
+func markAttempts(source, sessionName string, claims []nudge.Claim) (marked, failed []nudge.Claim) {
 	for i := range claims {
 		if err := claims[i].MarkAttempt(); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: failed to persist attempt state for %s: %v\n", source, sessionName, err)
+			fmt.Fprintf(os.Stderr, "%s: failed to persist attempt state for %s, skipping injection this cycle for entry %s: %v\n", source, sessionName, claims[i].Nudge.ID, err)
+			failed = append(failed, claims[i])
+			continue
 		}
+		marked = append(marked, claims[i])
 	}
-	return claims
+	return marked, failed
 }
 
 // alertDeadLetter sends a nudge-free (--no-notify equivalent) mail to the
@@ -215,16 +269,6 @@ func markAttempts(source, sessionName string, claims []nudge.Claim) []nudge.Clai
 // happen to point at. Requiring townRoot to already be a real workspace
 // avoids that and is a no-op everywhere it would otherwise misfire.
 func alertDeadLetter(townRoot, sessionName, source string, entry nudge.QueuedNudge) {
-	if ok, _ := workspace.IsWorkspace(townRoot); !ok {
-		fmt.Fprintf(os.Stderr, "%s: dead-letter alert for %s: %q is not a Gas Town workspace, skipping\n", source, sessionName, townRoot)
-		return
-	}
-
-	rig := ""
-	if identity, err := session.ParseSessionName(sessionName); err == nil {
-		rig = identity.Rig
-	}
-
 	subject := fmt.Sprintf("Nudge dead-lettered: %s", sessionName)
 	body := fmt.Sprintf(`Session: %s
 Source: %s
@@ -238,6 +282,62 @@ Replay:  gt nudge dead-letter replay %s %s`,
 		sessionName, source, entry.Sender, entry.ID, entry.Attempts, entry.LastError,
 		sessionName, sessionName, entry.ID)
 
+	sendNudgeAlert(townRoot, sessionName, source, subject, body)
+}
+
+// alertDoubleFault sends a nudge-free alert when an unverified entry's
+// dead-letter write itself fails (the double fault handleFailedInjection
+// retains rather than drops — R2, hq-g52db REVISION 3). Distinct from
+// alertDeadLetter: the entry named here was NOT durably dead-lettered, it
+// is still a live, un-acked claim, and dlErr is the write failure that
+// prevented dead-lettering it.
+func alertDoubleFault(townRoot, sessionName, source string, entry nudge.QueuedNudge, dlErr error) {
+	subject := fmt.Sprintf("Nudge dead-letter write failed (claim retained): %s", sessionName)
+	body := fmt.Sprintf(`Session: %s
+Source: %s
+Sender: %s
+Entry ID: %s
+Attempts: %d
+Delivery error: %s
+Dead-letter write error: %s
+
+This entry could not be dead-lettered and was NOT dropped: its claim is
+retained un-acked and will be restored to the active queue by a future
+orphan sweep. If the dead-letter store's underlying problem (e.g. disk
+full) persists, this entry will keep failing to dead-letter on every
+retry.`,
+		sessionName, source, entry.Sender, entry.ID, entry.Attempts, entry.LastError, dlErr)
+
+	sendNudgeAlert(townRoot, sessionName, source, subject, body)
+}
+
+// sendNudgeAlert sends a nudge-free (--no-notify equivalent) mail to the
+// rig witness and the mayor. SuppressNotify skips the router's proactive
+// tmux/queue nudge to the recipient (router.go notifyRecipient) — that is
+// the point: an alert about nudge delivery trouble must not itself become
+// another injection into a possibly-still-busy or still-broken session. The
+// alert is durable and shows up in the recipient's ordinary `gt mail
+// inbox`; it is not a proactive interruption. Errors are logged, not
+// returned — a failed alert must not block the caller's own durable write,
+// which has already happened by the time this is called.
+//
+// Uses the given townRoot directly rather than findMailWorkDir's cwd/env
+// detection: mail.NewRouter falls back to GT_TOWN_ROOT/GT_ROOT when its
+// workDir isn't a real workspace, which would silently redirect an alert (or
+// a test run against a scratch townRoot) into whatever town those env vars
+// happen to point at. Requiring townRoot to already be a real workspace
+// avoids that and is a no-op everywhere it would otherwise misfire.
+func sendNudgeAlert(townRoot, sessionName, source, subject, body string) {
+	if ok, _ := workspace.IsWorkspace(townRoot); !ok {
+		fmt.Fprintf(os.Stderr, "%s: alert for %s: %q is not a Gas Town workspace, skipping\n", source, sessionName, townRoot)
+		return
+	}
+
+	rig := ""
+	if identity, err := session.ParseSessionName(sessionName); err == nil {
+		rig = identity.Rig
+	}
+
 	targets := []string{"mayor"}
 	if rig != "" {
 		targets = append(targets, rig+"/witness")
@@ -249,7 +349,7 @@ Replay:  gt nudge dead-letter replay %s %s`,
 		msg := mail.NewMessage("nudge-poller", to, subject, body)
 		msg.SuppressNotify = true
 		if err := router.Send(msg); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: dead-letter alert to %s failed: %v\n", source, to, err)
+			fmt.Fprintf(os.Stderr, "%s: alert to %s failed: %v\n", source, to, err)
 		}
 	}
 }
