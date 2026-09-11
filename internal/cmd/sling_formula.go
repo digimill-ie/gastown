@@ -592,7 +592,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 	}
 
 	t := tmux.NewTmux()
-	if err := t.NudgePane(targetPane, prompt); err != nil {
+	if err := t.NudgePaneWithOpts(targetPane, prompt, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 		// Graceful fallback for no-tmux mode
 		fmt.Printf("%s Could not nudge (no tmux?): %v\n", style.Dim.Render("○"), err)
 		fmt.Printf("  Agent will discover work via gt prime / bd show\n")

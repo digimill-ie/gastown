@@ -194,14 +194,30 @@ func (p *Propeller) eventLoop() {
 }
 
 // deliverNudges drains queued nudges and injects them into the ACP session.
+//
+// Uses DrainClaims, not Drain: Drain deletes each entry from the queue the
+// instant it is read, before p.notify (the fallible ACP delivery call
+// below) is even attempted. p.notify DOES fail in practice — the requeue
+// fallback below exists precisely because it does — so a crash between
+// Drain's delete and a subsequent Requeue call lost the entry with no
+// durable trace anywhere, the same ordering bug nudge_poller.go's claim-
+// based rework closed for tmux delivery (codex, propulsion.go:198,235,
+// changes-requested at 08964387/95f841e6 rework: the PR that introduced
+// nudge.Claim/DrainClaims had claimed, incorrectly, that this caller "cannot
+// fail the way a tmux send can"). Claims are Acked only once the outcome —
+// successful delivery, or a durable requeue write — is itself durable.
 func (p *Propeller) deliverNudges() {
-	nudges, err := nudge.Drain(p.townRoot, p.session)
+	claims, err := nudge.DrainClaims(p.townRoot, p.session)
 	if err != nil {
-		debugLog(p.townRoot, "[Propeller] deliverNudges: Drain error: %v", err)
+		debugLog(p.townRoot, "[Propeller] deliverNudges: DrainClaims error: %v", err)
 		return
 	}
-	if len(nudges) == 0 {
+	if len(claims) == 0 {
 		return
+	}
+	nudges := make([]nudge.QueuedNudge, len(claims))
+	for i, c := range claims {
+		nudges[i] = c.Nudge
 	}
 
 	debugLog(p.townRoot, "[Propeller] deliverNudges: drained %d nudge(s)", len(nudges))
@@ -219,12 +235,20 @@ func (p *Propeller) deliverNudges() {
 
 	meta := buildSessionUpdateMeta(nudges, p.session)
 	requeue := func(reason string) {
-		if err := nudge.Requeue(p.townRoot, p.session, nudges); err != nil {
-			logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to requeue nudges after %s: %v", reason, err))
-			style.PrintWarning("ACP Propeller failed to requeue nudges after %s: %v", reason, err)
-			return
+		failed, err := nudge.Requeue(p.townRoot, p.session, nudges)
+		if err != nil {
+			logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to requeue %d/%d nudges after %s: %v", len(failed), len(nudges), reason, err))
+			style.PrintWarning("ACP Propeller failed to requeue %d/%d nudges after %s: %v", len(failed), len(nudges), reason, err)
+		} else {
+			logEvent(p.townRoot, "acp_degraded", fmt.Sprintf("requeued %d nudges: %s", len(nudges), reason))
 		}
-		logEvent(p.townRoot, "acp_degraded", fmt.Sprintf("requeued %d nudges: %s", len(nudges), reason))
+		// Ack every claim whose requeue write succeeded. An entry in
+		// failed did NOT durably land anywhere — its claim is left
+		// un-acked so a future DrainClaims orphan sweep can recover it
+		// instead of losing it here.
+		nudge.AckClaims(claims, failed, func(c nudge.Claim, ackErr error) {
+			style.PrintWarning("ACP Propeller failed to ack nudge claim for %s: %v", c.Nudge.ID, ackErr)
+		})
 	}
 
 	if p.proxy == nil || p.proxy.SessionID() == "" {
@@ -235,7 +259,14 @@ func (p *Propeller) deliverNudges() {
 	if err := p.notify(text, meta, urgent); err != nil {
 		requeue(fmt.Sprintf("delivery failure: %v", err))
 		style.PrintWarning("ACP Propeller failed to deliver nudge: %v", err)
+		return
 	}
+
+	// Delivery succeeded — every claim's outcome is now durable (the agent
+	// received it), so ack them all.
+	nudge.AckClaims(claims, nil, func(c nudge.Claim, ackErr error) {
+		style.PrintWarning("ACP Propeller failed to ack nudge claim for %s: %v", c.Nudge.ID, ackErr)
+	})
 }
 
 type escalationDeliveryMeta struct {

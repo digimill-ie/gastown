@@ -107,8 +107,15 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				return nil // session gone, exit
 			}
 
-			// Check if there are queued nudges.
-			if n, _ := nudge.Pending(townRoot, sessionName); n == 0 {
+			// Check if there is anything at all in the queue — a fresh
+			// entry, or a leftover .claimed file from a crashed drainer.
+			// Pending alone (counts .json only) would never trigger the
+			// DrainClaims call below when the queue holds only .claimed
+			// files, so the orphan sweep inside DrainClaims (the only thing
+			// that restores a stale claim) would never run (codex,
+			// nudge_poller.go:111, changes-requested at 08964387/95f841e6
+			// rework).
+			if has, _ := nudge.PendingOrClaimed(townRoot, sessionName); !has {
 				continue
 			}
 
@@ -138,23 +145,31 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			// fallback) must not be retyped again — route them straight to
 			// another dead-letter attempt.
 			toInject, exhausted := partitionForInjection(claims)
+			var unresolved []nudge.QueuedNudge
 			if len(exhausted) > 0 {
-				handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(exhausted), errAttemptsExhausted)
+				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(exhausted), errAttemptsExhausted)...)
 			}
 			if len(toInject) > 0 {
+				// Persist the incremented Attempts count to each claim
+				// BEFORE the batch injection attempt — see Claim.MarkAttempt
+				// — so a crash mid-injection leaves the correct count
+				// behind instead of a stale, pre-attempt one.
+				toInject = markAttempts(sourceNudgePoller, sessionName, toInject)
 				formatted := nudge.FormatForInjection(claimNudges(toInject))
 				if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
 					fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-					handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(toInject), err)
+					unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(toInject), err)...)
 				}
 			}
 
-			// Ack every claim only now: handleFailedInjection has already
-			// durably dead-lettered or requeued each entry (or, for the
-			// documented double-fault, dropped it with a loud log), so the
-			// original claim is redundant. Acking after, not before, keeps
-			// the crash window closed.
-			ackClaims(sourceNudgePoller, sessionName, claims)
+			// Ack every RESOLVED claim only now: handleFailedInjection has
+			// already durably dead-lettered or requeued each entry (or, for
+			// the documented double-fault, dropped it with a loud log), so
+			// the original claim is redundant for those. An entry in
+			// unresolved did NOT durably land anywhere (its requeue write
+			// itself failed) — its claim is left un-acked so the orphan
+			// sweep can recover it instead of losing it here.
+			ackClaims(sourceNudgePoller, sessionName, claims, unresolved)
 		}
 	}
 }

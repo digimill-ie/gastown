@@ -46,6 +46,49 @@ func deadLetterDir(townRoot, session string) string {
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_deadletter", safe)
 }
 
+// deadLetterReplayStaleThreshold bounds how long a ".replaying" claim file
+// can sit unresolved before it is treated as orphaned by a crashed replay.
+const deadLetterReplayStaleThreshold = 5 * time.Minute
+
+// sweepStaleDeadLetterReplays restores any ".replaying" claim file older
+// than deadLetterReplayStaleThreshold back to its original dead-letter
+// filename, so it becomes visible to List/Replay again.
+//
+// ReplayDeadLetter claims an entry (atomic rename to "<name>.json.replaying")
+// before re-enqueuing it and removing the original — but both ListDeadLetters
+// and ReplayDeadLetter's own scan filter strictly to a ".json" suffix, so a
+// process that crashes between the claim rename and the Enqueue/remove that
+// follows leaves that file invisible to both: not listed, not reachable by
+// id, forever (codex, deadletter.go:164, changes-requested at
+// 08964387/95f841e6 rework). This mirrors the nudge queue's orphaned-.claimed
+// sweep in DrainClaims. Best-effort: a rename race with a genuinely in-flight
+// replay just means this loses the race (ENOENT) and no-ops, which is safe —
+// the same race pattern the queue sweep already relies on.
+func sweepStaleDeadLetterReplays(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".replaying") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) <= deadLetterReplayStaleThreshold {
+			continue
+		}
+		stalePath := filepath.Join(dir, entry.Name())
+		restoredPath := strings.TrimSuffix(stalePath, ".replaying")
+		if err := os.Rename(stalePath, restoredPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to restore orphaned dead-letter replay %s: %v\n", entry.Name(), err)
+		}
+	}
+}
+
 // DeadLetter durably persists a failed nudge outside the active queue and
 // returns the path it was written to. It does not touch the active queue —
 // callers are responsible for not requeuing an entry they dead-letter.
@@ -91,6 +134,8 @@ func DeadLetter(townRoot, session string, n QueuedNudge, source, lastError, pane
 func ListDeadLetters(townRoot, session string) ([]DeadLetterEntry, error) {
 	dir := deadLetterDir(townRoot, session)
 
+	sweepStaleDeadLetterReplays(dir)
+
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -131,6 +176,8 @@ func ListDeadLetters(townRoot, session string) ([]DeadLetterEntry, error) {
 // changes-requested at 08964387).
 func ReplayDeadLetter(townRoot, session, id string) error {
 	dir := deadLetterDir(townRoot, session)
+
+	sweepStaleDeadLetterReplays(dir)
 
 	files, err := os.ReadDir(dir)
 	if err != nil {

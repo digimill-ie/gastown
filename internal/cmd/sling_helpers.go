@@ -697,7 +697,12 @@ func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpd
 
 // injectStartPrompt sends a prompt to the target pane to start working.
 // Uses the reliable nudge pattern: literal mode + 500ms debounce + separate Enter.
-func injectStartPrompt(pane, beadID, subject, args string) error {
+// townRoot, when non-empty, is passed through to NudgePaneWithOpts so this
+// nudge takes the same cross-process flock a concurrent nudge-poller
+// delivery or direct `gt nudge` to the same session uses — NudgePane alone
+// carried no TownRoot and so never took it (codex, tmux.go:1934,
+// changes-requested at 08964387/95f841e6 rework — Fix 4).
+func injectStartPrompt(townRoot, pane, beadID, subject, args string) error {
 	if pane == "" {
 		return fmt.Errorf("no target pane")
 	}
@@ -722,9 +727,9 @@ func injectStartPrompt(pane, beadID, subject, args string) error {
 		prompt = fmt.Sprintf("Work slung: %s. Start working on it now - run `"+cli.Name()+" hook` to see the hook, then begin.", beadID)
 	}
 
-	// Use the reliable nudge pattern (same as gt nudge / tmux.NudgeSession)
+	// Use the reliable nudge pattern (same as gt nudge / tmux.NudgeSessionWithOpts)
 	t := tmux.NewTmux()
-	return t.NudgePane(pane, prompt)
+	return t.NudgePaneWithOpts(pane, prompt, tmux.NudgeOpts{TownRoot: townRoot})
 }
 
 // getSessionFromPane extracts session name from a pane target.

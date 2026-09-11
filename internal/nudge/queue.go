@@ -106,6 +106,19 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
+// NewID generates a fresh stable identity for a QueuedNudge, the same
+// generator Enqueue uses when a caller doesn't supply one. Exported for
+// callers that build a QueuedNudge to dead-letter directly, bypassing
+// Enqueue (e.g. cmd.deliverNudge's wait-idle path), and need the ID to be
+// known and stable BEFORE the entry is persisted: DeadLetter also assigns
+// one when missing, but only on its own internal copy of the struct, so a
+// caller that reports the ID afterward (e.g. an alert mail) would still
+// report a blank one (codex, nudge.go:253/282, changes-requested at
+// 08964387/95f841e6 rework).
+func NewID() string {
+	return randomSuffix() + randomSuffix()
+}
+
 // Enqueue writes a nudge to the queue for the given session.
 // The nudge will be picked up by the agent's hook at the next turn boundary.
 // Returns an error if the queue is full (MaxQueueDepth reached).
@@ -160,19 +173,33 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	return nil
 }
 
-// Requeue writes previously drained nudges back to the queue for later delivery.
-// Existing timestamps are preserved so FIFO ordering remains stable relative to
-// one another; only expired nudges are skipped.
-func Requeue(townRoot, session string, nudges []QueuedNudge) error {
+// Requeue writes previously drained nudges back to the queue for later
+// delivery. Existing timestamps are preserved so FIFO ordering remains
+// stable relative to one another; only expired nudges are skipped.
+//
+// It attempts EVERY entry even if an earlier one fails to enqueue — the
+// previous version returned on the first error, silently never attempting
+// the rest of the batch. Returns the entries that failed to enqueue (empty
+// on full success): callers that Ack a claim only after its outcome is
+// durable (see Claim.Ack) need this to know precisely which entries are
+// NOT yet durable anywhere, so they can leave those claims un-acked instead
+// of acking (and thereby losing) a claim whose requeue write itself failed
+// (codex, nudge_poller.go:157, changes-requested at 08964387/95f841e6
+// rework).
+func Requeue(townRoot, session string, nudges []QueuedNudge) (failed []QueuedNudge, err error) {
+	var firstErr error
 	for _, n := range nudges {
 		if !n.ExpiresAt.IsZero() && time.Now().After(n.ExpiresAt) {
-			continue
+			continue // expired: nothing left to deliver, not a failure
 		}
-		if err := Enqueue(townRoot, session, n); err != nil {
-			return err
+		if enqErr := Enqueue(townRoot, session, n); enqErr != nil {
+			failed = append(failed, n)
+			if firstErr == nil {
+				firstErr = enqErr
+			}
 		}
 	}
-	return nil
+	return failed, firstErr
 }
 
 // Claim is a durably-claimed queue entry returned by DrainClaims: the
@@ -199,6 +226,77 @@ func (c Claim) Ack() error {
 		return fmt.Errorf("acking nudge claim: %w", err)
 	}
 	return nil
+}
+
+// Persist rewrites the claim's underlying .claimed file with the claim's
+// current in-memory Nudge state (atomic write-then-rename within the same
+// directory). Call this to durably record a state change — in particular
+// Attempts — BEFORE a fallible operation like a tmux injection attempt, so
+// a crash during that operation leaves the PERSISTED (already-incremented)
+// state behind for a future orphan-sweep restore, not the stale
+// pre-attempt state. Without this, a poller killed while actually typing
+// (after DrainClaims but before the failure/success handling that would
+// otherwise persist Attempts) leaves a claim on disk that still reads
+// Attempts=0, so the orphan sweep restores it as a fresh, unattempted entry
+// and a future cycle retypes it — risking duplicate content in whatever
+// the first, crashed attempt already delivered (codex, nudge_poller.go:146,
+// changes-requested at 08964387/95f841e6 rework).
+func (c Claim) Persist() error {
+	data, err := json.MarshalIndent(c.Nudge, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling nudge: %w", err)
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("writing claim state: %w", err)
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		return fmt.Errorf("persisting claim state: %w", err)
+	}
+	return nil
+}
+
+// MarkAttempt increments the claim's Attempts count and persists it (see
+// Persist) BEFORE the caller attempts a live delivery. Callers that inject
+// a batch of claims in one tmux call should MarkAttempt every claim in the
+// batch first, then extract the (now-incremented) Nudge values for
+// FormatForInjection/handleFailedInjection — see nudge_poller.go and
+// watchAndDeliver.
+func (c *Claim) MarkAttempt() error {
+	c.Nudge.Attempts++
+	return c.Persist()
+}
+
+// AckClaims resolves every claim in claims whose Nudge.ID is NOT present in
+// unresolved, by removing its underlying file — call only after each acked
+// entry's outcome (successful delivery, or a durable dead-letter/requeue
+// write) is itself durable. A claim whose ID IS in unresolved is
+// deliberately left un-acked: it stays on disk under its .claimed name, and
+// a future Drain/DrainClaims orphan sweep restores it to the pending queue
+// once staleClaimThreshold has passed. This is what keeps a Requeue write
+// that itself fails (see Requeue's returned failed slice) from silently
+// losing the entry — acking every original claim unconditionally, as
+// before this existed, discarded the only durable copy the moment the
+// caller decided (successfully or not) what to do with it (codex,
+// nudge_poller.go:157 / internal/acp/propulsion.go:198,235,
+// changes-requested at 08964387/95f841e6 rework). onAckErr, if non-nil, is
+// called with any per-claim removal error; logging is the caller's
+// business.
+func AckClaims(claims []Claim, unresolved []QueuedNudge, onAckErr func(Claim, error)) {
+	skip := make(map[string]bool, len(unresolved))
+	for _, n := range unresolved {
+		if n.ID != "" {
+			skip[n.ID] = true
+		}
+	}
+	for _, c := range claims {
+		if skip[c.Nudge.ID] {
+			continue
+		}
+		if err := c.Ack(); err != nil && onAckErr != nil {
+			onAckErr(c, err)
+		}
+	}
 }
 
 // Drain reads and removes all queued nudges for a session, returning them
@@ -317,6 +415,22 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 			continue
 		}
 
+		// Rename does not update mtime — the claimed file still carries the
+		// original enqueue-time mtime. Without resetting it, a nudge that
+		// sat in the queue longer than staleThreshold (routine for a normal
+		// 30-minute-TTL entry) reads as an orphaned claim the INSTANT it is
+		// claimed, so a second, concurrent Drain/DrainClaims call's orphan
+		// sweep can restore and redeliver it while this claimer is still
+		// mid-delivery — the double-delivery the staleness check exists to
+		// prevent, not enable (codex, queue.go:315, changes-requested at
+		// 08964387/95f841e6 rework). Best-effort: a Chtimes failure just
+		// means the claim relies on the original mtime as before, so it is
+		// logged, not fatal.
+		claimTime := time.Now()
+		if err := os.Chtimes(claimPath, claimTime, claimTime); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to reset claim mtime for %s: %v\n", entry.Name(), err)
+		}
+
 		data, err := os.ReadFile(claimPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -382,6 +496,40 @@ func Pending(townRoot, session string) (int, error) {
 	}
 
 	return count, nil
+}
+
+// PendingOrClaimed reports whether the queue directory holds ANYTHING —
+// either a fresh .json entry, or a leftover .claimed file from a prior
+// drain that has not yet been Acked. A poller/watcher that gates its drain
+// call on Pending()==0 alone (Pending counts .json files only) never calls
+// DrainClaims when the queue holds ONLY .claimed files — and DrainClaims is
+// what runs the orphan sweep that restores a claim left behind by a
+// crashed drainer. Without this, a claimed-but-crashed entry that hasn't
+// yet crossed staleClaimThreshold sits invisible forever: nothing ever
+// calls DrainClaims again to notice it has now gone stale (codex,
+// nudge_poller.go:111 / nudge.go:353, changes-requested at
+// 08964387/95f841e6 rework). Cheaper than a full DrainClaims (no rename,
+// no read) so it's safe to call on every poll tick.
+func PendingOrClaimed(townRoot, session string) (bool, error) {
+	dir := queueDir(townRoot, session)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading nudge queue: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".json") || strings.Contains(entry.Name(), ".claimed") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // QueueLen returns the number of pending nudges for a session without draining.

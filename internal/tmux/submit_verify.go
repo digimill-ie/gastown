@@ -309,7 +309,20 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string, recoveryVali
 	case probeTurnStarted, probeComposerCleared:
 		return nil
 	case probeUnknown:
-		return enterErr
+		// Genuinely indeterminate: the pane content matched neither a
+		// known-good nor a known-dirty pattern after every poll attempt.
+		// The previous version returned enterErr bare — a nil enterErr
+		// then reported SUCCESS despite never having confirmed anything,
+		// and a non-nil enterErr that doesn't itself wrap
+		// ErrSubmitNotVerified made errors.Is(deliverErr,
+		// ErrSubmitNotVerified) false, routing callers to the bounded
+		// (retypable) failure path for a case REVISION 3 requires zero
+		// retypes on (codex, submit_verify.go:312, changes-requested at
+		// 08964387/95f841e6 rework). Always wrap ErrSubmitNotVerified here.
+		if enterErr != nil {
+			return fmt.Errorf("%w: %w", ErrSubmitNotVerified, enterErr)
+		}
+		return fmt.Errorf("%w (composer state indeterminate after Enter)", ErrSubmitNotVerified)
 	case probeComposerDirty:
 		return fmt.Errorf("%w: %w (composer contains other text after Enter)", ErrSubmitNotVerified, ErrComposerDirty)
 	case probeStranded:
@@ -325,7 +338,13 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string, recoveryVali
 		}
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
-		return enterErr
+		// Unreachable with the current submitProbe enum (every value has an
+		// explicit case above); kept only so the switch compiles without a
+		// bare fallthrough. Wraps ErrSubmitNotVerified for the same reason
+		// as probeUnknown: an unrecognized probe result must never look
+		// like an ordinary retypable failure to a caller checking
+		// errors.Is(deliverErr, ErrSubmitNotVerified).
+		return fmt.Errorf("%w (unrecognized submit probe result)", ErrSubmitNotVerified)
 	}
 }
 

@@ -1889,7 +1889,7 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// NudgeSession should succeed on a ready session
-	err := tm.NudgeSession(sessionName, "test message")
+	err := tm.NudgeSessionWithOpts(sessionName, "test message", NudgeOpts{})
 	if err != nil {
 		t.Errorf("NudgeSession() = %v, want nil", err)
 	}
@@ -1914,7 +1914,7 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
 	}
 
-	if err := tm.NudgeSession(sessionName, "test message"); err != nil {
+	if err := tm.NudgeSessionWithOpts(sessionName, "test message", NudgeOpts{}); err != nil {
 		t.Fatalf("NudgeSession() with GT_PANE_ID = %v, want nil", err)
 	}
 }
@@ -1965,7 +1965,7 @@ func TestNudgeSession_WakesAgentWindowNotActiveWindow(t *testing.T) {
 		}
 	}
 
-	if err := tm.NudgeSession(sessionName, "test message"); err != nil {
+	if err := tm.NudgeSessionWithOpts(sessionName, "test message", NudgeOpts{}); err != nil {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 
@@ -2138,7 +2138,7 @@ func TestNudgeSession_StalePaneIDFallsBackToFirstPane(t *testing.T) {
 	}
 
 	marker := "GT_NUDGE_STALE_PANE_FALLBACK_" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
-	if err := tm.NudgeSession(sessionName, "echo "+marker); err != nil {
+	if err := tm.NudgeSessionWithOpts(sessionName, "echo "+marker, NudgeOpts{}); err != nil {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
