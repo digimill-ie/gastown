@@ -146,3 +146,49 @@ func TestErrSubmitNotVerifiedWrapping(t *testing.T) {
 		t.Fatal("errors.Is did not recognize wrapped ErrSubmitNotVerified")
 	}
 }
+
+// TestErrComposerDirtyWrapping mirrors TestErrSubmitNotVerifiedWrapping for
+// the new sentinel (hq-g52db): callers distinguish "the composer is known
+// dirty, do not retype" from every other injection failure via errors.Is on
+// ErrComposerDirty specifically, so both wrapped errors must remain
+// recognizable through fmt.Errorf %w chains the way submitComposer produces
+// them.
+func TestErrComposerDirtyWrapping(t *testing.T) {
+	t.Parallel()
+	wrapped := fmt.Errorf("nudge to session %q: %w", "gt-test", fmt.Errorf("%w: %w (composer contains other text after Enter)", ErrSubmitNotVerified, ErrComposerDirty))
+	if !errors.Is(wrapped, ErrSubmitNotVerified) {
+		t.Error("errors.Is did not recognize wrapped ErrSubmitNotVerified")
+	}
+	if !errors.Is(wrapped, ErrComposerDirty) {
+		t.Error("errors.Is did not recognize wrapped ErrComposerDirty")
+	}
+}
+
+// TestRecoveryKeystrokesValidatedForAgent covers the runtime table required
+// by hq-g52db fix 5: recovery keystrokes (C-j) are only attempted on runtimes
+// where their effect is validated. Claude Code is the long-validated target;
+// every other known preset — and any unrecognized/custom agent name — must
+// default to false rather than risk a destructive keystroke on an
+// unfamiliar runtime.
+func TestRecoveryKeystrokesValidatedForAgent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		agentName string
+		want      bool
+	}{
+		{"claude", true},
+		{"codex", false},
+		{"gemini", false},
+		{"cursor", false},
+		{"copilot", false},
+		{"some-unrecognized-custom-agent", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.agentName, func(t *testing.T) {
+			if got := recoveryKeystrokesValidatedForAgent(tt.agentName); got != tt.want {
+				t.Errorf("recoveryKeystrokesValidatedForAgent(%q) = %v, want %v", tt.agentName, got, tt.want)
+			}
+		})
+	}
+}

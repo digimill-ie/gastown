@@ -250,11 +250,29 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				return deliverErr
 			}
 			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)
-			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+			pending := nudge.QueuedNudge{
 				Sender:   sender,
 				Message:  message,
 				Priority: nudgePriorityFlag,
-			}); qErr != nil {
+			}
+			// Zero retypes after a composer-dirty delivery: enqueuing this
+			// entry would just have the poller/idle-watcher retype it into
+			// the same dirty composer on the next cycle. Dead-letter instead
+			// of falling into that loop (hq-g52db). Any other unverified
+			// failure still queues for later retry — bounded once queued,
+			// via handleFailedInjection's Attempts count.
+			if errors.Is(deliverErr, tmux.ErrComposerDirty) {
+				paneCapture, _ := t.CapturePane(sessionName, 25)
+				_ = nudge.LogInjectionError(townRoot, sessionName, sourceWaitIdle, deliverErr, paneCapture)
+				pending.Attempts = 1
+				if _, dlErr := nudge.DeadLetter(townRoot, sessionName, pending, sourceWaitIdle, deliverErr.Error(), paneCapture, false); dlErr != nil {
+					fmt.Fprintf(os.Stderr, "wait-idle: dead-letter for %s failed, queueing instead: %v\n", sessionName, dlErr)
+				} else {
+					alertDeadLetter(townRoot, sessionName, sourceWaitIdle, pending)
+					return nil
+				}
+			}
+			if qErr := nudge.Enqueue(townRoot, sessionName, pending); qErr != nil {
 				return fmt.Errorf("queue fallback after unverified submit failed: %v (original: %w)", qErr, deliverErr)
 			}
 			return nil
@@ -351,18 +369,12 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
-				requeueDrainedNudges(townRoot, sessionName, "idle-watcher", drained)
+				handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, drained, err)
 			}
 			return
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.
-}
-
-func requeueDrainedNudges(townRoot, sessionName, source string, drained []nudge.QueuedNudge) {
-	if err := nudge.Requeue(townRoot, sessionName, drained); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed: %v\n", source, sessionName, err)
-	}
 }
 
 // validNudgeModes is the set of allowed --mode values.

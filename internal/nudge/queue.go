@@ -48,6 +48,13 @@ const (
 	// staleClaimThreshold is how long a .claimed file must be untouched
 	// before Drain considers it orphaned (from a crashed drainer) and removes it.
 	staleClaimThreshold = 5 * time.Minute
+
+	// MaxInjectionAttempts bounds how many times a failed injection is
+	// requeued for automatic retry before the entry is dead-lettered instead
+	// (see cmd.handleFailedInjection). A composer-dirty failure skips
+	// straight to dead-letter regardless of this bound — retyping into a
+	// known-dirty composer duplicates content rather than fixing anything.
+	MaxInjectionAttempts = 2
 )
 
 // nudgeConfig loads nudge-specific thresholds from town settings.
@@ -57,6 +64,12 @@ func nudgeConfig(townRoot string) *config.NudgeThresholds {
 
 // QueuedNudge represents a nudge message stored in the queue.
 type QueuedNudge struct {
+	// ID is a stable identity for this logical nudge, assigned once at first
+	// Enqueue and preserved across Requeue (even though each requeue writes a
+	// new file with a new timestamp-based name). Used to correlate attempts
+	// across the poller, the idle watcher, and a poller restart, and to
+	// reference a specific dead-lettered entry for inspection/replay.
+	ID        string    `json:"id,omitempty"`
 	Sender    string    `json:"sender"`
 	Message   string    `json:"message"`
 	Priority  string    `json:"priority"`
@@ -68,6 +81,13 @@ type QueuedNudge struct {
 	// DeliverAfter, if non-zero, defers delivery until this time has passed.
 	// Drain skips (but does not discard) the nudge until the deadline is met.
 	DeliverAfter time.Time `json:"deliver_after,omitempty"`
+	// Attempts counts failed injection attempts for this entry. It persists
+	// across Requeue (on-disk, so it survives a poller restart) and bounds
+	// how many times a failed delivery is retried before dead-lettering.
+	Attempts int `json:"attempts,omitempty"`
+	// LastError records the most recent injection failure, for dead-letter
+	// inspection.
+	LastError string `json:"last_error,omitempty"`
 }
 
 // queueDir returns the nudge queue directory for a given session.
@@ -107,6 +127,9 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	}
 	if nudge.Priority == "" {
 		nudge.Priority = PriorityNormal
+	}
+	if nudge.ID == "" {
+		nudge.ID = randomSuffix() + randomSuffix()
 	}
 
 	// Set expiry if not already specified by the caller.
@@ -161,6 +184,15 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 //
 // Expired nudges (past ExpiresAt) are silently discarded during drain.
 // Orphaned .claimed files from crashed drainers are swept if older than 5 minutes.
+//
+// CAVEAT (named at review, hq-g52db): the claimed file is removed as soon as
+// it is unmarshaled, before the caller attempts delivery. If the process dies
+// between that removal and the caller's dead-letter or requeue write, the
+// entry is lost with no durable trace. Callers should write dead-letter (or
+// requeue) as the very next step after a failed delivery to keep this window
+// as short as possible; closing it fully would require deferring the removal
+// until the caller acks, which is a wider change to every Drain caller
+// (including the turn-boundary hook drain) and is out of scope here.
 func Drain(townRoot, session string) ([]QueuedNudge, error) {
 	dir := queueDir(townRoot, session)
 

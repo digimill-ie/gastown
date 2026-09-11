@@ -20,6 +20,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/telemetry"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // sessionNudgeLocks serializes nudges to the same session.
@@ -1697,7 +1698,23 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 // queue up and execute one at a time. This prevents garbled input when
 // SessionStart hooks and nudges arrive simultaneously.
 func (t *Tmux) NudgeSession(session, message string) error {
-	return t.NudgeSessionWithOpts(session, message, NudgeOpts{})
+	return t.NudgeSessionWithOpts(session, message, NudgeOpts{TownRoot: resolveTownRootForLock()})
+}
+
+// resolveTownRootForLock finds the town root from the current working
+// directory for cross-process nudge-lock purposes. Every caller of
+// NudgeSession runs inside a Gas Town process (mayor, witness, deacon, cmd
+// handlers, sling helpers, ...), so cwd-based resolution succeeds in
+// practice. Empty is a safe fallback: NudgeSessionWithOpts simply skips the
+// cross-process flock when TownRoot is empty, same as before this existed.
+// This closes the gap where "the option-less path" (tmux.go, hq-g52db) never
+// took the cross-process lock at all: previously only nudge.go's
+// NudgeModeWaitIdle/NudgeModeQueue callers passed TownRoot explicitly, while
+// NudgeSession — used by session_manager, sling helpers, witness handlers,
+// mail delivery, and more — never did.
+func resolveTownRootForLock() string {
+	townRoot, _ := workspace.FindFromCwd()
+	return townRoot
 }
 
 // NudgeOpts controls optional behavior for nudge delivery.
@@ -1871,7 +1888,7 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 7. Submit with verification — confirms Enter was processed and the
 	// message actually left the composer instead of being stranded by a
 	// swallowed carriage return. (GH#gt-0b5, PR #4461 replacement)
-	if err := t.submitComposer(target, sanitized, readyPromptPrefixForSession(t, session)); err != nil {
+	if err := t.submitComposer(target, sanitized, readyPromptPrefixForSession(t, session), recoveryKeystrokesValidatedForSession(t, session)); err != nil {
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 
@@ -1944,7 +1961,11 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	// 7. Submit with verification — confirms Enter was processed and the
 	// message actually left the composer instead of being stranded by a
 	// swallowed carriage return. (GH#gt-0b5, PR #4461 replacement)
-	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix); err != nil {
+	// NudgePane targets a specific pane rather than a session, so there is no
+	// session env to look up an agent preset from. This path is used for
+	// direct pane addressing (dispatch/sling), which is Claude-only today, so
+	// recovery keystrokes are assumed validated as before this change.
+	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix, true); err != nil {
 		return fmt.Errorf("nudge to pane %q: %w", pane, err)
 	}
 
@@ -3358,6 +3379,33 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 		return promptPrefix
 	}
 	return preset.ReadyPromptPrefix
+}
+
+// recoveryKeystrokesValidatedForSession reports whether stranded-composer
+// recovery keystrokes (C-j) are known safe for the session's agent runtime.
+// No GT_AGENT env defaults to true — the historic behavior, since the
+// overwhelming majority of sessions without GT_AGENT set are Claude Code.
+// Any GT_AGENT value (known preset or an unrecognized/custom one) defaults to
+// false, requiring an explicit RecoveryKeystrokesValidated on the preset,
+// since an unvalidated key on an unfamiliar runtime can be destructive (e.g.,
+// aborting in-flight generation) rather than merely resetting the composer.
+func recoveryKeystrokesValidatedForSession(t *Tmux, session string) bool {
+	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentName == "" {
+		return true
+	}
+	return recoveryKeystrokesValidatedForAgent(agentName)
+}
+
+// recoveryKeystrokesValidatedForAgent is the pure decision behind
+// recoveryKeystrokesValidatedForSession, split out so it is testable without
+// a live tmux session.
+func recoveryKeystrokesValidatedForAgent(agentName string) bool {
+	preset := config.GetAgentPresetByName(agentName)
+	if preset == nil {
+		return false
+	}
+	return preset.RecoveryKeystrokesValidated
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {

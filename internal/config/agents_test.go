@@ -52,6 +52,20 @@ func TestBuiltinPresets(t *testing.T) {
 	}
 }
 
+// TestRecoveryKeystrokesValidatedDefaultsFalse guards hq-g52db's fix 5: only
+// Claude — the long-validated target for tmux's stranded-composer C-j
+// recovery — opts in. Every other built-in preset must default false so a
+// newly added runtime doesn't silently inherit an unvalidated keystroke.
+func TestRecoveryKeystrokesValidatedDefaultsFalse(t *testing.T) {
+	t.Parallel()
+	for name, info := range builtinPresets {
+		want := name == AgentClaude
+		if info.RecoveryKeystrokesValidated != want {
+			t.Errorf("preset %s: RecoveryKeystrokesValidated = %v, want %v", name, info.RecoveryKeystrokesValidated, want)
+		}
+	}
+}
+
 func TestGetAgentPresetByName(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -12,6 +12,14 @@ import (
 // transport could not prove it left the target composer.
 var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in composer")
 
+// ErrComposerDirty reports that, after Enter, the composer holds normal
+// (non-ghost) text that is neither the sent needle nor its prefix. Retyping
+// into this state duplicates content rather than fixing anything, so callers
+// must not retry delivery on this error — see nudge.MaxInjectionAttempts and
+// the poller's dead-letter path. Always wrapped together with
+// ErrSubmitNotVerified; check with errors.Is.
+var ErrComposerDirty = errors.New("composer dirty: retyping would duplicate content")
+
 type submitProbe int
 
 const (
@@ -282,7 +290,13 @@ func (t *Tmux) pollSubmission(target, needle, promptPrefix string, attempts int)
 	return last
 }
 
-func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
+// submitComposer verifies that Enter delivered the message, and only attempts
+// stranded-composer recovery keystrokes (C-j) when recoveryValidated is true.
+// Recovery keystrokes are runtime-specific and unvalidated on most non-Claude
+// presets (see config.AgentPresetInfo.RecoveryKeystrokesValidated); sending
+// them blind risks a destructive effect (e.g., aborting in-flight generation)
+// rather than merely resetting the composer.
+func (t *Tmux) submitComposer(target, message, promptPrefix string, recoveryValidated bool) error {
 	enterErr := t.sendEnterVerified(target)
 	needle := submitNeedle(message)
 	if needle == "" {
@@ -295,8 +309,11 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	case probeUnknown:
 		return enterErr
 	case probeComposerDirty:
-		return fmt.Errorf("%w (composer contains other text after Enter)", ErrSubmitNotVerified)
+		return fmt.Errorf("%w: %w (composer contains other text after Enter)", ErrSubmitNotVerified, ErrComposerDirty)
 	case probeStranded:
+		if !recoveryValidated {
+			return fmt.Errorf("%w (stranded; recovery keystrokes not validated for this runtime)", ErrSubmitNotVerified)
+		}
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
 		return enterErr

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func setupNudgeTestRegistry(t *testing.T) {
@@ -434,27 +437,164 @@ func TestPostQueueIdleRecovery_SkipsDeliveryWhenDrainEmpty(t *testing.T) {
 	}
 }
 
-func TestRequeueDrainedNudgesPreservesFailedDelivery(t *testing.T) {
+// testTmuxNoSession returns a Tmux wrapper pointed at a socket with no real
+// tmux server, so CapturePane fails harmlessly (handleFailedInjection treats
+// that as an empty pane capture) without touching a real session.
+func testTmuxNoSession() *tmux.Tmux {
+	return tmux.NewTmuxWithSocket("gt-test-no-such-socket")
+}
+
+// TestHandleFailedInjection_GenericErrorRequeuesFirst covers the "any other
+// injection error is bounded" half of hq-g52db's fix 2: a first failure that
+// is NOT composer-dirty is requeued (not dead-lettered), with Attempts
+// incremented so a second failure crosses nudge.MaxInjectionAttempts.
+func TestHandleFailedInjection_GenericErrorRequeuesFirst(t *testing.T) {
 	townRoot := t.TempDir()
-	session := "gt-crew-test"
+	sessionName := "gt-crew-test"
 	drained := []nudge.QueuedNudge{
-		{Sender: "test", Message: "first", Timestamp: time.Now().Add(-time.Second)},
-		{Sender: "test", Message: "second", Timestamp: time.Now()},
+		{ID: "abc123", Sender: "test", Message: "first", Timestamp: time.Now().Add(-time.Second)},
+		{ID: "def456", Sender: "test", Message: "second", Timestamp: time.Now()},
 	}
 
-	requeueDrainedNudges(townRoot, session, "test", drained)
+	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceIdleWatcher, drained, errors.New("generic injection failure"))
 
-	got, err := nudge.Drain(townRoot, session)
+	got, err := nudge.Drain(townRoot, sessionName)
 	if err != nil {
 		t.Fatalf("Drain: %v", err)
 	}
 	if len(got) != len(drained) {
-		t.Fatalf("Drain got %d nudges, want %d", len(got), len(drained))
+		t.Fatalf("Drain got %d nudges, want %d (requeued, not dead-lettered)", len(got), len(drained))
 	}
 	for i := range drained {
 		if got[i].Message != drained[i].Message || got[i].Sender != drained[i].Sender {
 			t.Fatalf("requeued[%d] = %#v, want %#v", i, got[i], drained[i])
 		}
+		if got[i].Attempts != 1 {
+			t.Errorf("requeued[%d].Attempts = %d, want 1", i, got[i].Attempts)
+		}
+	}
+
+	entries, err := nudge.ListDeadLetters(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("ListDeadLetters got %d entries, want 0 (first failure should requeue, not dead-letter)", len(entries))
+	}
+}
+
+// TestHandleFailedInjection_ComposerDirtyDeadLettersImmediately covers the
+// "zero retypes after a dirty ... delivery" half of fix 2: a composer-dirty
+// failure is dead-lettered on the FIRST failure, never requeued, so the next
+// poll cannot retype into the same dirty composer.
+func TestHandleFailedInjection_ComposerDirtyDeadLettersImmediately(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+	drained := []nudge.QueuedNudge{
+		{ID: "dirty1", Sender: "test", Message: "stuck payload", Timestamp: time.Now()},
+	}
+	deliverErr := fmt.Errorf("%w: %w (composer contains other text after Enter)", tmux.ErrSubmitNotVerified, tmux.ErrComposerDirty)
+
+	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+
+	requeued, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(requeued) != 0 {
+		t.Fatalf("Drain got %d entries requeued, want 0 (composer-dirty must not be retyped)", len(requeued))
+	}
+
+	entries, err := nudge.ListDeadLetters(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ListDeadLetters got %d entries, want 1", len(entries))
+	}
+	// Assert the COMPLETE payload was preserved in the dead-letter record,
+	// not merely that the queue file disappeared.
+	got := entries[0]
+	if got.Message != "stuck payload" || got.Sender != "test" {
+		t.Errorf("dead-letter payload = %#v, want Message=%q Sender=%q", got, "stuck payload", "test")
+	}
+	if got.UncertainDelivery {
+		t.Errorf("dead-letter UncertainDelivery = true, want false for a known composer-dirty failure")
+	}
+	if got.Source != sourceNudgePoller {
+		t.Errorf("dead-letter Source = %q, want %q", got.Source, sourceNudgePoller)
+	}
+}
+
+// TestHandleFailedInjection_BoundedRetriesDeadLetterAfterMax covers the
+// "bounded" half for non-dirty errors: once Attempts reaches
+// nudge.MaxInjectionAttempts, the entry is dead-lettered instead of requeued
+// again, so an uncertain (but not provably-dirty) failure does not retype
+// forever either.
+func TestHandleFailedInjection_BoundedRetriesDeadLetterAfterMax(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+	drained := []nudge.QueuedNudge{
+		{ID: "uncertain1", Sender: "test", Message: "ack lost after typing", Timestamp: time.Now(), Attempts: nudge.MaxInjectionAttempts - 1},
+	}
+
+	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceIdleWatcher, drained, errors.New("uncertain delivery"))
+
+	requeued, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(requeued) != 0 {
+		t.Fatalf("Drain got %d entries requeued, want 0 (attempts bound reached)", len(requeued))
+	}
+
+	entries, err := nudge.ListDeadLetters(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ListDeadLetters got %d entries, want 1", len(entries))
+	}
+	if !entries[0].UncertainDelivery {
+		t.Errorf("dead-letter UncertainDelivery = false, want true for a generic (non-composer-dirty) bounded failure")
+	}
+}
+
+// TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead covers the
+// "dead-letter write failure (the queue file must survive)" test the review
+// asked for: if DeadLetter itself cannot write, the entry falls back to
+// requeue rather than being silently dropped.
+func TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+
+	// Force nudge.DeadLetter to fail by occupying its target directory path
+	// with a regular file, so MkdirAll cannot create the directory there.
+	safeName := strings.ReplaceAll(sessionName, "/", "_")
+	deadLetterParent := filepath.Join(townRoot, ".runtime", "nudge_deadletter")
+	if err := os.MkdirAll(deadLetterParent, 0755); err != nil {
+		t.Fatalf("setup MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(deadLetterParent, safeName), []byte("blocking file"), 0644); err != nil {
+		t.Fatalf("setup WriteFile: %v", err)
+	}
+
+	drained := []nudge.QueuedNudge{
+		{ID: "willfail", Sender: "test", Message: "must not be lost", Timestamp: time.Now()},
+	}
+	deliverErr := fmt.Errorf("%w: %w", tmux.ErrSubmitNotVerified, tmux.ErrComposerDirty)
+
+	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+
+	requeued, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(requeued) != 1 {
+		t.Fatalf("Drain got %d entries, want 1 (dead-letter write failed, must fall back to requeue)", len(requeued))
+	}
+	if requeued[0].Message != "must not be lost" {
+		t.Errorf("requeued message = %q, want %q", requeued[0].Message, "must not be lost")
 	}
 }
 

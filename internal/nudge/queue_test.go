@@ -791,3 +791,84 @@ func TestConcurrentDrainNoDoubleDeli(t *testing.T) {
 		t.Errorf("double delivery detected: got %d total nudges, want exactly %d", total, count)
 	}
 }
+
+// TestEnqueueAssignsID covers hq-g52db: every enqueued nudge gets a stable
+// identity so failed-delivery attempts can be correlated across the poller,
+// the idle watcher, and a poller restart even though each requeue writes a
+// new filename.
+func TestEnqueueAssignsID(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-id"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "test", Message: "hello"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("got %d nudges, want 1", len(nudges))
+	}
+	if nudges[0].ID == "" {
+		t.Error("Enqueue did not assign an ID to a nudge with none set")
+	}
+}
+
+// TestEnqueuePreservesExplicitID covers Requeue's contract: an already-set ID
+// (as Requeue passes through from a drained entry) must not be overwritten
+// with a new one, or attempts recorded against the original ID (e.g. in a
+// dead-letter record) would no longer match the requeued entry.
+func TestEnqueuePreservesExplicitID(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-id-preserved"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{ID: "fixed-id-123", Sender: "test", Message: "hello"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("got %d nudges, want 1", len(nudges))
+	}
+	if nudges[0].ID != "fixed-id-123" {
+		t.Errorf("ID = %q, want %q (Enqueue must not overwrite an explicit ID)", nudges[0].ID, "fixed-id-123")
+	}
+}
+
+// TestRequeuePreservesAttemptsAndID covers hq-g52db fix 2: the attempt count
+// must persist across a requeue (which is what happens on every poller
+// restart, since it is read back from the on-disk queue file) so retries are
+// bounded across restarts, not reset to zero each time.
+func TestRequeuePreservesAttemptsAndID(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-requeue-attempts"
+
+	drained := []QueuedNudge{
+		{ID: "abc", Sender: "test", Message: "hello", Attempts: 1, LastError: "boom", Timestamp: time.Now()},
+	}
+	if err := Requeue(townRoot, session, drained); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("got %d nudges, want 1", len(nudges))
+	}
+	if nudges[0].ID != "abc" {
+		t.Errorf("ID = %q, want %q", nudges[0].ID, "abc")
+	}
+	if nudges[0].Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1", nudges[0].Attempts)
+	}
+	if nudges[0].LastError != "boom" {
+		t.Errorf("LastError = %q, want %q", nudges[0].LastError, "boom")
+	}
+}
