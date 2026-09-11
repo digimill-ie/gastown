@@ -168,16 +168,6 @@ type AgentPresetInfo struct {
 	// keystroke and the 600ms readline timeout that follows it.
 	EscapeCancelsRequest bool `json:"escape_cancels_request,omitempty"`
 
-	// RecoveryKeystrokesValidated indicates the stranded-composer recovery
-	// sequence (send C-j to reset, then retype) has been observed to behave
-	// safely on this runtime — it resets the composer rather than, say,
-	// submitting a partial line or triggering an unrelated shortcut. When
-	// false (the default), a stranded composer is reported as
-	// ErrSubmitNotVerified without attempting recovery keystrokes, since an
-	// unvalidated key on an unknown runtime risks doing something destructive
-	// instead of merely resetting the composer. See hq-g52db.
-	RecoveryKeystrokesValidated bool `json:"recovery_keystrokes_validated,omitempty"`
-
 	// ACP is the configuration for ACP (Agent Communication Protocol) support.
 	// nil means the agent does not support ACP.
 	ACP *ACPConfig `json:"acp,omitempty"`
@@ -251,19 +241,18 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		SupportsForkSession: true,
 		NonInteractive:      nil, // Claude is native non-interactive
 		// Runtime defaults
-		PromptMode:                  "arg",
-		ConfigDirEnv:                "CLAUDE_CONFIG_DIR",
-		ConfigDir:                   ".claude",
-		HooksProvider:               "claude",
-		HooksDir:                    ".claude",
-		HooksSettingsFile:           "settings.json",
-		HooksUseSettingsDir:         true,
-		ReadyPromptPrefix:           "❯ ",
-		ReadyDelayMs:                10000,
-		InstructionsFile:            "CLAUDE.md",
-		EmitsPermissionWarning:      true,
-		HasTurnBoundaryDrain:        true,
-		RecoveryKeystrokesValidated: true, // C-j stranded-composer recovery is Claude Code's original, long-validated target runtime.
+		PromptMode:             "arg",
+		ConfigDirEnv:           "CLAUDE_CONFIG_DIR",
+		ConfigDir:              ".claude",
+		HooksProvider:          "claude",
+		HooksDir:               ".claude",
+		HooksSettingsFile:      "settings.json",
+		HooksUseSettingsDir:    true,
+		ReadyPromptPrefix:      "❯ ",
+		ReadyDelayMs:           10000,
+		InstructionsFile:       "CLAUDE.md",
+		EmitsPermissionWarning: true,
+		HasTurnBoundaryDrain:   true,
 	},
 	AgentGemini: {
 		Name:                AgentGemini,

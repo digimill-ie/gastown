@@ -257,7 +257,7 @@ func HandlePolecatDoneFromBead(bd *BdCli, workDir, rigName, polecatName string, 
 			mayorSession := session.MayorSessionName()
 			t := tmux.NewTmux()
 			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSessionWithOpts(mayorSession, mayorMsg, tmux.NudgeOpts{TownRoot: townRoot})
+				_ = t.NudgeSession(mayorSession, mayorMsg)
 			}
 		}
 		return result
@@ -509,7 +509,7 @@ func HandleMergeFailed(workDir, rigName string, msg *mail.Message, router *mail.
 	nudgeMsg := fmt.Sprintf("MERGE_FAILED: branch=%s issue=%s type=%s error=%s — fix and resubmit with 'gt done'",
 		payload.Branch, payload.IssueID, payload.FailureType, payload.Error)
 	t := tmux.NewTmux()
-	if err := t.NudgeSessionWithOpts(sessionName, nudgeMsg, tmux.NudgeOpts{TownRoot: workDirToTownRoot(workDir)}); err != nil {
+	if err := t.NudgeSession(sessionName, nudgeMsg); err != nil {
 		result.Error = fmt.Errorf("nudging polecat about failure: %w", err)
 		return result
 	}
@@ -746,7 +746,7 @@ func nudgeRefinery(townRoot, rigName string) error {
 	// No cooperative queue — idle agents never call Drain(), so queued
 	// nudges would be stuck forever. Direct delivery is safe: if the
 	// agent is busy, text buffers in tmux and is processed at next prompt.
-	return t.NudgeSessionWithOpts(sessionName, "New MR available - check merge queue for pending work", tmux.NudgeOpts{TownRoot: townRoot})
+	return t.NudgeSession(sessionName, "New MR available - check merge queue for pending work")
 }
 
 var slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
@@ -945,7 +945,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 	t := tmux.NewTmux()
 	if running, err := t.HasSession(mayorSession); err == nil && running {
 		msg := fmt.Sprintf("SLOT_OPEN: %s/%s completed (exit=%s) — slot available. Run `gt polecat list` to verify and sling next bead.", rigName, polecatName, exitType)
-		if err := t.NudgeSessionWithOpts(mayorSession, msg, tmux.NudgeOpts{TownRoot: townRoot}); err == nil {
+		if err := t.NudgeSession(mayorSession, msg); err == nil {
 			return // Nudge delivered — no mail needed.
 		}
 	}
@@ -986,7 +986,7 @@ func notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType string, s
 	t := tmux.NewTmux()
 	msg := fmt.Sprintf("SCHEDULER_OPEN: %s/%s completed (exit=%s); scheduler has capacity but no eligible queued beads remain.", rigName, polecatName, exitType)
 	if running, err := t.HasSession(mayorSession); err == nil && running {
-		if err := t.NudgeSessionWithOpts(mayorSession, msg, tmux.NudgeOpts{TownRoot: townRoot}); err == nil {
+		if err := t.NudgeSession(mayorSession, msg); err == nil {
 			return
 		}
 	}
@@ -1247,7 +1247,7 @@ func EscalateRecoveryNeeded(workDir, rigName string, payload *RecoveryPayload) (
 	nudgeMsg := fmt.Sprintf("RECOVERY_NEEDED: %s/%s cleanup_status=%s branch=%s issue=%s detected=%s — coordinate recovery before authorizing cleanup",
 		rigName, payload.PolecatName, payload.CleanupStatus, payload.Branch, payload.IssueID, payload.DetectedAt.Format(time.RFC3339))
 	t := tmux.NewTmux()
-	if err := t.NudgeSessionWithOpts(sessionName, nudgeMsg, tmux.NudgeOpts{TownRoot: workDirToTownRoot(workDir)}); err != nil {
+	if err := t.NudgeSession(sessionName, nudgeMsg); err != nil {
 		return "", fmt.Errorf("nudging deacon about recovery: %w", err)
 	}
 	return "nudge", nil
@@ -1899,7 +1899,7 @@ func detectSubmittedStillRunning(bd *BdCli, workDir, polecatName, sessionName st
 		Action:         fmt.Sprintf("nudged-exit-submitted-session (idle=%v, hook_status=%s)", age.Round(time.Second), hookStatus),
 	}
 	msg := fmt.Sprintf("RECOVERY_NEEDED: gt done appears submitted (hook=%s, cleanup_status=clean), but this session is still running with no fresh heartbeat for %v. If work is already submitted, exit now; otherwise run gt done again.", hookStatusForNudge(snapHook), age.Round(time.Second))
-	if err := t.NudgeSessionWithOpts(sessionName, msg, tmux.NudgeOpts{TownRoot: workDirToTownRoot(workDir)}); err != nil {
+	if err := t.NudgeSession(sessionName, msg); err != nil {
 		zombie.Error = err
 		zombie.Action = fmt.Sprintf("nudge-exit-submitted-session-failed: %v", err)
 	}
@@ -2490,7 +2490,7 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 			mayorSession := session.MayorSessionName()
 			t := tmux.NewTmux()
 			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSessionWithOpts(mayorSession, mayorMsg, tmux.NudgeOpts{TownRoot: townRoot})
+				_ = t.NudgeSession(mayorSession, mayorMsg)
 			}
 		}
 		return
@@ -2806,7 +2806,7 @@ then either close the bead or reset the respawn counter.`,
 				t := tmux.NewTmux()
 				nudgeMsg := fmt.Sprintf("SPAWN_BLOCKED %s (respawn limit reached) from %s/%s — mail send failed, investigate spawn storm",
 					hookBead, rigName, polecatName)
-				if nudgeErr := t.NudgeSessionWithOpts(session.MayorSessionName(), nudgeMsg, tmux.NudgeOpts{TownRoot: workDirToTownRoot(workDir)}); nudgeErr != nil {
+				if nudgeErr := t.NudgeSession(session.MayorSessionName(), nudgeMsg); nudgeErr != nil {
 					fmt.Fprintf(os.Stderr, "witness: nudge fallback to mayor also failed for %s: %v\n", hookBead, nudgeErr)
 				}
 			}
@@ -2857,7 +2857,7 @@ Please re-dispatch to an available polecat.`,
 			t := tmux.NewTmux()
 			nudgeMsg := fmt.Sprintf("RECOVERED_BEAD %s from %s/%s (status=%s, respawns=%d) — mail send failed, please re-dispatch",
 				hookBead, rigName, polecatName, status, respawnCount)
-			if nudgeErr := t.NudgeSessionWithOpts(session.DeaconSessionName(), nudgeMsg, tmux.NudgeOpts{TownRoot: workDirToTownRoot(workDir)}); nudgeErr != nil {
+			if nudgeErr := t.NudgeSession(session.DeaconSessionName(), nudgeMsg); nudgeErr != nil {
 				fmt.Fprintf(os.Stderr, "witness: nudge fallback to deacon also failed for %s: %v\n", hookBead, nudgeErr)
 			}
 		}

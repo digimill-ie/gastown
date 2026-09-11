@@ -108,7 +108,7 @@ func TestSubmitComposer_DirtyStateHeldAfterEnter(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := startFakeComposerSession(t, tm, fakeStaticComposerScript, "an unrelated draft")
 
-	err := tm.submitComposer(sessionName, "resume the patrol", DefaultReadyPromptPrefix, false)
+	err := tm.submitComposer(sessionName, "resume the patrol", DefaultReadyPromptPrefix)
 	if err == nil {
 		t.Fatal("submitComposer() = nil, want an error for a dirty composer")
 	}
@@ -144,10 +144,8 @@ func TestSubmitComposer_StrandedComposerRecovered(t *testing.T) {
 	const needle = "resume the patrol"
 	sessionName := startFakeComposerSession(t, tm, fakeComposerScript, needle)
 
-	// recoveryValidated=true: this is the runtime-validated path (the
-	// production caller gates this on recoveryKeystrokesValidatedForSession,
-	// tested separately).
-	err := tm.submitComposer(sessionName, needle, DefaultReadyPromptPrefix, true)
+	// Recovery (C-j) is attempted unconditionally, as at 649b832b.
+	err := tm.submitComposer(sessionName, needle, DefaultReadyPromptPrefix)
 	if err != nil {
 		t.Fatalf("submitComposer() = %v, want nil (recovered via C-j)", err)
 	}

@@ -192,20 +192,31 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	return nil
 }
 
-// Requeue writes previously drained nudges back to the queue for later
-// delivery. Existing timestamps are preserved so FIFO ordering remains
-// stable relative to one another; only expired nudges are skipped.
-//
-// It attempts EVERY entry even if an earlier one fails to enqueue — the
-// previous version returned on the first error, silently never attempting
-// the rest of the batch. Returns the entries that failed to enqueue (empty
-// on full success): callers that Ack a claim only after its outcome is
-// durable (see Claim.Ack) need this to know precisely which entries are
-// NOT yet durable anywhere, so they can leave those claims un-acked instead
-// of acking (and thereby losing) a claim whose requeue write itself failed
-// (codex, nudge_poller.go:157, changes-requested at 08964387/95f841e6
-// rework).
-func Requeue(townRoot, session string, nudges []QueuedNudge) (failed []QueuedNudge, err error) {
+// Requeue writes previously drained nudges back to the queue for later delivery.
+// Existing timestamps are preserved so FIFO ordering remains stable relative to
+// one another; only expired nudges are skipped.
+func Requeue(townRoot, session string, nudges []QueuedNudge) error {
+	for _, n := range nudges {
+		if !n.ExpiresAt.IsZero() && time.Now().After(n.ExpiresAt) {
+			continue
+		}
+		if err := Enqueue(townRoot, session, n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RequeueTracked is like Requeue but attempts EVERY entry even if an earlier
+// one fails to enqueue, and returns the entries that failed (empty on full
+// success). Used only by the nudge-poller's failure handling
+// (cmd.handleFailedInjection), which acks a claim only after its outcome is
+// durable (see Claim.Ack) and needs to know precisely which entries are NOT
+// yet durable anywhere, so it can leave those claims un-acked instead of
+// acking (and thereby losing) a claim whose requeue write itself failed.
+// Requeue itself keeps its original stop-on-first-error contract for its
+// other callers.
+func RequeueTracked(townRoot, session string, nudges []QueuedNudge) (failed []QueuedNudge, err error) {
 	var firstErr error
 	for _, n := range nudges {
 		if !n.ExpiresAt.IsZero() && time.Now().After(n.ExpiresAt) {
@@ -405,9 +416,11 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 			claimedIdx := strings.Index(name, ".claimed")
 			restoredPath := filepath.Join(dir, name[:claimedIdx])
 			if err := os.Rename(orphanPath, restoredPath); err != nil {
-				// Rename failed — remove as last resort to prevent infinite accumulation
-				fmt.Fprintf(os.Stderr, "Warning: failed to requeue orphaned claim %s: %v\n", entry.Name(), err)
-				_ = os.Remove(orphanPath)
+				// Rename failed — leave the orphaned claim file in place and
+				// retry on a future sweep. Removing it here would permanently
+				// drop the nudge, exactly what the "never drop" policy
+				// (see nudge.MaxInjectionAttempts callers) prohibits.
+				fmt.Fprintf(os.Stderr, "Warning: failed to requeue orphaned claim %s, will retry on a future sweep: %v\n", entry.Name(), err)
 			}
 		}
 	}

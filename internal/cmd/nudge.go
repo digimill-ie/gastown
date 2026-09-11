@@ -151,34 +151,6 @@ var idleWatcherTimeout = 60 * time.Second
 // Var so tests can override.
 var idleWatcherPollInterval = 1 * time.Second
 
-// buildWaitIdleDeadLetterEntry builds the QueuedNudge for wait-idle mode's
-// direct dead-letter path (an unverified delivery after WaitForIdle — see
-// deliverNudge below), which bypasses nudge.Enqueue and so must fill in ID,
-// Timestamp and ExpiresAt itself. DeadLetter also assigns an ID when one is
-// missing, but only on its OWN internal copy of the struct — it never
-// reports the generated ID back — so without setting it here first, the
-// alertDeadLetter call in deliverNudge would report a blank Entry ID, and
-// the persisted record would carry a zero Timestamp/ExpiresAt (codex,
-// nudge.go:253/282, changes-requested at 08964387/95f841e6 rework). Split
-// out as a pure function so it is unit-testable without a live tmux
-// session, the same reasoning as recoveryProbeError in submit_verify.go.
-func buildWaitIdleDeadLetterEntry(sender, message, priority string) nudge.QueuedNudge {
-	now := time.Now()
-	ttl := nudge.DefaultNormalTTL
-	if priority == nudge.PriorityUrgent {
-		ttl = nudge.DefaultUrgentTTL
-	}
-	return nudge.QueuedNudge{
-		ID:        nudge.NewID(),
-		Sender:    sender,
-		Message:   message,
-		Priority:  priority,
-		Timestamp: now,
-		ExpiresAt: now.Add(ttl),
-		Attempts:  1,
-	}
-}
-
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -198,14 +170,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		return nil
 	}
 
-	// FindFromCwdOrError falls back to GT_TOWN_ROOT/GT_ROOT when cwd isn't
-	// itself inside a workspace — plain FindFromCwd lacked that fallback,
-	// so a process launched from outside any workspace directory (but with
-	// those env vars set, as most agent sessions are) fell straight through
-	// to an empty townRoot and the cross-process nudge flock below silently
-	// went unused (codex, nudge.go:173, changes-requested at
-	// 08964387/95f841e6 rework).
-	townRoot, _ := workspace.FindFromCwdOrError()
+	townRoot, _ := workspace.FindFromCwd()
 
 	// Use the requested mode, but force queue mode for ACP sessions.
 	// ACP agents don't have tmux panes to send-keys to.
@@ -284,39 +249,14 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			if !errors.Is(deliverErr, tmux.ErrSubmitNotVerified) {
 				return deliverErr
 			}
-			fmt.Fprintf(os.Stderr, "wait-idle: %v; dead-lettering for %s\n", deliverErr, sessionName)
-			pending := buildWaitIdleDeadLetterEntry(sender, message, nudgePriorityFlag)
-			// Zero retypes after ANY unverified delivery — a known-dirty
-			// composer, a stranded composer, or simply "typed but could not
-			// confirm Enter delivered it" (ack lost after typing). Enqueuing
-			// this entry as an ordinary retry would just have the
-			// poller/idle-watcher retype it on the next cycle, risking
-			// duplicate content exactly the way a composer-dirty retype
-			// would (hq-g52db). REVISION 3 requires this for dirty AND
-			// uncertain deliveries alike — previously only ErrComposerDirty
-			// (not the broader ErrSubmitNotVerified) got this treatment, so
-			// an ack-lost-after-typing failure fell through to an ordinary
-			// Attempts=0 requeue below (codex, nudge.go:268, changes-requested
-			// at 08964387).
-			paneCapture, _ := t.CapturePane(t.ResolveAgentTarget(sessionName), 25)
-			_ = nudge.LogInjectionError(townRoot, sessionName, sourceWaitIdle, deliverErr, paneCapture)
-			if _, dlErr := nudge.DeadLetter(townRoot, sessionName, pending, sourceWaitIdle, deliverErr.Error(), paneCapture, true); dlErr != nil {
-				// Dead-letter write failed too: do NOT fall back to
-				// enqueuing — that would resume the exact retype loop this
-				// policy exists to stop (codex, nudge.go:268/275, the same
-				// finding). Drop the message, logged loudly, matching
-				// handleFailedInjection's documented double-fault policy.
-				//
-				// Return the error rather than nil: the caller (runNudge)
-				// prints "✓ Nudged ... (wait-idle)" on a nil return, which
-				// would falsely report success on a message that was typed,
-				// never verified as delivered, AND then dropped because
-				// even the dead-letter write failed (codex, nudge.go:280,
-				// changes-requested at 08964387/95f841e6 rework).
-				fmt.Fprintf(os.Stderr, "wait-idle: CRITICAL: dead-letter for unverified delivery to %s failed and it will NOT be queued (would resume the retype loop): %v\n", sessionName, dlErr)
-				return fmt.Errorf("wait-idle: delivery to %q unverified and dead-letter write also failed, message dropped: %w", sessionName, dlErr)
+			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)
+			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}); qErr != nil {
+				return fmt.Errorf("queue fallback after unverified submit failed: %v (original: %w)", qErr, deliverErr)
 			}
-			alertDeadLetter(townRoot, sessionName, sourceWaitIdle, pending)
 			return nil
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
@@ -386,15 +326,8 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 	for time.Now().Before(deadline) {
 		time.Sleep(idleWatcherPollInterval)
 
-		// If the queue is entirely empty — no fresh entry AND no leftover
-		// .claimed file from a crashed drainer — someone else drained it
-		// (or there is genuinely nothing left to do). QueueLen alone
-		// (counts .json only) would return early here even when a stale
-		// .claimed file is sitting unswept, so this watcher would never
-		// call DrainClaims again to run the orphan sweep that restores it
-		// (codex, nudge.go:353, changes-requested at 08964387/95f841e6
-		// rework).
-		if has, _ := nudge.PendingOrClaimed(townRoot, sessionName); !has {
+		// If queue is already empty, someone else drained it.
+		if nudge.QueueLen(townRoot, sessionName) == 0 {
 			return
 		}
 
@@ -408,59 +341,28 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 		// This avoids false positives during inter-tool-call gaps where
 		// the prompt briefly appears while Claude Code is still working.
 		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {
-			// DrainClaims atomically claims queued entries (rename-based)
-			// but does not delete them — see nudge.DrainClaims. If another
-			// process raced and drained first, we get an empty slice and
-			// skip delivery to avoid duplicates.
-			claims, _ := nudge.DrainClaims(townRoot, sessionName)
-			if len(claims) == 0 {
+			// Drain atomically claims queued entries (rename-based).
+			// If another process raced and drained first, we get an
+			// empty slice and skip delivery to avoid duplicates.
+			drained, _ := nudge.Drain(townRoot, sessionName)
+			if len(drained) == 0 {
 				return
 			}
-
-			toInject, exhausted, staleInFlight := partitionForInjection(claims)
-			var unresolved []nudge.QueuedNudge
-			if len(exhausted) > 0 {
-				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(exhausted), errAttemptsExhausted)...)
+			formatted := nudge.FormatForInjection(drained)
+			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+				requeueDrainedNudges(townRoot, sessionName, "idle-watcher", drained)
 			}
-			if len(staleInFlight) > 0 {
-				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(staleInFlight), errPriorAttemptUnresolved)...)
-			}
-			if len(toInject) > 0 {
-				// Persist the incremented Attempts count before injecting —
-				// see Claim.MarkAttempt and the matching comment in
-				// nudge_poller.go.
-				marked, failedPersist := markAttempts(sourceIdleWatcher, sessionName, toInject)
-				if len(failedPersist) > 0 {
-					unresolved = append(unresolved, claimNudges(failedPersist)...)
-				}
-				if len(marked) > 0 {
-					formatted := nudge.FormatForInjection(claimNudges(marked))
-					if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
-						fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
-						unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(marked), err)...)
-					}
-				}
-			}
-
-			// Ack only the RESOLVED claims — see the matching comment in
-			// nudge_poller.go.
-			ackClaims(sourceIdleWatcher, sessionName, claims, unresolved)
-			if len(unresolved) == 0 {
-				return
-			}
-			// An unconditional return here (the prior behavior) exits the
-			// watcher the instant it drains ANY batch, even one that left
-			// entries unresolved (a dead-letter/requeue write that itself
-			// failed, or a claim retained after a busy/crashed prior
-			// attempt) — stranding recovery on a brand-new `gt nudge`
-			// invocation for the rest of idleWatcherTimeout's remaining
-			// window, when this watcher could keep polling and give
-			// DrainClaims' own orphan sweep a chance instead (codex,
-			// nudge.go:415, changes-requested at REVISION 3 — Medium).
-			// Falls through to the outer loop rather than returning.
+			return
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.
+}
+
+func requeueDrainedNudges(townRoot, sessionName, source string, drained []nudge.QueuedNudge) {
+	if err := nudge.Requeue(townRoot, sessionName, drained); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed: %v\n", source, sessionName, err)
+	}
 }
 
 // validNudgeModes is the set of allowed --mode values.
@@ -629,7 +531,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("%s Nudged deacon (%s)\n", style.Bold.Render("✓"), nudgeModeFlag)
-		logNudgeSent("", constants.RoleDeacon, sender, message)
+
+		// Log nudge event
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			_ = LogNudge(townRoot, constants.RoleDeacon, message)
+		}
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", constants.RoleDeacon, message))
 		return nil
 	}
 	if dogName, ok := mail.DogAddressName(target); ok {
@@ -649,7 +556,10 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("%s Nudged %s (%s)\n", style.Bold.Render("✓"), target, nudgeModeFlag)
-		logNudgeSent("", target, sender, message)
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			_ = LogNudge(townRoot, target, message)
+		}
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", target, message))
 		return nil
 	}
 	if strings.HasPrefix(target, constants.RoleMayor+"/") || strings.HasPrefix(target, constants.RoleDeacon+"/") {
@@ -716,7 +626,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("%s Nudged %s/%s (%s)\n", style.Bold.Render("✓"), rigName, polecatName, nudgeModeFlag)
-		logNudgeSent(rigName, target, sender, message)
+
+		// Log nudge event
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			_ = LogNudge(townRoot, target, message)
+		}
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload(rigName, target, message))
 	} else {
 		// Raw session name (legacy)
 		// Check for ACP session - ACP agents don't have tmux sessions but can receive nudges via queue
@@ -737,31 +652,15 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("✓ Nudged %s (%s)\n", target, nudgeModeFlag)
-		logNudgeSent("", target, sender, message)
+
+		// Log nudge event
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			_ = LogNudge(townRoot, target, message)
+		}
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", target, message))
 	}
 
 	return nil
-}
-
-// logNudgeSent records a successful nudge send in the town log and activity
-// feed. Skipped entirely when GT_TEST_NUDGE_LOG is set: that means
-// deliverNudge intercepted the send instead of actually delivering it (see
-// its own test hook), so logging it as sent would be false. It matters
-// beyond correctness: LogNudge and events.LogFeed both resolve their town
-// root by walking up from the CURRENT WORKING DIRECTORY, not from any
-// townRoot the caller already has — so without this guard, a test run from a
-// worktree nested inside a real Gas Town workspace writes these records into
-// the REAL town's town.log and .events.jsonl. Confirmed live 2026-09-11
-// (hq-g52db): an unfiltered `go test ./internal/cmd/...` run wrote real
-// "nudge sent" records for gastown/alpha, hq-mayor, deacon, and others.
-func logNudgeSent(rigName, target, sender, message string) {
-	if os.Getenv("GT_TEST_NUDGE_LOG") != "" {
-		return
-	}
-	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-		_ = LogNudge(townRoot, target, message)
-	}
-	_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload(rigName, target, message))
 }
 
 // runNudgeChannel nudges all members of a named channel.
@@ -851,11 +750,8 @@ func runNudgeChannel(channelName, message, sender string) error {
 
 	fmt.Println()
 
-	// Log nudge event. See logNudgeSent's doc comment for why this is
-	// skipped under GT_TEST_NUDGE_LOG.
-	if os.Getenv("GT_TEST_NUDGE_LOG") == "" {
-		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", "channel:"+channelName, message))
-	}
+	// Log nudge event
+	_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", "channel:"+channelName, message))
 
 	if failed > 0 {
 		summary := fmt.Sprintf("Channel nudge complete: %d succeeded, %d failed", succeeded, failed)

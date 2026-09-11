@@ -106,39 +106,10 @@ func TestWakeRigAgentsDoesNotNudgeRefinery(t *testing.T) {
 
 // TestNudgeRefineryNoOpWithoutLog verifies that nudgeRefinery doesn't panic
 // or error when called without the test log env var and without a real tmux session.
-// The tmux NudgeSessionWithOpts call should fail silently.
-//
-// Deliberately exercising the real (non-test-log) path here means
-// nudgeRefinery's workspace.FindFromCwd() call runs for real too. This
-// package's tests run from a worktree nested inside the actual live town
-// (gastown/polecats/<name>/gastown/internal/cmd), so without isolating cwd,
-// FindFromCwd would resolve to the REAL town root and
-// channelevents.EmitToTown would write a REAL event into the live
-// refinery's channel — the same class of live-town pollution as hq-qyfok
-// (codex Medium, sling_helpers_test.go:112, changes-requested at
-// 08964387).
-//
-// A chdir alone is NOT enough: session.PrefixFor("nonexistent-rig") falls
-// back to session.DefaultPrefix ("gt" — gastown's OWN real prefix) for an
-// unregistered rig, so refinerySession resolves to a name that plausibly
-// collides with the REAL gastown refinery's session. Worse, tmux.NewTmux()
-// connects via tmux's process-global default socket
-// (tmux.GetDefaultSocket/SetDefaultSocket), which is NOT cwd-scoped: if any
-// EARLIER test in this package's process called session.InitRegistry
-// against a resolvable townRoot (real or otherwise), that call's
-// tmux.SetDefaultSocket permanently repoints the socket for the rest of
-// the test binary's process, regardless of what THIS test does with its
-// own cwd. So a plain chdir defeats only THIS test's own FindFromCwd call,
-// not a prior test's global pollution (codex, sling_helpers_test.go:136,
-// changes-requested at 08964387/95f841e6 rework — the "chdir does not
-// isolate tmux" finding). isolateTestTmuxAndWorkspace covers both: cwd,
-// AND an isolated GT_TMUX_SOCKET, AND restoring the global socket/registry
-// afterward so this test cannot pollute a later one either.
+// The tmux NudgeSession call should fail silently.
 func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 	// Ensure test log is NOT set so we exercise the real tmux path
 	t.Setenv("GT_TEST_NUDGE_LOG", "")
-
-	isolateTestTmuxAndWorkspace(t)
 
 	// Should not panic even though no tmux session exists
 	nudgeRefinery("nonexistent-rig", "test message")

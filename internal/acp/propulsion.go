@@ -2,7 +2,6 @@ package acp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,27 +13,6 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/townlog"
 )
-
-// errBusyDeferred signals that notify deliberately skipped InjectPrompt this
-// cycle (busy agent, non-urgent nudge) rather than attempting and failing
-// it. deliverNudges must not treat this like a successful delivery: only
-// notifyWithMeta's UI-only side channel saw the content, and the agent's
-// active turn never received it via InjectPrompt — acking the claim here
-// would delete it on the strength of that UI notification alone (codex,
-// propulsion.go:267, changes-requested at REVISION 3 — High 6).
-var errBusyDeferred = errors.New("nudge delivery deferred: session busy")
-
-// claimRecoveryInterval periodically re-invokes deliverNudges even when no
-// new nudge arrives. A retained claim (busy-deferred delivery, or a
-// requeue/dead-letter write that itself failed) produces no filesystem
-// event of its own — WatcherForSession only fires on a fresh .json file —
-// so without this, such a claim has no recovery trigger and can sit until
-// an unrelated new nudge happens to arrive (codex, propulsion.go:190,
-// changes-requested at REVISION 3 — High 7). Deliberately shorter than
-// nudge's staleClaimThreshold (5 minutes) so a busy-deferred claim gets
-// re-checked well before it would otherwise be swept as orphaned. A var,
-// not a const, so a test can shrink it instead of waiting a full minute.
-var claimRecoveryInterval = 60 * time.Second
 
 // acpDebugLogger provides file-based debug logging for ACP when GT_ACP_DEBUG=1.
 // It lazily opens the log file on first use and keeps it open for the session.
@@ -205,47 +183,25 @@ func (p *Propeller) eventLoop() {
 	}
 	defer func() { _ = watcher.Close() }()
 
-	ticker := time.NewTicker(claimRecoveryInterval)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case <-watcher.Events():
 			p.deliverNudges()
-		case <-ticker.C:
-			// Periodic recovery sweep — see claimRecoveryInterval.
-			p.deliverNudges()
 		}
 	}
 }
 
 // deliverNudges drains queued nudges and injects them into the ACP session.
-//
-// Uses DrainClaims, not Drain: Drain deletes each entry from the queue the
-// instant it is read, before p.notify (the fallible ACP delivery call
-// below) is even attempted. p.notify DOES fail in practice — the requeue
-// fallback below exists precisely because it does — so a crash between
-// Drain's delete and a subsequent Requeue call lost the entry with no
-// durable trace anywhere, the same ordering bug nudge_poller.go's claim-
-// based rework closed for tmux delivery (codex, propulsion.go:198,235,
-// changes-requested at 08964387/95f841e6 rework: the PR that introduced
-// nudge.Claim/DrainClaims had claimed, incorrectly, that this caller "cannot
-// fail the way a tmux send can"). Claims are Acked only once the outcome —
-// successful delivery, or a durable requeue write — is itself durable.
 func (p *Propeller) deliverNudges() {
-	claims, err := nudge.DrainClaims(p.townRoot, p.session)
+	nudges, err := nudge.Drain(p.townRoot, p.session)
 	if err != nil {
-		debugLog(p.townRoot, "[Propeller] deliverNudges: DrainClaims error: %v", err)
+		debugLog(p.townRoot, "[Propeller] deliverNudges: Drain error: %v", err)
 		return
 	}
-	if len(claims) == 0 {
+	if len(nudges) == 0 {
 		return
-	}
-	nudges := make([]nudge.QueuedNudge, len(claims))
-	for i, c := range claims {
-		nudges[i] = c.Nudge
 	}
 
 	debugLog(p.townRoot, "[Propeller] deliverNudges: drained %d nudge(s)", len(nudges))
@@ -263,20 +219,12 @@ func (p *Propeller) deliverNudges() {
 
 	meta := buildSessionUpdateMeta(nudges, p.session)
 	requeue := func(reason string) {
-		failed, err := nudge.Requeue(p.townRoot, p.session, nudges)
-		if err != nil {
-			logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to requeue %d/%d nudges after %s: %v", len(failed), len(nudges), reason, err))
-			style.PrintWarning("ACP Propeller failed to requeue %d/%d nudges after %s: %v", len(failed), len(nudges), reason, err)
-		} else {
-			logEvent(p.townRoot, "acp_degraded", fmt.Sprintf("requeued %d nudges: %s", len(nudges), reason))
+		if err := nudge.Requeue(p.townRoot, p.session, nudges); err != nil {
+			logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to requeue nudges after %s: %v", reason, err))
+			style.PrintWarning("ACP Propeller failed to requeue nudges after %s: %v", reason, err)
+			return
 		}
-		// Ack every claim whose requeue write succeeded. An entry in
-		// failed did NOT durably land anywhere — its claim is left
-		// un-acked so a future DrainClaims orphan sweep can recover it
-		// instead of losing it here.
-		nudge.AckClaims(claims, failed, func(c nudge.Claim, ackErr error) {
-			style.PrintWarning("ACP Propeller failed to ack nudge claim for %s: %v", c.Nudge.ID, ackErr)
-		})
+		logEvent(p.townRoot, "acp_degraded", fmt.Sprintf("requeued %d nudges: %s", len(nudges), reason))
 	}
 
 	if p.proxy == nil || p.proxy.SessionID() == "" {
@@ -285,29 +233,9 @@ func (p *Propeller) deliverNudges() {
 	}
 
 	if err := p.notify(text, meta, urgent); err != nil {
-		if errors.Is(err, errBusyDeferred) {
-			// Busy, non-urgent: leave every claim retained (un-acked)
-			// rather than requeuing. Requeuing would write a fresh .json
-			// file immediately, which the watcher would see right away —
-			// if the agent stays busy, that becomes a tight requeue/re-
-			// notify loop. Leaving the claim as-is means the next
-			// recovery trigger (a new nudge, or claimRecoveryInterval)
-			// picks it up via DrainClaims' own orphan sweep once
-			// staleClaimThreshold passes. Acking here would delete the
-			// claim on nothing more than a UI-only notification (High 6).
-			debugLog(p.townRoot, "[Propeller] deliverNudges: session busy, retaining %d claim(s) for later recovery", len(claims))
-			return
-		}
 		requeue(fmt.Sprintf("delivery failure: %v", err))
 		style.PrintWarning("ACP Propeller failed to deliver nudge: %v", err)
-		return
 	}
-
-	// Delivery succeeded — every claim's outcome is now durable (the agent
-	// received it), so ack them all.
-	nudge.AckClaims(claims, nil, func(c nudge.Claim, ackErr error) {
-		style.PrintWarning("ACP Propeller failed to ack nudge claim for %s: %v", c.Nudge.ID, ackErr)
-	})
 }
 
 type escalationDeliveryMeta struct {
@@ -436,11 +364,5 @@ func (p *Propeller) notify(text string, meta map[string]string, urgent bool) err
 			return err
 		}
 	}
-	// Busy and non-urgent: InjectPrompt was deliberately skipped, not
-	// attempted and failed. Report this distinctly from success — only
-	// notifyWithMeta's UI-only side channel ran, and the agent's active
-	// turn never received the content — so the caller does not ack the
-	// claim on the strength of a skip (codex, propulsion.go:267,
-	// changes-requested at REVISION 3 — High 6).
-	return errBusyDeferred
+	return nil
 }

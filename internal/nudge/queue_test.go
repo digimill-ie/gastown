@@ -1231,8 +1231,8 @@ func TestRequeuePreservesAttemptsAndID(t *testing.T) {
 	drained := []QueuedNudge{
 		{ID: "abc", Sender: "test", Message: "hello", Attempts: 1, LastError: "boom", Timestamp: time.Now()},
 	}
-	if failed, err := Requeue(townRoot, session, drained); err != nil {
-		t.Fatalf("Requeue: %v (failed=%v)", err, failed)
+	if failed, err := RequeueTracked(townRoot, session, drained); err != nil {
+		t.Fatalf("RequeueTracked: %v (failed=%v)", err, failed)
 	}
 
 	nudges, err := Drain(townRoot, session)

@@ -530,7 +530,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		// Promptless runtimes need the full startup prompt delivered via nudge so
 		// the agent sees both the beacon and the initial work instructions.
 		debugSession("DeliverStartupPromptFallback",
-			runtime.DeliverStartupPromptFallback(m.tmux, sessionID, startupPromptFallback, townRoot, runtimeConfig, constants.ClaudeStartTimeout))
+			runtime.DeliverStartupPromptFallback(m.tmux, sessionID, startupPromptFallback, runtimeConfig, constants.ClaudeStartTimeout))
 	} else {
 		if fallbackInfo.StartupNudgeDelayMs > 0 {
 			// Wait for agent to finish processing the beacon + gt prime before sending
@@ -542,7 +542,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 		if fallbackInfo.SendStartupNudge {
 			// Send work instructions via nudge
-			debugSession("SendStartupNudge", m.tmux.NudgeSessionWithOpts(sessionID, startupNudgeContent, tmux.NudgeOpts{TownRoot: townRoot}))
+			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, startupNudgeContent))
 		}
 	}
 
@@ -569,7 +569,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 
 	// Legacy fallback for other startup paths (non-fatal)
-	_ = runtime.RunStartupFallback(m.tmux, sessionID, "polecat", townRoot, runtimeConfig)
+	_ = runtime.RunStartupFallback(m.tmux, sessionID, "polecat", runtimeConfig)
 
 	// Verify session survived startup - if the command crashed, the session may have died.
 	// Without this check, Start() would return success even if the pane died during initialization.
@@ -940,7 +940,7 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// Agent is truly idle (no busy indicator, prompt visible) — nudge was likely lost. Retry.
 		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s idle at prompt, retrying nudge\n",
 			attempt, maxRetries, sessionID)
-		if err := m.tmux.NudgeSessionWithOpts(sessionID, retryContent, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+		if err := m.tmux.NudgeSession(sessionID, retryContent); err != nil {
 			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, err)
 			return
 		}

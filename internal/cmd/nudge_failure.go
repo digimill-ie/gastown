@@ -186,7 +186,7 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 	if len(toRequeue) == 0 {
 		return unresolved
 	}
-	failed, err := nudge.Requeue(townRoot, sessionName, toRequeue)
+	failed, err := nudge.RequeueTracked(townRoot, sessionName, toRequeue)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed for %d/%d entries: %v\n", source, sessionName, len(failed), len(toRequeue), err)
 	}

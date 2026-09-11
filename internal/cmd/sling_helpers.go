@@ -697,12 +697,7 @@ func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpd
 
 // injectStartPrompt sends a prompt to the target pane to start working.
 // Uses the reliable nudge pattern: literal mode + 500ms debounce + separate Enter.
-// townRoot, when non-empty, is passed through to NudgePaneWithOpts so this
-// nudge takes the same cross-process flock a concurrent nudge-poller
-// delivery or direct `gt nudge` to the same session uses — NudgePane alone
-// carried no TownRoot and so never took it (codex, tmux.go:1934,
-// changes-requested at 08964387/95f841e6 rework — Fix 4).
-func injectStartPrompt(townRoot, pane, beadID, subject, args string) error {
+func injectStartPrompt(pane, beadID, subject, args string) error {
 	if pane == "" {
 		return fmt.Errorf("no target pane")
 	}
@@ -727,9 +722,9 @@ func injectStartPrompt(townRoot, pane, beadID, subject, args string) error {
 		prompt = fmt.Sprintf("Work slung: %s. Start working on it now - run `"+cli.Name()+" hook` to see the hook, then begin.", beadID)
 	}
 
-	// Use the reliable nudge pattern (same as gt nudge / tmux.NudgeSessionWithOpts)
+	// Use the reliable nudge pattern (same as gt nudge / tmux.NudgeSession)
 	t := tmux.NewTmux()
-	return t.NudgePaneWithOpts(pane, prompt, tmux.NudgeOpts{TownRoot: townRoot})
+	return t.NudgePane(pane, prompt)
 }
 
 // getSessionFromPane extracts session name from a pane target.
@@ -904,29 +899,6 @@ func updateAgentHookBead(agentID, beadID, workDir, townBeadsDir string) {
 // This ensures the witness is ready to monitor. The refinery is nudged
 // separately when an MR is actually created (by nudgeRefinery).
 func wakeRigAgents(rigName string) {
-	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-
-	// Test hook: same pattern as nudgeWitness/nudgeRefinery below. This must
-	// run BEFORE anything that touches the real world — a real subprocess
-	// boot, or cwd-based townRoot discovery that a nested test worktree
-	// resolves to the actual live town. Previously this check ran AFTER
-	// both, so a test exercising this path still spawned a real `gt rig
-	// boot` subprocess and depended on daemon.IsRunning against whatever
-	// town the test happened to be nested in (codex Medium,
-	// sling_helpers.go:903, changes-requested at 08964387). Without this
-	// ordering, a test exercising the dispatch path with a real rig name
-	// (e.g. "gastown", the rig this very test suite lives in) sends a REAL
-	// nudge to that rig's REAL witness session on the host — hq-g52db,
-	// confirmed live 2026-09-11.
-	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
-		entry := fmt.Sprintf("nudge:%s:Polecat dispatched - check for work\n", witnessSession)
-		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-			_, _ = f.WriteString(entry)
-			_ = f.Close()
-		}
-		return
-	}
-
 	// Boot the rig (idempotent - no-op if already running)
 	bootCmd := exec.Command("gt", "rig", "boot", rigName)
 	_ = bootCmd.Run() // Ignore errors - rig might already be running
@@ -945,8 +917,9 @@ func wakeRigAgents(rigName string) {
 	// No cooperative queue — idle agents never call Drain(), so queued
 	// nudges would be stuck forever. Direct delivery is safe: if the
 	// agent is busy, text buffers in tmux and is processed at next prompt.
+	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 	t := tmux.NewTmux()
-	if err := t.NudgeSessionWithOpts(witnessSession, "Polecat dispatched - check for work", tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+	if err := t.NudgeSession(witnessSession, "Polecat dispatched - check for work"); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to nudge witness %s: %v\n", witnessSession, err)
 	}
 }
@@ -978,7 +951,7 @@ func nudgeWitness(rigName, message string) {
 	}
 
 	t := tmux.NewTmux()
-	if err := t.NudgeSessionWithOpts(witnessSession, message, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+	if err := t.NudgeSession(witnessSession, message); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to nudge witness %s: %v\n", witnessSession, err)
 	}
 }
@@ -1013,7 +986,7 @@ func nudgeRefinery(rigName, message string) {
 	}
 
 	t := tmux.NewTmux()
-	if err := t.NudgeSessionWithOpts(refinerySession, message, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+	if err := t.NudgeSession(refinerySession, message); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to nudge refinery %s: %v\n", refinerySession, err)
 	}
 }

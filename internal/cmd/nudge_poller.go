@@ -73,10 +73,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	// Resolve nudge options once at startup: if the target agent uses Escape
 	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
-	// TownRoot enables the cross-process flock so a poller delivery and a
-	// concurrent direct `gt nudge` to the same session serialize instead of
-	// interleaving keystrokes in one composer (hq-g52db).
-	nudgeOpts := tmux.NudgeOpts{TownRoot: townRoot}
+	nudgeOpts := tmux.NudgeOpts{}
 	agentName := ""
 	hasPromptDetection := false
 	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {

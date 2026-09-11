@@ -14,12 +14,11 @@ var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in 
 
 // ErrComposerDirty reports a composer state where retyping the message on
 // the next attempt would corrupt or duplicate content rather than fix
-// anything: either the composer holds normal (non-ghost) text that is
-// neither the sent needle nor its prefix, or the needle itself is still
-// sitting there stranded and no validated recovery keystroke can clear it
-// first. Either way, callers must not retry delivery on this error — see
-// nudge.MaxInjectionAttempts and the poller's dead-letter path. Always
-// wrapped together with ErrSubmitNotVerified; check with errors.Is.
+// anything: the composer holds text after Enter that is neither the sent
+// needle nor its cleared/turn-started form. Callers must not retry delivery
+// on this error — see nudge.MaxInjectionAttempts and the poller's
+// dead-letter path (hq-g52db). Always wrapped together with
+// ErrSubmitNotVerified; check with errors.Is.
 var ErrComposerDirty = errors.New("composer dirty: retyping would corrupt or duplicate content")
 
 type submitProbe int
@@ -292,13 +291,7 @@ func (t *Tmux) pollSubmission(target, needle, promptPrefix string, attempts int)
 	return last
 }
 
-// submitComposer verifies that Enter delivered the message, and only attempts
-// stranded-composer recovery keystrokes (C-j) when recoveryValidated is true.
-// Recovery keystrokes are runtime-specific and unvalidated on most non-Claude
-// presets (see config.AgentPresetInfo.RecoveryKeystrokesValidated); sending
-// them blind risks a destructive effect (e.g., aborting in-flight generation)
-// rather than merely resetting the composer.
-func (t *Tmux) submitComposer(target, message, promptPrefix string, recoveryValidated bool) error {
+func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	enterErr := t.sendEnterVerified(target)
 	needle := submitNeedle(message)
 	if needle == "" {
@@ -310,15 +303,12 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string, recoveryVali
 		return nil
 	case probeUnknown:
 		// Genuinely indeterminate: the pane content matched neither a
-		// known-good nor a known-dirty pattern after every poll attempt.
-		// The previous version returned enterErr bare — a nil enterErr
-		// then reported SUCCESS despite never having confirmed anything,
-		// and a non-nil enterErr that doesn't itself wrap
-		// ErrSubmitNotVerified made errors.Is(deliverErr,
-		// ErrSubmitNotVerified) false, routing callers to the bounded
-		// (retypable) failure path for a case REVISION 3 requires zero
-		// retypes on (codex, submit_verify.go:312, changes-requested at
-		// 08964387/95f841e6 rework). Always wrap ErrSubmitNotVerified here.
+		// known-good nor a known-dirty pattern after every poll attempt. A
+		// bare enterErr here would report SUCCESS on a nil enterErr despite
+		// never having confirmed anything, and — even when non-nil — would
+		// not satisfy errors.Is(deliverErr, ErrSubmitNotVerified), routing
+		// callers to a bounded/retypable failure path instead of the
+		// zero-retype one. Always wrap ErrSubmitNotVerified here.
 		if enterErr != nil {
 			return fmt.Errorf("%w: %w", ErrSubmitNotVerified, enterErr)
 		}
@@ -326,24 +316,8 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string, recoveryVali
 	case probeComposerDirty:
 		return fmt.Errorf("%w: %w (composer contains other text after Enter)", ErrSubmitNotVerified, ErrComposerDirty)
 	case probeStranded:
-		if !recoveryValidated {
-			// Wrapped with ErrComposerDirty too, even though the pane state
-			// is "stranded" not "dirty": the needle text is still sitting in
-			// the composer, so a caller that treats this as an ordinary
-			// bounded failure and retypes on the next attempt would type the
-			// new message straight on top of the stranded leftover with no
-			// clear step first — corrupting the composer exactly as a real
-			// dirty-composer retype would. Callers must not retry either.
-			return fmt.Errorf("%w: %w (stranded; recovery keystrokes not validated for this runtime)", ErrSubmitNotVerified, ErrComposerDirty)
-		}
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
-		// Unreachable with the current submitProbe enum (every value has an
-		// explicit case above); kept only so the switch compiles without a
-		// bare fallthrough. Wraps ErrSubmitNotVerified for the same reason
-		// as probeUnknown: an unrecognized probe result must never look
-		// like an ordinary retypable failure to a caller checking
-		// errors.Is(deliverErr, ErrSubmitNotVerified).
 		return fmt.Errorf("%w (unrecognized submit probe result)", ErrSubmitNotVerified)
 	}
 }
@@ -363,8 +337,13 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		}
 		time.Sleep(adaptiveTextDelay(len(message)))
 		_ = t.sendEnterVerified(target)
-	default:
-		return recoveryProbeError(probe)
+	case probeStranded, probeComposerDirty:
+		// The needle (or other content) is still visibly sitting in the
+		// composer after a recovery attempt — retyping now would duplicate
+		// or corrupt it, same as a fresh dirty/stranded probe.
+		return fmt.Errorf("%w: %w (composer state after C-j: %s)", ErrSubmitNotVerified, ErrComposerDirty, probe)
+	case probeUnknown:
+		return fmt.Errorf("%w (composer state after C-j: %s)", ErrSubmitNotVerified, probe)
 	}
 
 	switch probe := t.pollSubmission(target, needle, promptPrefix, submitProbeAttempts); probe {
@@ -372,28 +351,5 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		return nil
 	default:
 		return fmt.Errorf("nudge submit to %q: %w (final state: %s)", target, ErrSubmitNotVerified, probe)
-	}
-}
-
-// recoveryProbeError builds the error for a post-C-j probe result that is
-// neither turn-started nor composer-cleared: probeStranded (the needle is
-// still visibly sitting in the composer) and probeComposerDirty (the
-// composer holds other content) both wrap ErrComposerDirty alongside
-// ErrSubmitNotVerified, so a caller keying on either error sees the same
-// "do not retype" signal a fresh (non-recovery) dirty/stranded probe already
-// gives; probeUnknown wraps ErrSubmitNotVerified alone, since it is
-// genuinely indeterminate rather than known-dirty. Split out as a pure
-// function so this classification is unit-testable without a live tmux
-// session — the inline version could only be exercised end-to-end (codex,
-// submit_verify.go:348 / submit_verify_test.go:158, changes-requested at
-// 08964387: the existing wrapping tests constructed their own error values
-// rather than calling production code, so they could not fail if this
-// classification broke).
-func recoveryProbeError(probe submitProbe) error {
-	switch probe {
-	case probeStranded, probeComposerDirty:
-		return fmt.Errorf("%w: %w (composer state after C-j: %s)", ErrSubmitNotVerified, ErrComposerDirty, probe)
-	default:
-		return fmt.Errorf("%w (composer state after C-j: %s)", ErrSubmitNotVerified, probe)
 	}
 }

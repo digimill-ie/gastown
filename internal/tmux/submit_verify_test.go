@@ -164,90 +164,19 @@ func TestErrComposerDirtyWrapping(t *testing.T) {
 	}
 }
 
-// TestRecoveryKeystrokesValidatedForAgent covers the runtime table required
-// by hq-g52db fix 5: recovery keystrokes (C-j) are only attempted on runtimes
-// where their effect is validated. Claude Code is the long-validated target;
-// every other known preset — and any unrecognized/custom agent name — must
-// default to false rather than risk a destructive keystroke on an
-// unfamiliar runtime.
-func TestRecoveryKeystrokesValidatedForAgent(t *testing.T) {
+// TestSubmitComposer_ProbeUnknownDoesNotReportFalseSuccess covers the
+// probeUnknown fix: a genuinely indeterminate post-Enter state must never
+// report nil (success) just because the leading Enter itself didn't error —
+// it must always wrap ErrSubmitNotVerified, so callers route it to the
+// zero-retype dead-letter path instead of treating it as delivered.
+func TestSubmitComposer_ProbeUnknownDoesNotReportFalseSuccess(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		agentName string
-		want      bool
-	}{
-		{"claude", true},
-		{"codex", false},
-		{"gemini", false},
-		{"cursor", false},
-		{"copilot", false},
-		{"some-unrecognized-custom-agent", false},
-		{"", false},
+	tm := NewTmuxWithSocket("gt-test-no-such-socket-submit-verify-2")
+	err := tm.submitComposer("gt-test-nonexistent-session:0.0", "resume the patrol", DefaultReadyPromptPrefix)
+	if err == nil {
+		t.Fatal("submitComposer() = nil against a nonexistent session, want a wrapped ErrSubmitNotVerified")
 	}
-	for _, tt := range tests {
-		t.Run(tt.agentName, func(t *testing.T) {
-			if got := recoveryKeystrokesValidatedForAgent(tt.agentName); got != tt.want {
-				t.Errorf("recoveryKeystrokesValidatedForAgent(%q) = %v, want %v", tt.agentName, got, tt.want)
-			}
-		})
-	}
-}
-
-// TestRecoveryKeystrokesValidatedForSession_LookupFailureFailsClosed covers
-// the fix for a lookup FAILURE (tmux error, session gone) being treated the
-// same as "no GT_AGENT set" — the latter defaults to true (assume Claude),
-// but a failure is a genuinely unknown state and must default to false, not
-// fail open into an unvalidated recovery keystroke (codex, tmux.go:3379,
-// changes-requested at 08964387). A Tmux pointed at a socket with no real
-// server makes GetEnvironment fail deterministically without needing a live
-// tmux session.
-func TestRecoveryKeystrokesValidatedForSession_LookupFailureFailsClosed(t *testing.T) {
-	t.Parallel()
-	tm := NewTmuxWithSocket("gt-test-no-such-socket-submit-verify")
-	if got := recoveryKeystrokesValidatedForSession(tm, "any-session"); got {
-		t.Error("recoveryKeystrokesValidatedForSession() = true on a lookup failure, want false")
-	}
-}
-
-// TestRecoveryKeystrokesValidatedForPane_UnresolvableTargetFailsClosed is the
-// pane-target counterpart: an unresolvable pane (stale, no server) must not
-// default to true either (codex, tmux.go:3405, changes-requested at
-// 08964387).
-func TestRecoveryKeystrokesValidatedForPane_UnresolvableTargetFailsClosed(t *testing.T) {
-	t.Parallel()
-	tm := NewTmuxWithSocket("gt-test-no-such-socket-submit-verify")
-	if got := recoveryKeystrokesValidatedForPane(tm, "%999"); got {
-		t.Error("recoveryKeystrokesValidatedForPane() = true for an unresolvable pane, want false")
-	}
-}
-
-// TestRecoveryProbeError covers the pure classification behind
-// recoverStrandedComposer's post-C-j decision, split out specifically so it
-// is unit-testable without a live tmux session (codex,
-// submit_verify.go:348 / submit_verify_test.go:158, changes-requested at
-// 08964387: the prior wrapping tests constructed their own error values
-// rather than calling production code, so they could not fail if this
-// classification broke).
-func TestRecoveryProbeError(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		probe           submitProbe
-		wantDirty       bool
-		wantNotVerified bool
-	}{
-		{probeStranded, true, true},
-		{probeComposerDirty, true, true},
-		{probeUnknown, false, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.probe.String(), func(t *testing.T) {
-			err := recoveryProbeError(tt.probe)
-			if !errors.Is(err, ErrSubmitNotVerified) {
-				t.Errorf("recoveryProbeError(%v) missing ErrSubmitNotVerified: %v", tt.probe, err)
-			}
-			if got := errors.Is(err, ErrComposerDirty); got != tt.wantDirty {
-				t.Errorf("recoveryProbeError(%v) errors.Is(ErrComposerDirty) = %v, want %v", tt.probe, got, tt.wantDirty)
-			}
-		})
+	if !errors.Is(err, ErrSubmitNotVerified) {
+		t.Errorf("submitComposer() = %v, want wrapped ErrSubmitNotVerified", err)
 	}
 }

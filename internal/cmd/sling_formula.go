@@ -105,10 +105,10 @@ func formulaSlingPrompt(formulaName string) string {
 	return fmt.Sprintf("Formula %s slung. Run `"+cli.Name()+" hook` to see your hook, then execute the steps.", formulaName)
 }
 
-func nudgeFormulaDog(townRoot string, delayedDogInfo *DogDispatchInfo, prompt string) {
+func nudgeFormulaDog(delayedDogInfo *DogDispatchInfo, prompt string) {
 	dogSession := fmt.Sprintf("hq-dog-%s", delayedDogInfo.DogName)
 	t := tmux.NewTmux()
-	if err := t.NudgeSessionWithOpts(dogSession, prompt, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+	if err := t.NudgeSession(dogSession, prompt); err != nil {
 		fmt.Printf("%s Could not nudge dog %s: %v (will discover work via gt prime)\n",
 			style.Dim.Render("○"), delayedDogInfo.DogName, err)
 	} else {
@@ -434,7 +434,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 			}
 			delayedDogComplete = true
 			if os.Getenv("GT_TEST_NO_NUDGE") == "" {
-				nudgeFormulaDog(townRoot, delayedDogInfo, formulaSlingPrompt(formulaName))
+				nudgeFormulaDog(delayedDogInfo, formulaSlingPrompt(formulaName))
 			}
 		}
 		return nil
@@ -582,7 +582,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 	// IDs are not globally unique). Use NudgeSession which qualifies the target
 	// with the session name. (gt-etc)
 	if delayedDogInfo != nil {
-		nudgeFormulaDog(townRoot, delayedDogInfo, prompt)
+		nudgeFormulaDog(delayedDogInfo, prompt)
 		return nil
 	}
 
@@ -592,7 +592,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 	}
 
 	t := tmux.NewTmux()
-	if err := t.NudgePaneWithOpts(targetPane, prompt, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+	if err := t.NudgePane(targetPane, prompt); err != nil {
 		// Graceful fallback for no-tmux mode
 		fmt.Printf("%s Could not nudge (no tmux?): %v\n", style.Dim.Render("○"), err)
 		fmt.Printf("  Agent will discover work via gt prime / bd show\n")

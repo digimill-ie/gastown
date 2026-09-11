@@ -217,15 +217,6 @@ func NewTmuxWithSocket(socket string) *Tmux {
 	return &Tmux{socketName: socket}
 }
 
-// SocketName returns the tmux socket (-L flag) this instance targets, or ""
-// for the default tmux server. Exported so tests outside this package can
-// prove a test-isolation helper actually redirected NewTmux() to a private
-// socket, rather than assuming it from the env vars the helper happened to
-// set (codex, nudge_test.go:66, changes-requested at REVISION 3 — High 8).
-func (t *Tmux) SocketName() string {
-	return t.socketName
-}
-
 // run executes a tmux command and returns stdout.
 // All commands include -u flag for UTF-8 support regardless of locale settings.
 // See: https://github.com/steveyegge/gastown/issues/1219
@@ -1375,18 +1366,8 @@ func releaseNudgeLock(session string) {
 
 // nudgeFlockPath returns the filesystem lock path for cross-process nudge serialization.
 // Lock files live alongside the nudge queue directory for self-documentation and cleanup.
-//
-// When townRoot is empty, falls back to a session-keyed path under the OS
-// temp directory instead of returning a path the caller would have to
-// special-case. NudgeOpts.TownRoot=="" is a real, reachable state (a caller
-// without a townRoot handy) and must still serialize, not silently skip the
-// flock (codex, tmux.go:1854/1983, changes-requested at REVISION 3 — Fix 4:
-// "an empty TownRoot must not skip the flock").
 func nudgeFlockPath(townRoot, session string) string {
 	safe := strings.ReplaceAll(session, "/", "_")
-	if townRoot == "" {
-		return filepath.Join(os.TempDir(), "gt-nudge-lock", safe+".lock")
-	}
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
 }
 
@@ -1644,15 +1625,7 @@ func (t *Tmux) sendMessageToTarget(target, text string) error {
 			}
 		} else {
 			if _, err := t.run("send-keys", "-t", target, "-l", chunk); err != nil {
-				// Earlier chunks already landed in the composer — this is
-				// NOT an ordinary bounded failure a caller can safely
-				// retype: retyping the whole message now would duplicate
-				// whatever chunks did land. Wrap as an uncertain/dirty
-				// delivery so callers apply the zero-retype policy
-				// (REVISION 3; codex, tmux.go:1627, changes-requested at
-				// 08964387/95f841e6 rework) instead of treating this as a
-				// bounded, retryable error the way a plain err would.
-				return fmt.Errorf("%w: %w (chunk send failed after %d of %d bytes already sent: %v)", ErrSubmitNotVerified, ErrComposerDirty, i, len(text), err)
+				return err
 			}
 		}
 		// Small delay between chunks to let the terminal process
@@ -1708,6 +1681,23 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 		}
 	}
 	return fmt.Errorf("agent not ready for input after %s: %w", timeout, lastErr)
+}
+
+// NudgeSession sends a message to a Claude Code session reliably.
+// This is the canonical way to send messages to Claude sessions.
+// Uses: literal mode + 500ms debounce + ESC (for vim mode) + separate Enter.
+// After sending, triggers SIGWINCH to wake Claude in detached sessions.
+// Verification is the Witness's job (AI), not this function.
+//
+// If the agent TUI hasn't initialized yet (cold startup), retries with backoff
+// up to NudgeReadyTimeout before giving up. See sendKeysLiteralWithRetry.
+//
+// IMPORTANT: Nudges to the same session are serialized to prevent interleaving.
+// If multiple goroutines try to nudge the same session concurrently, they will
+// queue up and execute one at a time. This prevents garbled input when
+// SessionStart hooks and nudges arrive simultaneously.
+func (t *Tmux) NudgeSession(session, message string) error {
+	return t.NudgeSessionWithOpts(session, message, NudgeOpts{})
 }
 
 // NudgeOpts controls optional behavior for nudge delivery.
@@ -1787,9 +1777,8 @@ func isTmuxIndex(value string) bool {
 // choose where to type. Callers that capture pane content for diagnostics
 // (e.g. a failed-injection log) should use this instead of the bare session
 // name, which captures whatever pane happens to be focused in a multi-pane
-// session rather than the pane a delivery attempt actually targeted (codex,
-// nudge_failure.go:43, changes-requested at 08964387). Falls back to the
-// session's first pane if no agent pane can be found.
+// session rather than the pane a delivery attempt actually targeted.
+// Falls back to the session's first pane if no agent pane can be found.
 func (t *Tmux) ResolveAgentTarget(session string) string {
 	target := session + ":0.0"
 	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
@@ -1798,94 +1787,22 @@ func (t *Tmux) ResolveAgentTarget(session string) string {
 	return target
 }
 
-// skipEscapeForAgent reports whether the Escape keystroke used to exit
-// vim-mode composers and to dismiss Claude Code's Rewind menu is unsafe to
-// send to a session running agentName, because Escape cancels in-flight
-// generation for that runtime rather than harmlessly exiting vim INSERT mode
-// (GH#gt-wasn, hq-isz). An empty or unrecognized agentName defaults to
-// false — assume Claude Code, the historic behavior.
-func skipEscapeForAgent(agentName string) bool {
-	if agentName == "" {
-		return false
-	}
-	if agentName == "copilot" {
-		return true
-	}
-	if preset := config.GetAgentPresetByName(agentName); preset != nil {
-		return preset.EscapeCancelsRequest
-	}
-	// A resolved but unrecognized agent name is a genuinely unknown
-	// runtime — the same class as a session-level lookup failure
-	// (skipEscapeForSession already fails toward skip=true there) — so
-	// this must fail toward NOT sending Escape too, rather than falling
-	// through to the Claude-only default that only applies to the
-	// explicit empty-agentName case above (codex, tmux.go:1798,
-	// changes-requested at REVISION 3).
-	return true
-}
-
-// skipEscapeForSession resolves skipEscapeForAgent's input from a live
-// session. Both prior call sites discarded the GetEnvironment error
-// entirely (agentType, _ := ...), so a lookup FAILURE (session gone, tmux
-// error — a genuinely unknown runtime) and an explicitly BLANK GT_AGENT
-// (something deliberately cleared the identity — also unknown) both
-// collapsed to the same empty string, and skipEscapeForAgent("") fails
-// OPEN into sending Escape for both (codex, tmux.go:1844,1946,
-// changes-requested at 08964387/95f841e6 rework). Escape is destructive on
-// a runtime where it cancels in-flight generation, so — unlike
-// recoveryKeystrokesValidatedForSession, where "no GT_AGENT" defaults to
-// assuming Claude because C-j is safe there — an unknown state here must
-// fail toward NOT sending it: both cases return skip=true. In practice
-// almost every session has GT_AGENT set at creation (session_manager.go's
-// AgentEnv fallback writes the resolved agent, "claude" included), so this
-// only changes behavior for the rare legacy/manually-created session this
-// propagation predates.
-func skipEscapeForSession(t *Tmux, session string) bool {
-	agentType, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil || agentType == "" {
-		return true
-	}
-	return skipEscapeForAgent(agentType)
-}
-
-// NudgeSessionWithOpts sends a message to a Claude Code session reliably.
-// This is the canonical way to send messages to Claude sessions.
-// Uses: literal mode + 500ms debounce + ESC (for vim mode) + separate Enter.
-// After sending, triggers SIGWINCH to wake Claude in detached sessions.
-// Verification is the Witness's job (AI), not this function.
-//
-// If the agent TUI hasn't initialized yet (cold startup), retries with
-// backoff up to NudgeReadyTimeout before giving up. See
-// sendKeysLiteralWithRetry.
-//
-// IMPORTANT: Nudges to the same session are serialized to prevent
-// interleaving. If multiple goroutines try to nudge the same session
-// concurrently, they will queue up and execute one at a time. This prevents
-// garbled input when SessionStart hooks and nudges arrive simultaneously.
-//
-// There is deliberately no option-less NudgeSession wrapper: it had zero
-// remaining production callers and existed only as an unlocked escape
-// hatch that any caller could reach for and skip the cross-process flock
-// below without noticing (opts.TownRoot empty is still possible, but a
-// caller must now choose that explicitly, rather than getting it silently
-// via a wrapper that never took a TownRoot at all) (codex, tmux.go:1700,
-// changes-requested at 08964387/95f841e6 rework — Fix 4). See NudgeOpts for
-// available options, and NudgePaneWithOpts for the pane-target equivalent.
+// NudgeSessionWithOpts is like NudgeSession but accepts delivery options.
+// See NudgeOpts for available options.
 func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) error {
 	// Cross-process lock: serialize nudges across OS processes via flock(2).
 	// Each `gt nudge` CLI invocation is a separate process, so the in-process
 	// channel semaphore below provides no cross-process protection. Without
 	// this, concurrent nudges interleave send-keys/Enter and produce garbled
-	// or empty input. (GH#gt-ukl8) Always taken, regardless of opts.TownRoot:
-	// nudgeFlockPath falls back to a session-keyed temp path when TownRoot is
-	// empty, so an empty root no longer skips the flock outright (codex,
-	// tmux.go:1854, changes-requested at REVISION 3 — Fix 4).
-	lockPath := nudgeFlockPath(opts.TownRoot, session)
-	unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
-	if err != nil {
-		return fmt.Errorf("cross-process nudge lock for session %q: %w", session, err)
+	// or empty input. (GH#gt-ukl8)
+	if opts.TownRoot != "" {
+		lockPath := nudgeFlockPath(opts.TownRoot, session)
+		unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
+		if err != nil {
+			return fmt.Errorf("cross-process nudge lock for session %q: %w", session, err)
+		}
+		defer unlock()
 	}
-	defer unlock()
 
 	// In-process lock: serialize nudges within a single process (goroutine fast path).
 	if !acquireNudgeLock(session, nudgeLockTimeout) {
@@ -1895,25 +1812,16 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 
 	// Resolve the correct target: in multi-pane sessions, find the pane
 	// running the agent rather than sending to the focused pane.
-	target := t.ResolveAgentTarget(session)
-
-	// Resolve whether Escape is unsafe for this session's runtime BEFORE any
-	// Escape-based recovery (Rewind dismissal, vim-mode exit) is attempted —
-	// previously this resolution happened after the pre-delivery Rewind
-	// dismissal below, so that dismissal ignored opts.SkipEscape and the
-	// runtime's own EscapeCancelsRequest preset entirely (codex,
-	// nudge.go:1809 [now the block below], changes-requested at 08964387).
-	if !opts.SkipEscape && skipEscapeForSession(t, session) {
-		opts.SkipEscape = true
+	target := session + ":0.0"
+	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
+		target = t.canonicalPaneTarget(session, agentPane)
 	}
 
 	// 0. Pre-delivery: dismiss Rewind menu if the session is stuck in it.
 	// A previous nudge or user action may have triggered Claude Code's
 	// double-Escape Rewind UI, which captures all input. Dismiss it first
-	// so the nudge can be delivered normally. (GH#gt-8el) Skipped when
-	// Escape is unsafe for this runtime — sending it here would bypass the
-	// same gate the deliberate step-5 Escape below respects.
-	if !opts.SkipEscape && t.isInRewindMode(target) {
+	// so the nudge can be delivered normally. (GH#gt-8el)
+	if t.isInRewindMode(target) {
 		t.dismissRewindMode(target)
 	}
 
@@ -1927,6 +1835,15 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 2. Sanitize control characters that corrupt delivery
 	sanitized := sanitizeNudgeMessage(message)
 
+	if !opts.SkipEscape {
+		// Auto-skip Escape for Copilot CLI sessions. Escape cancels in-flight
+		// generation in Copilot CLI (like Gemini), leaving the nudge text
+		// stranded in the input field without Enter being processed. (hq-isz)
+		agentType, _ := t.GetEnvironment(session, "GT_AGENT")
+		if agentType == "copilot" {
+			opts.SkipEscape = true
+		}
+	}
 	// Snapshot before typing the nudge so the message text itself cannot look
 	// like the agent's busy indicator.
 	sendEscape := !opts.SkipEscape && t.shouldSendEscape(target)
@@ -1969,7 +1886,7 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 7. Submit with verification — confirms Enter was processed and the
 	// message actually left the composer instead of being stranded by a
 	// swallowed carriage return. (GH#gt-0b5, PR #4461 replacement)
-	if err := t.submitComposer(target, sanitized, readyPromptPrefixForSession(t, session), recoveryKeystrokesValidatedForSession(t, session)); err != nil {
+	if err := t.submitComposer(target, sanitized, readyPromptPrefixForSession(t, session)); err != nil {
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 
@@ -1984,42 +1901,11 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	return nil
 }
 
-// NudgePaneWithOpts sends a message to a specific pane reliably. Same
-// pattern as NudgeSessionWithOpts but targets a pane ID (e.g., "%9")
-// instead of a session name. After sending, triggers SIGWINCH to wake
-// Claude in detached sessions. Nudges to the same pane are serialized to
-// prevent interleaving.
-//
-// There is deliberately no option-less NudgePane wrapper: it had zero
-// remaining production callers and, like the removed NudgeSession wrapper,
-// existed only as an unlocked escape hatch a caller could reach for without
-// noticing it carried no TownRoot (codex, tmux.go:1964, changes-requested
-// at REVISION 3 — Fix 4: "NudgePane is still an option-less wrapper").
-//
-// The cross-process flock is always taken — keyed on the pane's OWNING
-// SESSION (resolved via sessionNameForTarget) when resolvable, the same key
-// NudgeSessionWithOpts uses, so a sling/dispatch nudge via this function and
-// a concurrent nudge-poller delivery or direct `gt nudge` to the SAME
-// session actually serialize against each other; falls back to the pane
-// identifier itself when the owning session can't be resolved, and to a
-// temp-dir path when opts.TownRoot is empty (see nudgeFlockPath).
-// Previously this was gated on opts.TownRoot != "" AND a resolvable session
-// name, so either an empty root or an unresolvable pane skipped the flock
-// entirely — the exact interleaving NudgePaneWithOpts exists to prevent
-// (codex, tmux.go:1934/1983, changes-requested at 08964387/95f841e6 rework
-// and REVISION 3 — Fix 4).
-func (t *Tmux) NudgePaneWithOpts(pane, message string, opts NudgeOpts) error {
-	lockKey := t.sessionNameForTarget(pane)
-	if lockKey == "" {
-		lockKey = pane
-	}
-	lockPath := nudgeFlockPath(opts.TownRoot, lockKey)
-	unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
-	if err != nil {
-		return fmt.Errorf("cross-process nudge lock for pane %q: %w", pane, err)
-	}
-	defer unlock()
-
+// NudgePane sends a message to a specific pane reliably.
+// Same pattern as NudgeSession but targets a pane ID (e.g., "%9") instead of session name.
+// After sending, triggers SIGWINCH to wake Claude in detached sessions.
+// Nudges to the same pane are serialized to prevent interleaving.
+func (t *Tmux) NudgePane(pane, message string) error {
 	// Serialize nudges to this pane to prevent interleaving.
 	// Use a timed lock to avoid permanent blocking if a previous nudge hung.
 	if !acquireNudgeLock(pane, nudgeLockTimeout) {
@@ -2027,25 +1913,8 @@ func (t *Tmux) NudgePaneWithOpts(pane, message string, opts NudgeOpts) error {
 	}
 	defer releaseNudgeLock(pane)
 
-	// Resolve whether Escape is unsafe for this pane's runtime BEFORE any
-	// Escape-based recovery (Rewind dismissal, vim-mode exit) is attempted.
-	// NudgePane is used for dispatch/sling to freshly started sessions,
-	// which are NOT Claude-only (see the recovery-keystrokes comment on the
-	// submitComposer call below) — so this needs the same runtime gate
-	// NudgeSessionWithOpts applies, previously entirely absent here (codex,
-	// tmux.go:1931 [Escape send below], changes-requested at 08964387).
-	// An unresolvable pane (stale, no server) is a genuinely unknown
-	// runtime too, so it fails toward skipEscape=true, not the historic
-	// false default (codex, tmux.go:1797/1844/1946, changes-requested at
-	// 08964387/95f841e6 rework).
-	skipEscape := true
-	if sessionName := t.sessionNameForTarget(pane); sessionName != "" {
-		skipEscape = skipEscapeForSession(t, sessionName)
-	}
-
-	// 0. Pre-delivery: dismiss Rewind menu if active. (GH#gt-8el) Skipped
-	// when Escape is unsafe for this runtime — see above.
-	if !skipEscape && t.isInRewindMode(pane) {
+	// 0. Pre-delivery: dismiss Rewind menu if active. (GH#gt-8el)
+	if t.isInRewindMode(pane) {
 		t.dismissRewindMode(pane)
 	}
 
@@ -2060,7 +1929,7 @@ func (t *Tmux) NudgePaneWithOpts(pane, message string, opts NudgeOpts) error {
 	sanitized := sanitizeNudgeMessage(message)
 	// Snapshot before typing the nudge so the message text itself cannot look
 	// like the agent's busy indicator.
-	sendEscape := !skipEscape && t.shouldSendEscape(pane)
+	sendEscape := t.shouldSendEscape(pane)
 
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
@@ -2090,13 +1959,7 @@ func (t *Tmux) NudgePaneWithOpts(pane, message string, opts NudgeOpts) error {
 	// 7. Submit with verification — confirms Enter was processed and the
 	// message actually left the composer instead of being stranded by a
 	// swallowed carriage return. (GH#gt-0b5, PR #4461 replacement)
-	// NudgePane targets a pane, not a session name, so the GT_AGENT lookup
-	// needs an extra step: resolve the pane's owning session first. This path
-	// is used for dispatch/sling to freshly started sessions, which are NOT
-	// Claude-only — ensureAgentReady (sling_helpers.go) explicitly handles
-	// non-Claude presets here, so recovery keystrokes must be gated the same
-	// way NudgeSessionWithOpts gates them, not assumed validated.
-	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix, recoveryKeystrokesValidatedForPane(t, pane)); err != nil {
+	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix); err != nil {
 		return fmt.Errorf("nudge to pane %q: %w", pane, err)
 	}
 
@@ -3510,99 +3373,6 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 		return promptPrefix
 	}
 	return preset.ReadyPromptPrefix
-}
-
-// recoveryKeystrokesValidatedForSession reports whether stranded-composer
-// recovery keystrokes (C-j) are known safe for the session's agent runtime.
-// No GT_AGENT registered for the session (a genuine "unknown variable"
-// response from a REACHABLE session) defaults to true — the historic
-// behavior, since the overwhelming majority of sessions without GT_AGENT
-// set are Claude Code. Any GT_AGENT value (known preset or an
-// unrecognized/custom one) defaults to false, requiring an explicit
-// RecoveryKeystrokesValidated on the preset, since an unvalidated key on an
-// unfamiliar runtime can be destructive (e.g., aborting in-flight
-// generation) rather than merely resetting the composer.
-//
-// A LOOKUP FAILURE because the session itself is UNREACHABLE
-// (errors.Is(err, ErrNoServer) or ErrSessionNotFound — tmux error, session
-// gone) is deliberately NOT treated the same as "no GT_AGENT set": that
-// would fail OPEN into sending an unvalidated recovery keystroke to a
-// runtime we couldn't even identify. An unknown state must default to
-// false, same as an unrecognized agent (codex, tmux.go:3379,
-// changes-requested at 08964387).
-//
-// An EXPLICITLY BLANK GT_AGENT (err == nil, agentName == "") is a THIRD,
-// distinct state from either of the above — something deliberately cleared
-// the identity — and must default to false too, not true: the previous
-// version of this function collapsed it with the "genuinely unset"
-// lookup-failure case by checking bare err != nil (which, per
-// GetEnvironment's real semantics, actually FIRES for "genuinely unset" —
-// tmux's "unknown variable" response — not for an explicit blank value),
-// so an explicitly-blanked GT_AGENT fell through to the agentName=="" ==
-// true branch and enabled C-j on an unidentified runtime (codex,
-// tmux.go:3441, changes-requested at 08964387/95f841e6 rework).
-func recoveryKeystrokesValidatedForSession(t *Tmux, session string) bool {
-	agentName, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil {
-		if isMissingEnvironmentError(err, "GT_AGENT") {
-			// Session is reachable; GT_AGENT simply was never registered
-			// (tmux's "unknown variable" response) — the historic default.
-			return true
-		}
-		// Any OTHER lookup failure — session gone, no server, or some
-		// other tmux error unrelated to the variable being unset — is
-		// NOT the same as a genuinely unregistered variable, and was
-		// previously conflated with it by only checking
-		// ErrNoServer/ErrSessionNotFound: any other error type (a
-		// transient tmux failure, say) fell through to true and sent
-		// the recovery keystroke to a runtime that was never actually
-		// identified. Fail toward NOT sending it, same as
-		// skipEscapeForSession (codex, tmux.go:3523, changes-requested
-		// at REVISION 3).
-		return false
-	}
-	if agentName == "" {
-		return false
-	}
-	return recoveryKeystrokesValidatedForAgent(agentName)
-}
-
-// recoveryKeystrokesValidatedForAgent is the pure decision behind
-// recoveryKeystrokesValidatedForSession, split out so it is testable without
-// a live tmux session.
-func recoveryKeystrokesValidatedForAgent(agentName string) bool {
-	preset := config.GetAgentPresetByName(agentName)
-	if preset == nil {
-		return false
-	}
-	return preset.RecoveryKeystrokesValidated
-}
-
-// recoveryKeystrokesValidatedForPane is recoveryKeystrokesValidatedForSession
-// for a pane target instead of a session name: it resolves the pane's owning
-// session first, since GT_AGENT is a session-level environment variable.
-// Defaults to FALSE if the owning session cannot be resolved (stale pane, no
-// server): an unresolvable target is an unknown state, and an unknown state
-// must not fail open into an unvalidated recovery keystroke — same
-// reasoning as the lookup-failure case in recoveryKeystrokesValidatedForSession
-// (codex, tmux.go:3405, changes-requested at 08964387).
-func recoveryKeystrokesValidatedForPane(t *Tmux, pane string) bool {
-	sessionName := t.sessionNameForTarget(pane)
-	if sessionName == "" {
-		return false
-	}
-	return recoveryKeystrokesValidatedForSession(t, sessionName)
-}
-
-// sessionNameForTarget resolves the tmux session name that owns the given
-// target (a pane ID like "%23", or a "session:window.pane" string). Returns
-// "" if the target cannot be resolved (stale pane, no server).
-func (t *Tmux) sessionNameForTarget(target string) string {
-	out, err := t.run("display-message", "-t", target, "-p", "#{session_name}")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(out)
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {
