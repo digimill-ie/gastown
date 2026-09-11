@@ -1,7 +1,6 @@
 package nudge
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1085,20 +1084,17 @@ func TestDrainClaims_AssignsIDToLegacyEntryWithoutOne(t *testing.T) {
 		t.Fatal("DrainClaims left the claim's ID empty — AckClaims can never recognize this entry as unresolved")
 	}
 
-	// The assigned ID must be PERSISTED, not just held in memory: simulate
-	// a crash-and-restore by reading the claim file straight off disk.
-	// (Same package as queue.go, so the unexported path field is
-	// reachable directly — no need for a test-only exported accessor.)
-	data, err := os.ReadFile(claims[0].path)
-	if err != nil {
-		t.Fatalf("ReadFile claim: %v", err)
+	// The assigned ID must be PERSISTED, not just held in memory: simulate a
+	// crash-and-restore by reading it straight off disk. It lives in a
+	// companion sidecar (see idSidecarPath), never written into the claim's
+	// own file — that in-place rewrite is exactly the tmp-then-rename
+	// hazard this package no longer uses (see restoreOrphanedClaim).
+	onDiskID, ok := readIDSidecar(claims[0].path)
+	if !ok {
+		t.Fatal("assigned ID sidecar missing — a crash before resolution would lose the assigned ID")
 	}
-	var onDisk QueuedNudge
-	if err := json.Unmarshal(data, &onDisk); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if onDisk.ID != claims[0].Nudge.ID {
-		t.Errorf("on-disk ID = %q, in-memory ID = %q: the assigned ID must be persisted to the claim file", onDisk.ID, claims[0].Nudge.ID)
+	if onDiskID != claims[0].Nudge.ID {
+		t.Errorf("sidecar ID = %q, in-memory ID = %q: the assigned ID must be persisted", onDiskID, claims[0].Nudge.ID)
 	}
 
 	// Reproduce the actual failure mode: a caller that decides this
@@ -1250,5 +1246,156 @@ func TestRequeuePreservesAttemptsAndID(t *testing.T) {
 	}
 	if nudges[0].LastError != "boom" {
 		t.Errorf("LastError = %q, want %q", nudges[0].LastError, "boom")
+	}
+}
+
+// TestMarkAttempt_SidecarIsAppendOnlyAndNeverRewritesClaim covers the
+// REQUIRED SHAPE for gtn-81j: Attempts must be recorded in an append-only
+// sidecar file — one byte per attempt, count = size — that is never
+// rewritten and never renamed, and the claim's own file must never be
+// touched by MarkAttempt at all.
+func TestMarkAttempt_SidecarIsAppendOnlyAndNeverRewritesClaim(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-attempts-sidecar"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "m"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claims, err := DrainClaims(townRoot, session)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("DrainClaims: claims=%d err=%v", len(claims), err)
+	}
+	claim := claims[0]
+
+	claimBefore, err := os.ReadFile(claim.path)
+	if err != nil {
+		t.Fatalf("ReadFile claim (before): %v", err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		if err := claim.MarkAttempt(); err != nil {
+			t.Fatalf("MarkAttempt #%d: %v", i, err)
+		}
+		if claim.Nudge.Attempts != i {
+			t.Fatalf("in-memory Attempts after MarkAttempt #%d = %d, want %d", i, claim.Nudge.Attempts, i)
+		}
+		if !claim.Nudge.InFlight {
+			t.Fatalf("in-memory InFlight after MarkAttempt #%d = false, want true", i)
+		}
+
+		sidecarPath := attemptsSidecarPath(claim.path)
+		info, err := os.Stat(sidecarPath)
+		if err != nil {
+			t.Fatalf("stat attempts sidecar after MarkAttempt #%d: %v", i, err)
+		}
+		if info.Size() != int64(i) {
+			t.Fatalf("attempts sidecar size after MarkAttempt #%d = %d, want %d", i, info.Size(), i)
+		}
+
+		// The claim's own file must be byte-for-byte unchanged: MarkAttempt
+		// records the attempt entirely in the sidecar, never by rewriting
+		// the claim (the old Claim.Persist did exactly that, and a partial
+		// rewrite there is the regression this replaces).
+		claimNow, err := os.ReadFile(claim.path)
+		if err != nil {
+			t.Fatalf("ReadFile claim (after #%d): %v", i, err)
+		}
+		if string(claimNow) != string(claimBefore) {
+			t.Fatalf("claim file content changed after MarkAttempt #%d: MarkAttempt must never rewrite the claim's own file", i)
+		}
+	}
+}
+
+// TestOrphanSweep_StaleTmpSiblingNeverClobbersIntactClaim reproduces the
+// High regression at a752f4a7 (codex gate verdict, gtn-81j): the old
+// Claim.Persist wrote "<claim>.tmp" then renamed it OVER the claim's own
+// ".claimed.<suffix>" file. A partial write (e.g. a full disk) left a
+// truncated ".tmp" sibling whose name ALSO contained ".claimed" — so the
+// orphan sweep's substring match treated it as a second, independent
+// orphaned claim of the SAME entry. Directory entries sort lexically, so
+// the (shorter) intact claim name sorts before its own "<name>.tmp"
+// sibling: the intact one restored first, and the truncated .tmp restored
+// SECOND, overwriting it with garbage. The next drain then deleted the
+// result as malformed — the only copy of the message was lost.
+//
+// This test manufactures exactly that disk shape — an intact, attempted
+// claim plus a stray, garbage ".claimed...tmp" sibling, both aged past
+// staleness — and asserts the entry survives, in exactly one place, with
+// its content and attempt count intact. It must go RED if the orphan sweep
+// loses its isClaimSidecarOrTemp exclusion (e.g. if the old Claim.Persist,
+// and the un-excluded ".claimed" substring match it relied on, are
+// restored).
+func TestOrphanSweep_StaleTmpSiblingNeverClobbersIntactClaim(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-tmp-sibling-crash"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "do not lose me"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claims, err := DrainClaims(townRoot, session)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("DrainClaims: claims=%d err=%v", len(claims), err)
+	}
+	claim := claims[0]
+
+	if err := claim.MarkAttempt(); err != nil {
+		t.Fatalf("MarkAttempt: %v", err)
+	}
+
+	// Manufacture the crash artifact: a truncated sibling sharing the
+	// claim's ".claimed.<suffix>" prefix, exactly the shape a partial write
+	// through the old tmp-then-rename Persist left behind.
+	garbage := claim.path + ".tmp"
+	if err := os.WriteFile(garbage, []byte("{truncat"), 0644); err != nil {
+		t.Fatalf("writing garbage sibling: %v", err)
+	}
+
+	// Age both the intact claim and the garbage sibling past staleness, so
+	// this call's orphan sweep considers both.
+	dir := queueDir(townRoot, session)
+	old := time.Now().Add(-staleClaimThreshold - time.Minute)
+	for _, p := range []string{claim.path, garbage} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("Chtimes %s: %v", p, err)
+		}
+	}
+
+	// The orphan sweep runs inside DrainClaims.
+	if _, err := DrainClaims(townRoot, session); err != nil {
+		t.Fatalf("DrainClaims (sweep): %v", err)
+	}
+
+	// The entry must exist in EXACTLY one place: a single pending .json
+	// entry — never zero (lost) and never duplicated.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var jsonFiles []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".json") {
+			jsonFiles = append(jsonFiles, e.Name())
+		}
+	}
+	if len(jsonFiles) != 1 {
+		t.Fatalf("pending .json entries after sweep = %v, want exactly 1", jsonFiles)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("Drain got %d nudges, want 1", len(nudges))
+	}
+	if nudges[0].Message != "do not lose me" {
+		t.Fatalf("recovered message = %q, want %q (content was lost or clobbered)", nudges[0].Message, "do not lose me")
+	}
+	if nudges[0].Attempts != 1 {
+		t.Fatalf("recovered Attempts = %d, want 1 (persisted from the crashed attempt)", nudges[0].Attempts)
+	}
+	if !nudges[0].InFlight {
+		t.Fatalf("recovered InFlight = false, want true (the crashed attempt never reported an outcome)")
 	}
 }

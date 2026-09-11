@@ -143,8 +143,23 @@ func DeadLetter(townRoot, session string, n QueuedNudge, source, lastError, pane
 
 	filename := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), entry.ID)
 	path := filepath.Join(dir, filename)
-	if err := os.WriteFile(path, data, 0644); err != nil {
+
+	// Land the entry with one atomic rename rather than writing directly to
+	// its final name: a partial write (e.g. a full disk) can otherwise leave
+	// a truncated, malformed file sitting AT the final dead-letter path,
+	// where ListDeadLetters silently skips it as unparseable — a
+	// dead-letter record that looks like it never existed. Writing to a
+	// fresh, uniquely-named temp file first means a partial write only ever
+	// leaves harmless scratch bytes under a name nothing reads; the final
+	// path is either fully present or entirely absent, never corrupted.
+	tmp := path + ".incoming-" + randomSuffix()
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		_ = os.Remove(tmp)
 		return "", fmt.Errorf("writing dead-letter entry: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("landing dead-letter entry: %w", err)
 	}
 
 	return path, nil

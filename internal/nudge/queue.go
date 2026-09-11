@@ -55,6 +55,23 @@ const (
 	// straight to dead-letter regardless of this bound — retyping into a
 	// known-dirty composer duplicates content rather than fixing anything.
 	MaxInjectionAttempts = 2
+
+	// attemptsSidecarSuffix names the append-only sidecar Claim.MarkAttempt
+	// writes next to a claim to durably record an attempt (see
+	// attemptsSidecarPath). idSidecarSuffix names the write-once sidecar
+	// DrainClaims uses to durably record an ID backfilled onto a legacy
+	// entry (see idSidecarPath). Both share their claim's ".claimed.<suffix>"
+	// name as a prefix, so the orphan sweep must recognize and skip them
+	// explicitly (isClaimSidecarOrTemp) rather than treating each as an
+	// independent orphaned claim of the same entry. legacyTmpSuffix is kept
+	// in that same exclusion list defensively: it named the old write-then-
+	// rename Claim.Persist's temp file, the exact shape whose misclassification
+	// by the orphan sweep caused a truncated sibling to overwrite an intact
+	// claim (codex gate verdict at a752f4a7, gtn-81j) — that code path is gone,
+	// but a stray file of that name must still never be mistaken for a claim.
+	attemptsSidecarSuffix = ".attempts"
+	idSidecarSuffix       = ".id"
+	legacyTmpSuffix       = ".tmp"
 )
 
 // nudgeConfig loads nudge-specific thresholds from town settings.
@@ -251,56 +268,130 @@ type Claim struct {
 // crashing before that write is exactly the queue.go:305 ordering bug this
 // type exists to close (hq-g52db rework, codex changes-requested at
 // 08964387). Removing an already-removed file is not an error.
+//
+// Also removes this claim's sidecars (attemptsSidecarPath, idSidecarPath),
+// if any: they exist only for this claim's lifetime, and leaving them
+// behind on every resolved claim would leak one file per delivered nudge
+// forever. Best-effort — a leftover sidecar is inert clutter, never a
+// correctness risk (isClaimSidecarOrTemp keeps the orphan sweep from ever
+// treating a bare sidecar as an independent claim), so a removal failure
+// here is not reported as an Ack error.
 func (c Claim) Ack() error {
 	if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("acking nudge claim: %w", err)
 	}
+	_ = os.Remove(attemptsSidecarPath(c.path))
+	_ = os.Remove(idSidecarPath(c.path))
 	return nil
 }
 
-// Persist rewrites the claim's underlying .claimed file with the claim's
-// current in-memory Nudge state (atomic write-then-rename within the same
-// directory). Call this to durably record a state change — in particular
-// Attempts — BEFORE a fallible operation like a tmux injection attempt, so
-// a crash during that operation leaves the PERSISTED (already-incremented)
-// state behind for a future orphan-sweep restore, not the stale
-// pre-attempt state. Without this, a poller killed while actually typing
-// (after DrainClaims but before the failure/success handling that would
-// otherwise persist Attempts) leaves a claim on disk that still reads
-// Attempts=0, so the orphan sweep restores it as a fresh, unattempted entry
-// and a future cycle retypes it — risking duplicate content in whatever
-// the first, crashed attempt already delivered (codex, nudge_poller.go:146,
-// changes-requested at 08964387/95f841e6 rework).
-func (c Claim) Persist() error {
-	data, err := json.MarshalIndent(c.Nudge, "", "  ")
+// attemptsSidecarPath returns the append-only attempts-count sidecar for a
+// claim file. MarkAttempt appends exactly one byte per attempt and never
+// rewrites or renames it; the sidecar's SIZE is the durable attempt count.
+// This exists so an attempt is recorded WITHOUT ever rewriting the claim's
+// own file: the previous design (Claim.Persist) wrote a full-record
+// temp-then-rename onto the claim's own ".claimed.<suffix>" name, and a
+// partial write there left a truncated ".tmp" sibling that the orphan
+// sweep's naive ".claimed"-substring match mistook for a second, independent
+// orphaned claim of the SAME entry — since directory entries sort lexically,
+// the truncated file restored second and overwrote the just-restored intact
+// one, and the next drain deleted the result as malformed: total loss of
+// the only copy of the message (codex gate verdict at a752f4a7, gtn-81j). An
+// append of a single byte cannot leave a claim's payload in that state: a
+// crash mid-append leaves the sidecar at its previous size or one byte
+// longer, never with any existing byte altered.
+func attemptsSidecarPath(claimPath string) string {
+	return claimPath + attemptsSidecarSuffix
+}
+
+// attemptsSidecarCount returns the durable attempt count recorded in
+// claimPath's attempts sidecar (its file size), or 0 if no attempt has been
+// recorded yet.
+func attemptsSidecarCount(claimPath string) int {
+	info, err := os.Stat(attemptsSidecarPath(claimPath))
 	if err != nil {
-		return fmt.Errorf("marshaling nudge: %w", err)
+		return 0
 	}
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return fmt.Errorf("writing claim state: %w", err)
-	}
-	if err := os.Rename(tmp, c.path); err != nil {
-		return fmt.Errorf("persisting claim state: %w", err)
-	}
-	return nil
+	return int(info.Size())
 }
 
-// MarkAttempt increments the claim's Attempts count and persists it (see
-// Persist) BEFORE the caller attempts a live delivery. Callers that inject
-// a batch of claims in one tmux call should MarkAttempt every claim in the
-// batch first, then extract the (now-incremented) Nudge values for
-// FormatForInjection/handleFailedInjection — see nudge_poller.go and
-// watchAndDeliver.
+// idSidecarPath returns the write-once sidecar that durably records an ID
+// backfilled onto a legacy claim that predates the ID field (see NewID and
+// DrainClaims). Like the attempts sidecar, this exists so an assignment is
+// recorded without ever rewriting the claim's own file.
+func idSidecarPath(claimPath string) string {
+	return claimPath + idSidecarSuffix
+}
+
+// writeIDSidecar durably records id next to claimPath without touching
+// claimPath's own content. O_EXCL makes the write single-shot: a sidecar
+// that already exists is left alone rather than rewritten.
+func writeIDSidecar(claimPath, id string) error {
+	f, err := os.OpenFile(idSidecarPath(claimPath), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return fmt.Errorf("creating id sidecar: %w", err)
+	}
+	defer f.Close()
+	_, err = f.WriteString(id)
+	return err
+}
+
+// readIDSidecar returns the durably-assigned ID for claimPath, if any, and
+// whether the sidecar was present and non-empty.
+func readIDSidecar(claimPath string) (string, bool) {
+	data, err := os.ReadFile(idSidecarPath(claimPath))
+	if err != nil {
+		return "", false
+	}
+	id := strings.TrimSpace(string(data))
+	if id == "" {
+		return "", false
+	}
+	return id, true
+}
+
+// isClaimSidecarOrTemp reports whether name is a sidecar or leftover temp
+// file derived from a claim's own name (attemptsSidecarSuffix,
+// idSidecarSuffix, legacyTmpSuffix) rather than an independent claim. Every
+// such name shares its claim's ".claimed.<suffix>" prefix, so the orphan
+// sweep's substring match on ".claimed" would otherwise treat each one as a
+// second, independent orphaned claim of the same entry — see
+// attemptsSidecarPath's doc comment for what that misclassification cost.
+func isClaimSidecarOrTemp(name string) bool {
+	return strings.HasSuffix(name, attemptsSidecarSuffix) ||
+		strings.HasSuffix(name, idSidecarSuffix) ||
+		strings.HasSuffix(name, legacyTmpSuffix)
+}
+
+// MarkAttempt durably records one more delivery attempt for c BEFORE the
+// caller attempts a live injection (see attemptsSidecarPath), then updates
+// the in-memory Nudge to match: Attempts incremented, and InFlight set
+// (cleared only by a subsequent Enqueue — dead-letter and successful ack
+// both remove the file instead). A claim whose sidecar still reads a
+// nonzero count after a restart never went through either of those — the
+// attempt that recorded it never reported an outcome — see
+// QueuedNudge.InFlight. Callers that inject a batch of claims in one tmux
+// call should MarkAttempt every claim in the batch first, then extract the
+// (now-incremented) Nudge values for FormatForInjection/
+// handleFailedInjection — see nudge_poller.go and watchAndDeliver.
 func (c *Claim) MarkAttempt() error {
+	f, err := os.OpenFile(attemptsSidecarPath(c.path), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("opening attempts sidecar: %w", err)
+	}
+	if _, err := f.Write([]byte{1}); err != nil {
+		f.Close()
+		return fmt.Errorf("appending attempt marker: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing attempts sidecar: %w", err)
+	}
 	c.Nudge.Attempts++
-	// Set BEFORE the attempt, alongside Attempts, and cleared only by a
-	// subsequent Enqueue (dead-letter and successful ack both remove the
-	// file instead). A claim whose persisted state still reads InFlight
-	// after a restart never went through either of those — the attempt
-	// that set it never reported an outcome — see QueuedNudge.InFlight.
 	c.Nudge.InFlight = true
-	return c.Persist()
+	return nil
 }
 
 // AckClaims resolves every claim in claims whose Nudge.ID is NOT present in
@@ -365,6 +456,74 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 	return nudges, nil
 }
 
+// restoreOrphanedClaim moves an abandoned claim back into the pending
+// queue, merging in any amendments recorded in its sidecars — an attempts
+// count from Claim.MarkAttempt, an ID backfilled onto a legacy entry — since
+// the claim's own file was last written (see attemptsSidecarPath,
+// idSidecarPath).
+//
+// When neither sidecar exists, the claim's content is exactly what it was
+// at claim time, so a bare rename is enough — cheap, and it never reads or
+// rewrites the payload.
+//
+// When a sidecar exists, the merged content is written to a fresh temp file
+// and landed with ONE atomic rename to restoredPath, which cannot already
+// exist — its only creator renamed it away to become claimPath. Only after
+// that lands is the original claim (and its sidecars) removed. Nothing here
+// ever rewrites claimPath or restoredPath in place: the failure this
+// replaces was exactly a write-then-rename onto a name the orphan sweep
+// could also match (see attemptsSidecarPath's doc comment).
+func restoreOrphanedClaim(claimPath, restoredPath string) error {
+	attemptsDelta := attemptsSidecarCount(claimPath)
+	sidecarID, hasID := readIDSidecar(claimPath)
+
+	if attemptsDelta == 0 && !hasID {
+		return os.Rename(claimPath, restoredPath)
+	}
+
+	data, err := os.ReadFile(claimPath)
+	if err != nil {
+		return fmt.Errorf("reading orphaned claim: %w", err)
+	}
+	var n QueuedNudge
+	if err := json.Unmarshal(data, &n); err != nil {
+		// Malformed payload — nothing sane to restore. Drop it and its
+		// sidecars rather than resurrecting garbage into the live queue.
+		_ = os.Remove(claimPath)
+		_ = os.Remove(attemptsSidecarPath(claimPath))
+		_ = os.Remove(idSidecarPath(claimPath))
+		return nil
+	}
+	if attemptsDelta > 0 {
+		n.Attempts += attemptsDelta
+		n.InFlight = true
+	}
+	if hasID && n.ID == "" {
+		n.ID = sidecarID
+	}
+	merged, err := json.MarshalIndent(n, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling restored claim: %w", err)
+	}
+
+	tmp := restoredPath + ".restore-" + randomSuffix()
+	if err := os.WriteFile(tmp, merged, 0644); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("writing restored claim: %w", err)
+	}
+	if err := os.Rename(tmp, restoredPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("landing restored claim: %w", err)
+	}
+
+	if err := os.Remove(claimPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: restored claim landed at %s but failed to remove original %s: %v\n", restoredPath, claimPath, err)
+	}
+	_ = os.Remove(attemptsSidecarPath(claimPath))
+	_ = os.Remove(idSidecarPath(claimPath))
+	return nil
+}
+
 // DrainClaims is like Drain but does not delete each entry's claim file —
 // it returns Claims that the caller must explicitly Ack once the entry's
 // outcome is durable. This closes the crash window Drain's immediate
@@ -396,13 +555,18 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 
 	// Requeue orphaned .claimed files from crashed drainers.
 	// A .claimed file older than staleClaimThreshold is certainly orphaned —
-	// normal processing completes in milliseconds. We rename it back to .json
-	// so it gets picked up on this or a future Drain call, rather than deleting
-	// it (which would permanently drop the nudge).
+	// normal processing completes in milliseconds. We restore it to .json so
+	// it gets picked up on this or a future Drain call, rather than deleting
+	// it (which would permanently drop the nudge). isClaimSidecarOrTemp
+	// excludes a claim's OWN sidecars/temp siblings — sharing the claim's
+	// ".claimed.<suffix>" name as a prefix, they would otherwise match
+	// ".claimed" too and be treated as a second, independent orphan of the
+	// SAME entry (see attemptsSidecarPath's doc comment).
 	staleThreshold := nudgeConfig(townRoot).StaleClaimThresholdD()
 	now := time.Now()
 	for _, entry := range entries {
-		if !strings.Contains(entry.Name(), ".claimed") {
+		name := entry.Name()
+		if !strings.Contains(name, ".claimed") || isClaimSidecarOrTemp(name) {
 			continue
 		}
 		info, err := entry.Info()
@@ -410,17 +574,16 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 			continue
 		}
 		if now.Sub(info.ModTime()) > staleThreshold {
-			orphanPath := filepath.Join(dir, entry.Name())
+			claimPath := filepath.Join(dir, name)
 			// Strip everything from ".claimed" onward to restore original .json filename
-			name := entry.Name()
 			claimedIdx := strings.Index(name, ".claimed")
 			restoredPath := filepath.Join(dir, name[:claimedIdx])
-			if err := os.Rename(orphanPath, restoredPath); err != nil {
-				// Rename failed — leave the orphaned claim file in place and
+			if err := restoreOrphanedClaim(claimPath, restoredPath); err != nil {
+				// Restore failed — leave the orphaned claim file in place and
 				// retry on a future sweep. Removing it here would permanently
 				// drop the nudge, exactly what the "never drop" policy
 				// (see nudge.MaxInjectionAttempts callers) prohibits.
-				fmt.Fprintf(os.Stderr, "Warning: failed to requeue orphaned claim %s, will retry on a future sweep: %v\n", entry.Name(), err)
+				fmt.Fprintf(os.Stderr, "Warning: failed to requeue orphaned claim %s, will retry on a future sweep: %v\n", name, err)
 			}
 		}
 	}
@@ -528,10 +691,13 @@ func DrainClaims(townRoot, session string) ([]Claim, error) {
 		// regardless of what shape the file on disk started in, and
 		// persist it immediately so a future orphan-sweep restore carries
 		// the same ID rather than reverting to blank (codex, queue.go:288,
-		// changes-requested at REVISION 3 — High 4).
+		// changes-requested at REVISION 3 — High 4). Recorded in a write-once
+		// sidecar (see idSidecarPath), never by rewriting the claim's own
+		// file — that rewrite is exactly the mechanism removed from
+		// MarkAttempt (see attemptsSidecarPath's doc comment).
 		if claim.Nudge.ID == "" {
 			claim.Nudge.ID = NewID()
-			if perr := claim.Persist(); perr != nil {
+			if perr := writeIDSidecar(claim.path, claim.Nudge.ID); perr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to persist assigned ID for %s: %v\n", entry.Name(), perr)
 			}
 		}
