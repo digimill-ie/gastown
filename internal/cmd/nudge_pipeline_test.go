@@ -261,3 +261,64 @@ func TestPipeline_UnverifiedDoubleFault_RetainsClaim(t *testing.T) {
 		t.Fatalf("ListDeadLetters succeeded against a directory this test replaced with a file — sabotage didn't take")
 	}
 }
+
+// TestPipeline_SingleDeadLetterFault_RequeuesAndAcksClaim is the pipeline
+// (DrainClaims -> handleFailedInjection -> ackClaims) counterpart to
+// TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead, which
+// only exercised handleFailedInjection directly against a hand-built
+// QueuedNudge slice — never through a real Claim, so it never proved the
+// ORIGINAL claim file actually gets acked once the requeue fallback durably
+// lands (codex: "dead-letter-branch tests ... synthetic", nudge_test.go:742,
+// changes-requested at REVISION 3 — Medium). A single fault (dead-letter
+// write fails) on a BOUNDED (non-unverified) entry falls back to requeue,
+// and the original claim — now redundant — must be acked away.
+func TestPipeline_SingleDeadLetterFault_RequeuesAndAcksClaim(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-pipeline-single-deadletter-fault"
+
+	if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		ID: "single-fault-1", Sender: "test", Message: "must not be lost", Attempts: nudge.MaxInjectionAttempts - 1,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claims, err := nudge.DrainClaims(townRoot, sessionName)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("DrainClaims: claims=%d err=%v", len(claims), err)
+	}
+	if claimFileCount(t, townRoot, sessionName) != 1 {
+		t.Fatalf("expected 1 claim file on disk before injection")
+	}
+
+	deadLetterPath := filepath.Join(townRoot, ".runtime", "nudge_deadletter", sessionName)
+	if err := os.MkdirAll(filepath.Dir(deadLetterPath), 0755); err != nil {
+		t.Fatalf("MkdirAll parent: %v", err)
+	}
+	if err := os.WriteFile(deadLetterPath, []byte("block"), 0644); err != nil {
+		t.Fatalf("blocking dead-letter dir: %v", err)
+	}
+
+	drained := []nudge.QueuedNudge{claims[0].Nudge}
+	deliverErr := errors.New("uncertain delivery")
+
+	unresolved := handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+	if len(unresolved) != 0 {
+		t.Fatalf("unresolved = %d entries, want 0 (the requeue fallback succeeded)", len(unresolved))
+	}
+
+	ackClaims(sourceNudgePoller, sessionName, claims, unresolved)
+
+	// The original claim is now redundant — its content durably landed via
+	// requeue — and must be gone.
+	if n := claimFileCount(t, townRoot, sessionName); n != 0 {
+		t.Fatalf("claim files remaining after ackClaims = %d, want 0 (the requeue fallback landed, the original claim is redundant)", n)
+	}
+
+	requeued, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(requeued) != 1 || requeued[0].Message != "must not be lost" {
+		t.Fatalf("Drain = %#v, want exactly 1 entry with the original payload", requeued)
+	}
+}
