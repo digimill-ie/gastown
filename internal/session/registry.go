@@ -120,6 +120,20 @@ func SetDefaultRegistry(r *PrefixRegistry) {
 // Should be called early in the process lifecycle.
 // Safe to call multiple times; later calls replace earlier data.
 func InitRegistry(townRoot string) error {
+	return initRegistry(townRoot, true)
+}
+
+// InitRegistryReadOnly is identical to InitRegistry except it never writes
+// the town-root fallback copy of rigs.json (see BuildPrefixRegistryFromTown).
+// For callers — a dry-run scan — that must not mutate anything on disk while
+// still resolving the tmux socket and prefix registry for read access
+// (gtn-m7s / hq-ooijo revision 2: "a dry-run flag must suppress ALL scan
+// mutations").
+func InitRegistryReadOnly(townRoot string) error {
+	return initRegistry(townRoot, false)
+}
+
+func initRegistry(townRoot string, allowFallbackWrite bool) error {
 	var errs []error
 
 	// Determine the tmux socket name from GT_TMUX_SOCKET env var:
@@ -132,7 +146,7 @@ func InitRegistry(townRoot string) error {
 	}
 	tmux.SetDefaultSocket(socket)
 
-	r, err := BuildPrefixRegistryFromTown(townRoot)
+	r, err := buildPrefixRegistryFromTown(townRoot, allowFallbackWrite)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("prefix registry: %w", err))
 	} else {
@@ -140,7 +154,8 @@ func InitRegistry(townRoot string) error {
 	}
 
 	// Load agent registry so all entry points (CLI, daemon, witness) respect
-	// user-configured overrides like custom process_names.
+	// user-configured overrides like custom process_names. Read-only: it
+	// loads settings/agents.json into memory and writes nothing.
 	if err := config.LoadAgentRegistry(config.DefaultAgentRegistryPath(townRoot)); err != nil {
 		errs = append(errs, fmt.Errorf("agent registry: %w", err))
 	}
@@ -201,13 +216,27 @@ func PrefixFor(rigName string) string {
 // Checks mayor/rigs.json first (canonical), then falls back to town-root rigs.json.
 // Warns to stderr if rigs.json is missing entirely — an empty registry causes
 // silent failures in session name parsing (crew cycling, nudge routing, etc.).
+//
+// This maintains the town-root fallback copy of rigs.json as a side effect
+// (see buildPrefixRegistryFromTown). Use BuildPrefixRegistryFromTownReadOnly
+// for a caller that must not write to disk.
 func BuildPrefixRegistryFromTown(townRoot string) (*PrefixRegistry, error) {
+	return buildPrefixRegistryFromTown(townRoot, true)
+}
+
+// BuildPrefixRegistryFromTownReadOnly is identical to BuildPrefixRegistryFromTown
+// but never writes the town-root fallback copy of rigs.json.
+func BuildPrefixRegistryFromTownReadOnly(townRoot string) (*PrefixRegistry, error) {
+	return buildPrefixRegistryFromTown(townRoot, false)
+}
+
+func buildPrefixRegistryFromTown(townRoot string, allowFallbackWrite bool) (*PrefixRegistry, error) {
 	// Canonical location: inside mayor worktree.
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
 	fallbackPath := filepath.Join(townRoot, "rigs.json")
 	if _, err := os.Stat(rigsPath); err == nil {
 		r, err := BuildPrefixRegistryFromFile(rigsPath)
-		if err == nil {
+		if err == nil && allowFallbackWrite {
 			// Maintain fallback copy at town root (resilient to git ops in mayor/).
 			copyFileIfNewer(rigsPath, fallbackPath)
 		}

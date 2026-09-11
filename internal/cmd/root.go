@@ -129,8 +129,21 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Env var fallback ensures commands invoked from outside the town directory
 	// (e.g., "gt agents menu" via a cross-socket tmux binding) still connect to
 	// the correct town socket rather than silently using the wrong server.
+	// A command that declares its own boolean --dry-run flag and has it set
+	// must not mutate anything on disk — including the shared pre-run side
+	// effects below (registry.json fallback write, this session's own
+	// heartbeat touch). See gtn-m7s / hq-ooijo revision 2, which named these
+	// two specifically for `gt patrol scan --dry-run`.
+	dryRun := isDryRunInvocation(cmd)
+
 	if townRoot := detectTownRootFromCwd(); townRoot != "" {
-		if err := session.InitRegistry(townRoot); err != nil {
+		var err error
+		if dryRun {
+			err = session.InitRegistryReadOnly(townRoot)
+		} else {
+			err = session.InitRegistry(townRoot)
+		}
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "WARNING: failed to initialize town registry: %v\n", err)
 		}
 	}
@@ -151,8 +164,10 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Touch polecat session heartbeat on every gt command (gt-qjtq: ZFC liveness fix).
 	// This is best-effort and non-blocking — the heartbeat file signals that the agent
 	// is alive and actively running gt commands. Used by isSessionProcessDead to
-	// determine liveness without PID signal probing.
-	touchPolecatHeartbeat()
+	// determine liveness without PID signal probing. Skipped under --dry-run.
+	if !dryRun {
+		touchPolecatHeartbeat()
+	}
 
 	// Skip beads check for exempt commands
 	if beadsExempt || isRoleCommand(cmd) {
@@ -166,6 +181,23 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "   Run %s for details.\n\n", style.Dim.Render("gt doctor"))
 	}
 	return nil
+}
+
+// isDryRunInvocation reports whether the invoked command declares a boolean
+// --dry-run flag and it is set. Generic by design — any command that opts
+// into a --dry-run contract gets the shared pre-run mutation suppression
+// (registry fallback write, heartbeat touch) for free, without hardcoding
+// individual command names here.
+func isDryRunInvocation(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if flag := cmd.Flags().Lookup("dry-run"); flag != nil {
+		if v, err := cmd.Flags().GetBool("dry-run"); err == nil {
+			return v
+		}
+	}
+	return false
 }
 
 func isCommandOrAncestorExempt(cmd *cobra.Command, exemptions map[string]bool) bool {

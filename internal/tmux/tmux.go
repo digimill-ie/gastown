@@ -2096,23 +2096,54 @@ func containsCodexUpdateDialog(content string) bool {
 		strings.Contains(content, "Skip until next version")
 }
 
-// promptSuffixes are strings that indicate a shell or agent prompt is visible.
-// Claude prompt ends with ">", Codex uses "›", and shells often end with
-// "$", "%", "#", or "❯".
+// promptSuffixes are strings that indicate a shell or agent prompt is visible
+// EMPTY, waiting for input. Claude prompt ends with ">", Codex uses "›", and
+// shells often end with "$", "%", "#", or "❯".
 var promptSuffixes = []string{">", "›", "$", "%", "#", "❯"}
+
+// composerPrefixes are prompt-lead characters that begin a live input
+// composer line, whether or not it already has typed text after them (e.g.
+// "> ", "› review this"). promptSuffixes alone misses this case: a composer
+// with real typed content does not END with the prompt character, so an old
+// dialog marker followed by a non-empty composer line was reading as "the
+// dialog is still showing" and would send that dialog's keys into the
+// composer (gtn-m7s / hq-ooijo revision 2, codex finding on
+// classifyStartupDialog / tmux.go:2289).
+var composerPrefixes = []string{">", "›", "❯"}
 
 // containsPromptIndicator checks if pane content contains a prompt indicator
 // that signals a shell or agent is ready (no dialog blocking it).
 func containsPromptIndicator(content string) bool {
 	for _, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
+		if lineIsPromptIndicator(line) {
+			return true
 		}
-		for _, suffix := range promptSuffixes {
-			if strings.HasSuffix(trimmed, suffix) {
-				return true
-			}
+	}
+	return false
+}
+
+// lineIsPromptIndicator reports whether a single (already-trimmed-for-check)
+// line reads as an active prompt or composer: either an EMPTY prompt ending
+// in a known suffix, or a composer line — empty or with typed text — that
+// STARTS with a known composer lead character.
+func lineIsPromptIndicator(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, suffix := range promptSuffixes {
+		if strings.HasSuffix(trimmed, suffix) {
+			return true
+		}
+	}
+	for _, prefix := range composerPrefixes {
+		// Require the prefix alone ("> ") or followed by a space before any
+		// typed text ("› review this") — not merely HasPrefix — so a dialog
+		// option glyph that happens to start with the same character (a
+		// TUI selection cursor immediately butted against other text) isn't
+		// misread as a live composer.
+		if trimmed == prefix || strings.HasPrefix(trimmed, prefix+" ") {
+			return true
 		}
 	}
 	return false
@@ -2121,15 +2152,8 @@ func containsPromptIndicator(content string) bool {
 func lastPromptIndicatorLine(content string) int {
 	last := -1
 	for i, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		for _, suffix := range promptSuffixes {
-			if strings.HasSuffix(trimmed, suffix) {
-				last = i
-				break
-			}
+		if lineIsPromptIndicator(line) {
+			last = i
 		}
 	}
 	return last
@@ -2307,6 +2331,19 @@ func (t *Tmux) dialogDismissKeys(target string, kind StartupDialogKind) error {
 			return fmt.Errorf("sending Down for %s: %w", kind, err)
 		}
 		time.Sleep(200 * time.Millisecond)
+		// Revalidate before the second key: something else (the agent
+		// itself, or an unrelated actor) may have dismissed the dialog in
+		// the gap between Down and Enter. Sending Enter blind here would
+		// submit whatever now has focus — e.g. a real composer the Down
+		// already scrolled through (gtn-m7s / hq-ooijo revision 2, codex
+		// finding on the unvalidated 200ms gap).
+		recheck, err := t.CapturePane(target, 80)
+		if err != nil {
+			return fmt.Errorf("revalidating %s before Enter: %w", kind, err)
+		}
+		if classifyStartupDialog(recheck) != kind {
+			return fmt.Errorf("%s dialog no longer visible after Down, refusing to send Enter", kind)
+		}
 		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
 			return fmt.Errorf("sending Enter for %s: %w", kind, err)
 		}
@@ -2317,10 +2354,13 @@ func (t *Tmux) dialogDismissKeys(target string, kind StartupDialogKind) error {
 	return nil
 }
 
-// dialogTarget resolves the pane that actually runs the agent, falling back
+// AgentTarget resolves the pane that actually runs the agent, falling back
 // to the session name when no agent pane can be identified (single-pane
-// sessions, or legacy sessions without GT_PANE_ID).
-func (t *Tmux) dialogTarget(session string) string {
+// sessions, or legacy sessions without GT_PANE_ID). Callers that capture
+// pane content or read activity fields to judge whether an agent is busy
+// must resolve this first — the session/window's ACTIVE pane can be a
+// different, idle auxiliary pane (gtn-m7s / hq-ooijo revision 2).
+func (t *Tmux) AgentTarget(session string) string {
 	if pane, err := t.FindAgentPane(session); err == nil && pane != "" {
 		return pane
 	}
@@ -2331,7 +2371,7 @@ func (t *Tmux) dialogTarget(session string) string {
 // reports which known startup dialog, if any, is showing. It never sends
 // keys — pure detection, safe to call for dry-run surveys.
 func (t *Tmux) ClassifyVisibleDialog(session string) (StartupDialogKind, error) {
-	content, err := t.CapturePane(t.dialogTarget(session), 80)
+	content, err := t.CapturePane(t.AgentTarget(session), 80)
 	if err != nil {
 		return DialogNone, fmt.Errorf("capturing pane: %w", err)
 	}
@@ -2346,7 +2386,7 @@ func (t *Tmux) ClassifyVisibleDialog(session string) (StartupDialogKind, error) 
 // the dialog actually cleared; if it did not, the caller should escalate
 // rather than report success.
 func (t *Tmux) DismissDialog(session string, kind StartupDialogKind) error {
-	target := t.dialogTarget(session)
+	target := t.AgentTarget(session)
 
 	recheck, err := t.CapturePane(target, 80)
 	if err != nil {

@@ -42,7 +42,7 @@ var HungSessionThresholdMinutes = int(constants.HungSessionThreshold.Minutes())
 // loaded for liveness checks.
 func initRegistryFromWorkDir(workDir string) {
 	if townRoot, err := workspace.Find(workDir); err == nil && townRoot != "" {
-		initRegistryFromTownRoot(townRoot)
+		initRegistryFromTownRoot(townRoot, false)
 	}
 }
 
@@ -116,10 +116,21 @@ func defaultBDRun(workDir string, args ...string) error {
 
 // initRegistryFromTownRoot initializes registries from a known town root,
 // logging any errors so that misconfiguration is observable.
-func initRegistryFromTownRoot(townRoot string) {
+//
+// readOnly skips the registry's rigs.json fallback-copy write
+// (session.InitRegistryReadOnly instead of session.InitRegistry) — required
+// by a dry-run caller, which must not mutate anything on disk (gtn-m7s /
+// hq-ooijo revision 2: "a dry-run flag must suppress ALL scan mutations").
+func initRegistryFromTownRoot(townRoot string, readOnly bool) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
-	if err := session.InitRegistry(townRoot); err != nil {
+	var err error
+	if readOnly {
+		err = session.InitRegistryReadOnly(townRoot)
+	} else {
+		err = session.InitRegistry(townRoot)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "witness: failed to initialize town registry: %v\n", err)
 	}
 }
@@ -726,7 +737,7 @@ func findMRBeadForBranch(bd *BdCli, workDir, branch string) string {
 // nudges would be stuck forever. Direct delivery is safe: if the
 // agent is busy, text buffers in tmux and is processed at next prompt.
 func nudgeRefinery(townRoot, rigName string) error {
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromTownRoot(townRoot, false)
 	sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
 
 	// Check if refinery is running
@@ -1631,7 +1642,7 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromTownRoot(townRoot, false)
 
 	// Load witness thresholds from config (fallback to compiled-in defaults).
 	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
@@ -2269,7 +2280,7 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromTownRoot(townRoot, dryRun)
 
 	// Load witness thresholds from config (fallback to compiled-in defaults).
 	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
@@ -2309,6 +2320,17 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 			continue // Dead agent — zombie detection handles this
 		}
 
+		// Session created time is fetched FIRST: it is needed both to bind
+		// heartbeat trust to this specific session incarnation (below) and
+		// to compute session age. session_created is stable regardless of
+		// attach state, unlike session_activity below.
+		createdUnix, err := t.GetSessionCreatedUnix(sessionName)
+		if err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Errorf("getting session created time for %s: %w", sessionName, err))
+			continue
+		}
+
 		// Heartbeat v2 check (gt-3vr5): if the agent has a fresh heartbeat,
 		// it's alive and making progress — skip stall detection entirely.
 		// This replaces tmux activity scraping for v2 agents.
@@ -2319,7 +2341,16 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 		// is genuinely busy (gtn-k43 / hq-ooijo revision 2). A malformed or
 		// missing heartbeat file reads as hb == nil and falls through to the
 		// content-based checks below, same as before.
-		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() {
+		//
+		// MatchesIncarnation binds trust to THIS session's current
+		// session_created: a tmux session name can be reused (old session
+		// dies, a new one is created with the same name), and a stale
+		// "working" heartbeat left by the dead incarnation must never
+		// suppress recovery for the new one — the merge risk named on
+		// hq-ooijo revision 2. A heartbeat that fails the incarnation check
+		// falls through to the content/activity checks below exactly like a
+		// missing heartbeat.
+		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() && hb.MatchesIncarnation(createdUnix) {
 			if time.Since(hb.Timestamp) < polecat.SessionHeartbeatStaleThreshold {
 				continue // Fresh v2 heartbeat — agent is alive, not stalled
 			}
@@ -2328,31 +2359,30 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 			}
 		}
 
-		// Session age: session_created is stable regardless of attach state,
-		// unlike session_activity below.
-		createdUnix, err := t.GetSessionCreatedUnix(sessionName)
-		if err != nil {
-			result.Errors = append(result.Errors,
-				fmt.Errorf("getting session created time for %s: %w", sessionName, err))
-			continue
-		}
 		sessionAge := now.Sub(time.Unix(createdUnix, 0))
 		if sessionAge < stallThreshold {
 			continue // Too young — still in normal startup
 		}
 
+		// Resolve the AGENT pane once: the content and activity checks below
+		// must read the pane actually running the agent, not whichever pane
+		// or window happens to be active in the session. An idle auxiliary
+		// window/pane being active would otherwise hide a genuine busy hint
+		// and read the wrong window_activity (gtn-m7s / hq-ooijo revision 2).
+		agentTarget := t.AgentTarget(sessionName)
+
 		// Content check: a backgrounded command or an actively streaming
 		// turn is genuinely busy no matter what the tmux activity fields
 		// read. Best-effort — a capture error falls through to the activity
 		// check rather than blocking detection.
-		if content, err := t.CapturePane(sessionName, 80); err == nil && tmux.ContainsBackgroundTaskHint(content) {
+		if content, err := t.CapturePane(agentTarget, 80); err == nil && tmux.ContainsBackgroundTaskHint(content) {
 			continue
 		}
 
 		// Liveness: window_activity, never session_activity. session_activity
 		// freezes at session-creation time on every detached session
 		// (hq-wisp-y46vn) — using it here is exactly the bug this fixes.
-		activity, err := t.GetWindowActivity(sessionName)
+		activity, err := t.GetWindowActivity(agentTarget)
 		if err != nil {
 			result.Errors = append(result.Errors,
 				fmt.Errorf("getting window activity for %s: %w", sessionName, err))
@@ -2365,7 +2395,9 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 
 		// Session is old, silent, self-reports nothing, and shows no
 		// background-task hint. Act only on a SPECIFIC known dialog detected
-		// by content — never on silence alone.
+		// by content — never on silence alone. ClassifyVisibleDialog and
+		// DismissDialog resolve the agent pane themselves (t.AgentTarget),
+		// so passing sessionName here still targets the right pane.
 		kind, err := t.ClassifyVisibleDialog(sessionName)
 		if err != nil {
 			result.Errors = append(result.Errors,
@@ -2448,7 +2480,7 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromTownRoot(townRoot, false)
 
 	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
 	entries, err := os.ReadDir(polecatsDir)
@@ -2945,7 +2977,7 @@ func DetectOrphanedBeads(bd *BdCli, workDir, rigName string, router *mail.Router
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromTownRoot(townRoot, false)
 
 	// Scan both in_progress and hooked beads — resetAbandonedBead handles both
 	// states, and orphaned beads can be stuck in either.
@@ -3083,7 +3115,7 @@ func DetectOrphanedMolecules(bd *BdCli, workDir, rigName string, router *mail.Ro
 	if err != nil || townRoot == "" {
 		townRoot = workDir
 	}
-	initRegistryFromTownRoot(townRoot)
+	initRegistryFromTownRoot(townRoot, false)
 
 	// Step 1: List beads that could have attached molecules.
 	// Slung beads start as status=hooked; polecats may change them to in_progress.
