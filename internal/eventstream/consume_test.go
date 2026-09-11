@@ -2,6 +2,8 @@ package eventstream
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -189,5 +191,63 @@ func TestConsumeOnce_StopsOnApplyErrorAndRetriesInOrder(t *testing.T) {
 	pos, _ = AckedPosition(townRoot, agent)
 	if pos != 3 {
 		t.Fatalf("AckedPosition after retry = %d, want 3", pos)
+	}
+}
+
+// TestConsumeOnce_ConcurrentConsumersNeverDoubleApply guards against an
+// accidentally double-armed "gt events tail <target>" — a real recurring
+// failure mode elsewhere in this codebase (duplicate watchers on a single-
+// consumer channel). Two goroutines race ConsumeOnce against the same
+// agent stream; the per-event lock in processEventLocked must serialize
+// them so each event's effect runs exactly once, however the race lands.
+func TestConsumeOnce_ConcurrentConsumersNeverDoubleApply(t *testing.T) {
+	townRoot := t.TempDir()
+	agent := "gt-gastown-witness"
+
+	const numEvents = 20
+	for i := 0; i < numEvents; i++ {
+		if _, err := Append(townRoot, agent, TypeQueuedNudge, nil); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+
+	var effectCounts [numEvents + 1]int32 // index by event id (1-based)
+	apply := func(ev Event) error {
+		atomic.AddInt32(&effectCounts[ev.ID], 1)
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	const numConsumers = 8
+	for c := 0; c < numConsumers; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each concurrent "consumer" hammers ConsumeOnce until the
+			// stream is fully acked, mirroring what a real accidental
+			// double-tail would do (poll repeatedly against the same
+			// target).
+			for i := 0; i < numEvents*2; i++ {
+				if _, err := ConsumeOnce(townRoot, agent, apply); err != nil {
+					t.Errorf("ConsumeOnce: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	for id := 1; id <= numEvents; id++ {
+		if got := atomic.LoadInt32(&effectCounts[id]); got != 1 {
+			t.Errorf("effect for event %d ran %d times, want exactly 1 (double-delivery under concurrent consumers)", id, got)
+		}
+	}
+
+	pos, err := AckedPosition(townRoot, agent)
+	if err != nil {
+		t.Fatalf("AckedPosition: %v", err)
+	}
+	if pos != numEvents {
+		t.Fatalf("AckedPosition = %d, want %d", pos, numEvents)
 	}
 }

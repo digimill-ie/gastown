@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -208,15 +207,4 @@ func FormatNotification(ev Event) string {
 		return fmt.Sprintf("[event %d] queued nudge from %s: %s", ev.ID, sender, message)
 	}
 	return fmt.Sprintf("[event %d] %s", ev.ID, ev.Type)
-}
-
-// ParseAgentArg normalizes a CLI-provided id string into an int64,
-// returning a descriptive error for the (never expected in normal use)
-// malformed case rather than a raw strconv error.
-func ParseAgentArg(s string) (int64, error) {
-	id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid event id %q: %w", s, err)
-	}
-	return id, nil
 }

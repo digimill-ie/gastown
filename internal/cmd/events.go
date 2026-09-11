@@ -221,31 +221,36 @@ func runEventsTail(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// pass reports the consume error to the caller rather than swallowing
+	// it, so --once (scripting/tests) surfaces failure via exit code.
+	// Heartbeat is always attempted, independent of whether the consume
+	// succeeded or anything was delivered — liveness, not delivery, is
+	// what 'status' reads.
 	pass := func() error {
-		if _, err := eventstream.ConsumeOnce(townRoot, stream, apply); err != nil {
-			// Do not exit: the failed event stays claimed-unacked and is
-			// retried next pass. Report to stderr so a wrapping Monitor
-			// invocation surfaces it without treating the whole tail as dead.
-			fmt.Fprintf(os.Stderr, "gt events tail: consume pass error: %v\n", err)
-		}
-		// Heartbeat every pass, independent of whether anything was
-		// delivered — liveness, not delivery, is what 'status' reads.
+		_, consumeErr := eventstream.ConsumeOnce(townRoot, stream, apply)
 		if hbErr := eventstream.Heartbeat(townRoot, stream); hbErr != nil {
 			fmt.Fprintf(os.Stderr, "gt events tail: heartbeat error: %v\n", hbErr)
 		}
-		return nil
+		return consumeErr
 	}
 
 	if eventsTailOnceFlag {
 		return pass()
 	}
 
+	// The persistent loop does not exit on a pass error: the failed event
+	// stays claimed-unacked and is retried next pass. Only --once (above)
+	// propagates it as a command failure.
+	logPassError := func() {
+		if err := pass(); err != nil {
+			fmt.Fprintf(os.Stderr, "gt events tail: consume pass error: %v\n", err)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := pass(); err != nil {
-		return err
-	}
+	logPassError()
 	ticker := time.NewTicker(eventsTailIntervalFlag)
 	defer ticker.Stop()
 	for {
@@ -253,9 +258,7 @@ func runEventsTail(cmd *cobra.Command, args []string) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := pass(); err != nil {
-				return err
-			}
+			logPassError()
 		}
 	}
 }

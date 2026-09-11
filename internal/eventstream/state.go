@@ -182,15 +182,20 @@ func Ack(townRoot, agent string, id int64) error {
 			return fmt.Errorf("cannot ack event %d: not marked completed", id)
 		}
 		st.AckedID = id
-		// Prune completed ids at or below the new ack position — they are
-		// now implied by AckedID and would otherwise grow unbounded.
-		for k := range st.CompletedIDs {
-			if k <= id {
-				delete(st.CompletedIDs, k)
-			}
-		}
+		pruneCompletedLocked(st, id)
 		return nil
 	})
+}
+
+// pruneCompletedLocked removes completed ids at or below uptoID — they are
+// now implied by AckedID and would otherwise grow unbounded. Caller must
+// hold the state lock (i.e. be inside a withStateLock callback).
+func pruneCompletedLocked(st *ConsumerState, uptoID int64) {
+	for k := range st.CompletedIDs {
+		if k <= uptoID {
+			delete(st.CompletedIDs, k)
+		}
+	}
 }
 
 // AckedPosition returns the current replay position.
