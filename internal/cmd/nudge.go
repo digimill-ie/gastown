@@ -151,6 +151,34 @@ var idleWatcherTimeout = 60 * time.Second
 // Var so tests can override.
 var idleWatcherPollInterval = 1 * time.Second
 
+// buildWaitIdleDeadLetterEntry builds the QueuedNudge for wait-idle mode's
+// direct dead-letter path (an unverified delivery after WaitForIdle — see
+// deliverNudge below), which bypasses nudge.Enqueue and so must fill in ID,
+// Timestamp and ExpiresAt itself. DeadLetter also assigns an ID when one is
+// missing, but only on its OWN internal copy of the struct — it never
+// reports the generated ID back — so without setting it here first, the
+// alertDeadLetter call in deliverNudge would report a blank Entry ID, and
+// the persisted record would carry a zero Timestamp/ExpiresAt (codex,
+// nudge.go:253/282, changes-requested at 08964387/95f841e6 rework). Split
+// out as a pure function so it is unit-testable without a live tmux
+// session, the same reasoning as recoveryProbeError in submit_verify.go.
+func buildWaitIdleDeadLetterEntry(sender, message, priority string) nudge.QueuedNudge {
+	now := time.Now()
+	ttl := nudge.DefaultNormalTTL
+	if priority == nudge.PriorityUrgent {
+		ttl = nudge.DefaultUrgentTTL
+	}
+	return nudge.QueuedNudge{
+		ID:        nudge.NewID(),
+		Sender:    sender,
+		Message:   message,
+		Priority:  priority,
+		Timestamp: now,
+		ExpiresAt: now.Add(ttl),
+		Attempts:  1,
+	}
+}
+
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -257,30 +285,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				return deliverErr
 			}
 			fmt.Fprintf(os.Stderr, "wait-idle: %v; dead-lettering for %s\n", deliverErr, sessionName)
-			// ID, Timestamp and ExpiresAt are set explicitly here because
-			// this entry is built inline and dead-lettered directly,
-			// bypassing Enqueue (the only place that otherwise fills them
-			// in). DeadLetter also assigns an ID when one is missing, but
-			// only on ITS OWN internal copy of the struct — it never
-			// reports the generated ID back — so without setting it here
-			// first, the alertDeadLetter call below would report a blank
-			// Entry ID, and the persisted record would carry a zero
-			// Timestamp/ExpiresAt (codex, nudge.go:253/282,
-			// changes-requested at 08964387/95f841e6 rework).
-			now := time.Now()
-			ttl := nudge.DefaultNormalTTL
-			if nudgePriorityFlag == nudge.PriorityUrgent {
-				ttl = nudge.DefaultUrgentTTL
-			}
-			pending := nudge.QueuedNudge{
-				ID:        nudge.NewID(),
-				Sender:    sender,
-				Message:   message,
-				Priority:  nudgePriorityFlag,
-				Timestamp: now,
-				ExpiresAt: now.Add(ttl),
-				Attempts:  1,
-			}
+			pending := buildWaitIdleDeadLetterEntry(sender, message, nudgePriorityFlag)
 			// Zero retypes after ANY unverified delivery — a known-dirty
 			// composer, a stranded composer, or simply "typed but could not
 			// confirm Enter delivered it" (ack lost after typing). Enqueuing

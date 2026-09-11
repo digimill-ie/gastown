@@ -1,6 +1,9 @@
 package nudge
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -220,5 +223,100 @@ func TestReplayDeadLetterConcurrentDoesNotDoubleQueue(t *testing.T) {
 	}
 	if len(drained) != 1 {
 		t.Fatalf("queue got %d entries after concurrent replay, want exactly 1 (no duplication)", len(drained))
+	}
+}
+
+// TestOrphanedReplayIsSweptBackToVisible covers the codex finding at
+// deadletter.go:164: a replay that crashes AFTER the claim rename but
+// BEFORE the Enqueue/remove that follows it leaves a ".replaying" file
+// that both ListDeadLetters and ReplayDeadLetter's own scan filter
+// strictly to a ".json" suffix — invisible to both, forever, without a
+// sweep (changes-requested at 08964387/95f841e6 rework).
+func TestOrphanedReplayIsSweptBackToVisible(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-orphaned-replay"
+
+	n := QueuedNudge{ID: "crashed-replay", Sender: "test", Message: "must not vanish", Timestamp: time.Now()}
+	path, err := DeadLetter(townRoot, session, n, "nudge-poller", "boom", "", true)
+	if err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	// Simulate ReplayDeadLetter's crash window: claim the entry (the exact
+	// rename ReplayDeadLetter performs) and stop there — no Enqueue, no
+	// remove.
+	claimPath := path + ".replaying"
+	if err := os.Rename(path, claimPath); err != nil {
+		t.Fatalf("simulating claimed-but-crashed replay: %v", err)
+	}
+	old := time.Now().Add(-deadLetterReplayStaleThreshold - time.Minute)
+	if err := os.Chtimes(claimPath, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	// Both ListDeadLetters and ReplayDeadLetter run the sweep before their
+	// own scan, so either one recovers it. Exercise List first.
+	entries, err := ListDeadLetters(townRoot, session)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 1 || entries[0].ID != "crashed-replay" {
+		t.Fatalf("ListDeadLetters after orphan sweep = %#v, want the crashed replay visible again", entries)
+	}
+
+	// And it must be reachable by id for an actual retry, not just listed.
+	if err := ReplayDeadLetter(townRoot, session, "crashed-replay"); err != nil {
+		t.Fatalf("ReplayDeadLetter after orphan sweep: %v", err)
+	}
+	drained, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drained) != 1 || drained[0].Message != "must not vanish" {
+		t.Fatalf("drained = %#v, want the recovered payload intact", drained)
+	}
+}
+
+// TestFreshReplayClaimIsNotSweptPrematurely is the false-case companion:
+// a ".replaying" file younger than deadLetterReplayStaleThreshold (a
+// genuinely in-flight replay, not a crashed one) must NOT be restored —
+// doing so would let a second reader see and re-replay an entry the first
+// replay is still in the middle of processing.
+func TestFreshReplayClaimIsNotSweptPrematurely(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-fresh-replay-claim"
+
+	n := QueuedNudge{ID: "in-flight", Sender: "test", Message: "still replaying", Timestamp: time.Now()}
+	path, err := DeadLetter(townRoot, session, n, "nudge-poller", "boom", "", true)
+	if err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+	claimPath := path + ".replaying"
+	if err := os.Rename(path, claimPath); err != nil {
+		t.Fatalf("claiming: %v", err)
+	}
+	// Freshly claimed — no Chtimes backdating.
+
+	entries, err := ListDeadLetters(townRoot, session)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("ListDeadLetters got %d entries, want 0 (a fresh in-flight replay claim must stay hidden)", len(entries))
+	}
+
+	dir := filepath.Dir(claimPath)
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	found := false
+	for _, e := range dirEntries {
+		if strings.HasSuffix(e.Name(), ".replaying") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("fresh .replaying claim file was removed/renamed by the sweep, want it left alone")
 	}
 }

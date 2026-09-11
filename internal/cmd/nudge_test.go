@@ -899,6 +899,54 @@ func TestNudgeDogTargetRoutesToDogSession(t *testing.T) {
 	}
 }
 
+// TestBuildWaitIdleDeadLetterEntry_FieldsPopulated covers the codex finding
+// that wait-idle's directly-dead-lettered entries lacked Timestamp and
+// ExpiresAt, and that the alert reporting the entry got a blank ID (codex,
+// nudge.go:253/282, changes-requested at 08964387/95f841e6 rework — "not
+// fixed from prior review"). All three must be set before DeadLetter or
+// alertDeadLetter ever see the entry, since DeadLetter's own ID-assignment
+// fallback never reports the generated ID back to the caller.
+func TestBuildWaitIdleDeadLetterEntry_FieldsPopulated(t *testing.T) {
+	before := time.Now()
+	got := buildWaitIdleDeadLetterEntry("test-sender", "test message", nudge.PriorityNormal)
+	after := time.Now()
+
+	if got.ID == "" {
+		t.Error("ID is empty, want a generated ID (so an alert can name the entry)")
+	}
+	if got.Sender != "test-sender" || got.Message != "test message" {
+		t.Errorf("Sender/Message = %q/%q, want %q/%q", got.Sender, got.Message, "test-sender", "test message")
+	}
+	if got.Timestamp.Before(before) || got.Timestamp.After(after) {
+		t.Errorf("Timestamp = %v, want between %v and %v", got.Timestamp, before, after)
+	}
+	if got.Priority != nudge.PriorityNormal {
+		t.Errorf("Priority = %q, want %q", got.Priority, nudge.PriorityNormal)
+	}
+	wantExpiry := got.Timestamp.Add(nudge.DefaultNormalTTL)
+	if !got.ExpiresAt.Equal(wantExpiry) {
+		t.Errorf("ExpiresAt = %v, want %v (Timestamp + DefaultNormalTTL)", got.ExpiresAt, wantExpiry)
+	}
+	if got.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1 (this IS the first attempt, already failed unverified)", got.Attempts)
+	}
+}
+
+// TestBuildWaitIdleDeadLetterEntry_UrgentTTL covers the urgent-priority TTL
+// branch and confirms two calls never collide on ID.
+func TestBuildWaitIdleDeadLetterEntry_UrgentTTL(t *testing.T) {
+	a := buildWaitIdleDeadLetterEntry("s", "m", nudge.PriorityUrgent)
+	b := buildWaitIdleDeadLetterEntry("s", "m", nudge.PriorityUrgent)
+
+	wantExpiry := a.Timestamp.Add(nudge.DefaultUrgentTTL)
+	if !a.ExpiresAt.Equal(wantExpiry) {
+		t.Errorf("ExpiresAt = %v, want %v (Timestamp + DefaultUrgentTTL)", a.ExpiresAt, wantExpiry)
+	}
+	if a.ID == b.ID {
+		t.Errorf("two calls produced the same ID %q, want distinct", a.ID)
+	}
+}
+
 func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
 	// watchAndDeliver should exit immediately when queue is empty
 	// (someone else drained it). We test this by calling with a
