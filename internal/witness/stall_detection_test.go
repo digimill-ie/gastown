@@ -155,20 +155,28 @@ func writeTestHeartbeat(t *testing.T, townRoot, sessionName string, ts time.Time
 	if err != nil {
 		t.Fatalf("GetSessionID(%s): %v", sessionName, err)
 	}
-	writeTestHeartbeatWithIncarnation(t, townRoot, sessionName, ts, state, sessionID, created)
+	writeTestHeartbeatWithIncarnation(t, townRoot, sessionName, ts, state, sessionID, created, polecat.HeartbeatWriterAgent)
 }
 
 // writeTestHeartbeatWithIncarnation is writeTestHeartbeat with an explicit
 // SessionID + Incarnation, letting a test construct a heartbeat that
 // belongs to a DIFFERENT (or unknown, "" / 0) session incarnation than the
-// live session it's written for.
-func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState, sessionID string, incarnation int64) {
+// live session it's written for. Writer is explicit and required — every
+// caller here is simulating a genuine, previously-running agent's own
+// heartbeat (stale-working, wrong-incarnation, or a dead same-second
+// replacement), never an unattributable pre-v2.2 legacy file, so leaving it
+// as the zero value would silently test the wrong case: IsStartupWindowOpen
+// now fails closed on ANY present heartbeat with no Writer field at all,
+// regardless of incarnation (regression 1, gtn-s8i / codex review
+// 5640759300), which is a different, unconditional rule from the
+// incarnation-scoped agent-heartbeat check these tests mean to exercise.
+func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState, sessionID string, incarnation int64, writer polecat.HeartbeatWriter) {
 	t.Helper()
 	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	hb := polecat.SessionHeartbeat{Timestamp: ts, State: state, SessionID: sessionID, Incarnation: incarnation}
+	hb := polecat.SessionHeartbeat{Timestamp: ts, State: state, SessionID: sessionID, Incarnation: incarnation, Writer: writer}
 	data, err := json.Marshal(hb)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +191,12 @@ func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName strin
 // (session_manager.go), as opposed to one a `gt` command's persistentPreRun
 // has since overwritten. Stamps the live session's real incarnation so
 // MatchesFullIncarnation passes, isolating the Context distinction under
-// test.
+// test. Writer is explicitly HeartbeatWriterLauncher, matching what
+// session_manager.go's TouchLauncherStartupHeartbeat actually writes — never
+// leave it as the zero value: an unset Writer is a DIFFERENT, legacy case
+// (a pre-v2.2 heartbeat, unattributable to launcher or agent) that
+// IsStartupWindowOpen now fails closed on (regression 1, gtn-s8i / codex
+// review 5640759300), unlike a genuine launcher placeholder.
 func writeTestStartupHeartbeat(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState) {
 	t.Helper()
 	tm := tmux.NewTmux()
@@ -205,6 +218,7 @@ func writeTestStartupHeartbeat(t *testing.T, townRoot, sessionName string, ts ti
 		Context:     polecat.StartupHeartbeatContext,
 		SessionID:   sessionID,
 		Incarnation: created,
+		Writer:      polecat.HeartbeatWriterLauncher,
 	}
 	data, err := json.Marshal(hb)
 	if err != nil {
@@ -415,7 +429,7 @@ func TestDetectStalledPolecats_StaleStartupHeartbeat_ClaudeComposerMultilineQuot
 func TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppressed(t *testing.T) {
 	f := newStallTestFixture(t, "0s", "0s")
 	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
-		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, "$999999", 1)
+		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, "$999999", 1, polecat.HeartbeatWriterAgent)
 	time.Sleep(50 * time.Millisecond)
 
 	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
@@ -440,7 +454,7 @@ func TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppres
 func TestDetectStalledPolecats_FreshHeartbeat_WrongIncarnation_NotSuppressed(t *testing.T) {
 	f := newStallTestFixture(t, "0s", "0s")
 	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
-		time.Now(), polecat.HeartbeatWorking, "$999999", 1)
+		time.Now(), polecat.HeartbeatWorking, "$999999", 1, polecat.HeartbeatWriterAgent)
 	time.Sleep(50 * time.Millisecond)
 
 	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
@@ -967,7 +981,7 @@ func TestDetectStalledPolecats_Revision3_SameSecondReplacement_NewIncarnationOpe
 	// integers starting at $0/$1; this value is unreachable in this test's
 	// isolated, single-session tmux server).
 	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
-		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, "$999999", created)
+		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, "$999999", created, polecat.HeartbeatWriterAgent)
 	time.Sleep(50 * time.Millisecond)
 
 	sessionID, created := liveIdentity(t, f.tm, f.sessionName)

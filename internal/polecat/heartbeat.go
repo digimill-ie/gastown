@@ -394,12 +394,14 @@ type StartupWindowStatus struct {
 // (gtn-qp7 / hq-ooijo revision 3).
 //
 // Fails CLOSED (Open=false) whenever the answer is not provably "still
-// open": an unresolvable current incarnation, or a malformed/unreadable
-// latch or heartbeat file, refuses authorization rather than guessing —
-// "unknown or corrupt identity means refuse to send" (revision 3, item 2).
-// A MISSING file, in contrast, carries no evidence either way and does not
-// by itself close the window: a session that has never written either file
-// is exactly the fresh-startup case this window must stay open for.
+// open": an unresolvable current incarnation, a malformed/unreadable latch
+// or heartbeat file, or a PRESENT heartbeat with no Writer field at all (a
+// pre-v2.2 legacy heartbeat we cannot attribute to launcher or agent) all
+// refuse authorization rather than guessing — "unknown or corrupt identity
+// means refuse to send" (revision 3, item 2). A MISSING file, in contrast,
+// carries no evidence either way and does not by itself close the window: a
+// session that has never written either file is exactly the fresh-startup
+// case this window must stay open for.
 func IsStartupWindowOpen(townRoot, sessionName, sessionID string, created int64) StartupWindowStatus {
 	if sessionID == "" || created == 0 {
 		return StartupWindowStatus{Open: false, Reason: "cannot resolve current session incarnation"}
