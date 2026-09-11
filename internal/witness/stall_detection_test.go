@@ -138,31 +138,37 @@ func writeTestOperationalConfig(t *testing.T, townRoot, stallThreshold, activity
 // writeTestHeartbeat writes a heartbeat file directly (bypassing
 // TouchSessionHeartbeat, which always stamps time.Now()) so tests can
 // construct a STALE heartbeat reporting a specific state. It stamps the
-// CURRENT live session's real incarnation (session_created), so it tests
-// the intended scenario — a stale-but-working heartbeat for THIS session,
-// not a reused/dead one — matching MatchesIncarnation's binding (gtn-m7s /
-// hq-ooijo revision 2). Use writeTestHeartbeatWithIncarnation directly to
+// CURRENT live session's real incarnation (session_id + session_created),
+// so it tests the intended scenario — a stale-but-working heartbeat for
+// THIS session, not a reused/dead one — matching MatchesFullIncarnation's
+// binding (gtn-m7s / hq-ooijo revision 2, sharpened by session id in
+// revision 3, gtn-qp7). Use writeTestHeartbeatWithIncarnation directly to
 // construct a mismatched-incarnation fixture.
 func writeTestHeartbeat(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState) {
 	t.Helper()
-	created, err := tmux.NewTmux().GetSessionCreatedUnix(sessionName)
+	tm := tmux.NewTmux()
+	created, err := tm.GetSessionCreatedUnix(sessionName)
 	if err != nil {
 		t.Fatalf("GetSessionCreatedUnix(%s): %v", sessionName, err)
 	}
-	writeTestHeartbeatWithIncarnation(t, townRoot, sessionName, ts, state, created)
+	sessionID, err := tm.GetSessionID(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionID(%s): %v", sessionName, err)
+	}
+	writeTestHeartbeatWithIncarnation(t, townRoot, sessionName, ts, state, sessionID, created)
 }
 
 // writeTestHeartbeatWithIncarnation is writeTestHeartbeat with an explicit
-// Incarnation value, letting a test construct a heartbeat that belongs to a
-// DIFFERENT (or unknown, 0) session incarnation than the live session it's
-// written for.
-func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState, incarnation int64) {
+// SessionID + Incarnation, letting a test construct a heartbeat that
+// belongs to a DIFFERENT (or unknown, "" / 0) session incarnation than the
+// live session it's written for.
+func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState, sessionID string, incarnation int64) {
 	t.Helper()
 	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	hb := polecat.SessionHeartbeat{Timestamp: ts, State: state, Incarnation: incarnation}
+	hb := polecat.SessionHeartbeat{Timestamp: ts, State: state, SessionID: sessionID, Incarnation: incarnation}
 	data, err := json.Marshal(hb)
 	if err != nil {
 		t.Fatal(err)
@@ -176,12 +182,18 @@ func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName strin
 // polecat.StartupHeartbeatContext — the launcher's own untouched placeholder
 // (session_manager.go), as opposed to one a `gt` command's persistentPreRun
 // has since overwritten. Stamps the live session's real incarnation so
-// MatchesIncarnation passes, isolating the Context distinction under test.
+// MatchesFullIncarnation passes, isolating the Context distinction under
+// test.
 func writeTestStartupHeartbeat(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState) {
 	t.Helper()
-	created, err := tmux.NewTmux().GetSessionCreatedUnix(sessionName)
+	tm := tmux.NewTmux()
+	created, err := tm.GetSessionCreatedUnix(sessionName)
 	if err != nil {
 		t.Fatalf("GetSessionCreatedUnix(%s): %v", sessionName, err)
+	}
+	sessionID, err := tm.GetSessionID(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionID(%s): %v", sessionName, err)
 	}
 	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -191,6 +203,7 @@ func writeTestStartupHeartbeat(t *testing.T, townRoot, sessionName string, ts ti
 		Timestamp:   ts,
 		State:       state,
 		Context:     polecat.StartupHeartbeatContext,
+		SessionID:   sessionID,
 		Incarnation: created,
 	}
 	data, err := json.Marshal(hb)
@@ -402,7 +415,7 @@ func TestDetectStalledPolecats_StaleStartupHeartbeat_ClaudeComposerMultilineQuot
 func TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppressed(t *testing.T) {
 	f := newStallTestFixture(t, "0s", "0s")
 	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
-		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, 1)
+		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, "$999999", 1)
 	time.Sleep(50 * time.Millisecond)
 
 	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
@@ -427,7 +440,7 @@ func TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppres
 func TestDetectStalledPolecats_FreshHeartbeat_WrongIncarnation_NotSuppressed(t *testing.T) {
 	f := newStallTestFixture(t, "0s", "0s")
 	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
-		time.Now(), polecat.HeartbeatWorking, 1)
+		time.Now(), polecat.HeartbeatWorking, "$999999", 1)
 	time.Sleep(50 * time.Millisecond)
 
 	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
@@ -721,5 +734,250 @@ func TestDetectStalledPolecats_DryRun_NeverSendsKeys(t *testing.T) {
 	}
 	if kind != tmux.DialogWorkspaceTrust {
 		t.Errorf("dialog no longer visible after dry-run — a key was sent (kind=%q)", kind)
+	}
+}
+
+// The tests below cover the revision-3 startup-window gate end to end
+// (gtn-qp7 / hq-ooijo): dismiss keys are authorized only while the session
+// incarnation's startup window is open, and text classification alone no
+// longer decides whether to send them.
+
+// writeTestHeartbeatFull writes a heartbeat with every revision-3 field
+// explicit, for tests that need a combination writeTestHeartbeat and
+// writeTestStartupHeartbeat don't cover (e.g. an explicit Writer value).
+func writeTestHeartbeatFull(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState, context string, sessionID string, incarnation int64, writer polecat.HeartbeatWriter) {
+	t.Helper()
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hb := polecat.SessionHeartbeat{
+		Timestamp:   ts,
+		State:       state,
+		Context:     context,
+		SessionID:   sessionID,
+		Incarnation: incarnation,
+		Writer:      writer,
+	}
+	data, err := json.Marshal(hb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func liveIdentity(t *testing.T, tm *tmux.Tmux, sessionName string) (sessionID string, created int64) {
+	t.Helper()
+	created, err := tm.GetSessionCreatedUnix(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionCreatedUnix(%s): %v", sessionName, err)
+	}
+	sessionID, err = tm.GetSessionID(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionID(%s): %v", sessionName, err)
+	}
+	return sessionID, created
+}
+
+// TestDetectStalledPolecats_Revision3_FreshSession_TrustPrompt_Dismissed is
+// the "fresh session on the trust prompt before any agent heartbeat" case
+// (hq-ooijo revision 3 test list, item 1): no heartbeat or latch file
+// exists at all, so the startup window is open by construction, and the
+// dialog is dismissed with its validated sequence.
+func TestDetectStalledPolecats_Revision3_FreshSession_TrustPrompt_Dismissed(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+
+	if err := f.tm.SendKeys(f.sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg; clear; echo dialog-dismissed"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	sessionID, created := liveIdentity(t, f.tm, f.sessionName)
+	if status := polecat.IsStartupWindowOpen(f.townRoot, f.sessionName, sessionID, created); !status.Open {
+		t.Fatalf("window unexpectedly closed on a fresh session: %s", status.Reason)
+	}
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "auto-dismissed:workspace-trust" {
+		t.Errorf("Stalled = %+v, want one entry with Action=auto-dismissed:workspace-trust", result.Stalled)
+	}
+}
+
+// TestDetectStalledPolecats_Revision3_AfterFirstAgentHeartbeat_ComposerText_ZeroKeys
+// is "identical text in a composer after the first agent heartbeat gets
+// zero keys" (test list item 2): the agent has already written its own
+// (non-startup, Writer=agent) heartbeat, and the pane merely holds text
+// that quotes a dialog marker. Zero keys must reach it — whether that
+// guarantee comes from the pre-existing stale-working early-skip (gtn-k43
+// revision 2) or from the startup-window gate, the OUTCOME this test
+// asserts is the one the bead requires.
+func TestDetectStalledPolecats_Revision3_AfterFirstAgentHeartbeat_ComposerText_ZeroKeys(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	sessionID, created := liveIdentity(t, f.tm, f.sessionName)
+	// Writer=agent, matching TouchSessionHeartbeatWithState's real shape —
+	// this is what closes the window (writeTestHeartbeat's plain shape
+	// predates the Writer field and, correctly, does not close it; the
+	// pre-existing stale-working early-skip is what covers that shape).
+	writeTestHeartbeatFull(t, f.townRoot, f.sessionName, time.Now().Add(-1*time.Hour),
+		polecat.HeartbeatWorking, "", sessionID, created, polecat.HeartbeatWriterAgent)
+
+	if err := f.tm.SendKeys(f.sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if status := polecat.IsStartupWindowOpen(f.townRoot, f.sessionName, sessionID, created); status.Open {
+		t.Fatalf("window unexpectedly open after an agent heartbeat for this incarnation: %s", status.Reason)
+	}
+
+	before, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (before): %v", err)
+	}
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+
+	after, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if before != after {
+		t.Errorf("pane content changed after the agent's first heartbeat — a key was sent\nbefore: %q\nafter:  %q", before, after)
+	}
+	if len(result.Stalled) != 0 {
+		for _, s := range result.Stalled {
+			if strings.HasPrefix(s.Action, "auto-dismissed:") || strings.HasPrefix(s.Action, "would-dismiss:") {
+				t.Errorf("Stalled = %+v, want no dismiss action after the first agent heartbeat", result.Stalled)
+			}
+		}
+	}
+}
+
+// TestDetectStalledPolecats_Revision3_LauncherHeartbeat_PromptStillUp_Dismissed
+// is "launcher heartbeat with the prompt still up: window open, dismissed"
+// (test list item 3): AcceptStartupDialogs/WaitForRuntimeReady are
+// non-fatal (session_manager.go:512,521), so the launcher's own placeholder
+// write happens even when a genuine dialog is left unhandled. That write
+// must never close the window.
+func TestDetectStalledPolecats_Revision3_LauncherHeartbeat_PromptStillUp_Dismissed(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	sessionID, created := liveIdentity(t, f.tm, f.sessionName)
+	writeTestHeartbeatFull(t, f.townRoot, f.sessionName, time.Now().Add(-1*time.Hour),
+		polecat.HeartbeatWorking, polecat.StartupHeartbeatContext, sessionID, created, polecat.HeartbeatWriterLauncher)
+
+	if err := f.tm.SendKeys(f.sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg; clear; echo dialog-dismissed"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if status := polecat.IsStartupWindowOpen(f.townRoot, f.sessionName, sessionID, created); !status.Open {
+		t.Fatalf("window unexpectedly closed by a launcher heartbeat: %s", status.Reason)
+	}
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "auto-dismissed:workspace-trust" {
+		t.Errorf("Stalled = %+v, want one entry with Action=auto-dismissed:workspace-trust "+
+			"(a launcher heartbeat must never close the startup window)", result.Stalled)
+	}
+}
+
+// TestDetectStalledPolecats_Revision3_AgentHeartbeatWritten_BetweenDownAndEnter_Aborts
+// is "heartbeat transition between Down and Enter aborts" (test list item
+// 4), driven end to end through DetectStalledPolecats rather than a
+// synthetic authorized() closure (see the tmux-package equivalent for the
+// mechanism isolated from real subprocess timing): the window starts OPEN
+// (no heartbeat), a real bypass-permissions dialog is showing, and a
+// background write lands the agent's first real heartbeat ~80ms later —
+// closing the window either before DetectStalledPolecats' own outer check
+// (real tmux subprocess overhead per polecat can itself exceed 80ms) or in
+// dialogDismissKeysGated's 200ms gap between Down and Enter. Either landing
+// point is a correct abort; what must never happen, regardless of exactly
+// when the write lands, is Enter reaching the dialog.
+func TestDetectStalledPolecats_Revision3_AgentHeartbeatWritten_BetweenDownAndEnter_Aborts(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+
+	marker := filepath.Join(t.TempDir(), "enter-reached")
+	script := "#!/bin/bash\n" +
+		"clear; printf '%s\\n' 'Bypass Permissions mode'; printf '%s\\n' '1. No'; printf '%s\\n' '2. Yes, I accept'\n" +
+		"IFS= read -rsn1 _c\n" +
+		"IFS= read -rsn2 -t 1 _rest\n" +
+		"IFS= read -r _maybe_enter\n" +
+		"touch " + marker + "\n"
+	scriptPath := filepath.Join(t.TempDir(), "gated-live.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := f.tm.SendKeys(f.sessionName, "clear; bash "+scriptPath); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	sessionID, created := liveIdentity(t, f.tm, f.sessionName)
+	if status := polecat.IsStartupWindowOpen(f.townRoot, f.sessionName, sessionID, created); !status.Open {
+		t.Fatalf("window unexpectedly closed before the race: %s", status.Reason)
+	}
+
+	// Land the agent's first heartbeat ~80ms in, inside the 200ms gap
+	// dialogDismissKeysGated leaves between Down and its Enter recheck.
+	// Written inline rather than via writeTestHeartbeat: that helper calls
+	// t.Fatalf, which only testing's own goroutine may do safely.
+	dir := filepath.Join(f.townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hbData, err := json.Marshal(polecat.SessionHeartbeat{
+		Timestamp: time.Now(), State: polecat.HeartbeatWorking,
+		SessionID: sessionID, Incarnation: created, Writer: polecat.HeartbeatWriterAgent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hbPath := filepath.Join(dir, f.sessionName+".json")
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		_ = os.WriteFile(hbPath, hbData, 0o644)
+	}()
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+
+	time.Sleep(300 * time.Millisecond)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("marker file exists — Enter reached the dialog after the agent's first heartbeat closed the window")
+	}
+	for _, s := range result.Stalled {
+		if strings.HasPrefix(s.Action, "auto-dismissed:") {
+			t.Errorf("Stalled = %+v, want no auto-dismissed action once the agent's first heartbeat has landed", result.Stalled)
+		}
+	}
+}
+
+// TestDetectStalledPolecats_Revision3_SameSecondReplacement_NewIncarnationOpen
+// is "same-second session replacement is a new incarnation" (test list item
+// 5): a heartbeat matching this session's real created-timestamp but a
+// DIFFERENT session id — exactly what a name reused within the same second
+// leaves behind — must not suppress detection or close the window for the
+// live session.
+func TestDetectStalledPolecats_Revision3_SameSecondReplacement_NewIncarnationOpen(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	_, created := liveIdentity(t, f.tm, f.sessionName)
+	// Same Incarnation (created second) as the live session, but a session
+	// id that cannot be the live session's own (tmux ids are small, +
+	// integers starting at $0/$1; this value is unreachable in this test's
+	// isolated, single-session tmux server).
+	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
+		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, "$999999", created)
+	time.Sleep(50 * time.Millisecond)
+
+	sessionID, created := liveIdentity(t, f.tm, f.sessionName)
+	if status := polecat.IsStartupWindowOpen(f.townRoot, f.sessionName, sessionID, created); !status.Open {
+		t.Errorf("window unexpectedly closed by a same-second, different-session-id heartbeat: %s", status.Reason)
+	}
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "no-known-dialog" {
+		t.Errorf("Stalled = %+v, want one entry with Action=no-known-dialog "+
+			"(a same-second, different-session-id heartbeat must not suppress detection)", result.Stalled)
 	}
 }
