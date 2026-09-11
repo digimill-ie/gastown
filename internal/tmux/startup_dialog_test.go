@@ -432,11 +432,16 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	// as an EMPTY value indistinguishable from "nothing arrived" — only the
 	// exit status (0 = something was read, non-zero = the read timed out)
 	// tells them apart.
+	// clear happens IMMEDIATELY after the real dismiss key is consumed, not
+	// after the stray-key wait: DismissDialog does its own post-send
+	// re-capture (~500ms after sending Enter) to confirm the dialog cleared,
+	// and that must see a blank screen well before this script's 1-second
+	// stray-key wait finishes — the marker/verdict text can print later.
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'\n" +
 		"IFS= read -r _line\n" +
-		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"clear\n" +
+		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter\\n'; " +
 		"else printf 'unexpected: line=%s extra=%s status=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\"; fi\n"
 	scriptPath := filepath.Join(t.TempDir(), "trust.sh")
@@ -460,8 +465,11 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	// dialog's own key is a single Enter, nothing before and nothing after.
 	// A return status alone cannot tell a correctly-dismissed dialog from
 	// one that merely stopped matching the classifier for an unrelated
-	// reason (codex finding on this file).
-	time.Sleep(400 * time.Millisecond)
+	// reason (codex finding on this file). The script's own stray-key read
+	// waits a full second before printing its verdict, so this wait must
+	// clear that 1s mark with margin (~550ms already elapsed inside
+	// DetectAndDismissKnownDialog's own post-send sleep).
+	time.Sleep(900 * time.Millisecond)
 	after, err := tm.CapturePane(sessionName, 30)
 	if err != nil {
 		t.Fatalf("CapturePane (after): %v", err)
@@ -504,13 +512,19 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	// Enter is a lone newline byte, which `read -n1` consumes and reports as
 	// an empty value indistinguishable from "nothing arrived" (codex Medium,
 	// startup_dialog_test.go:399, REVISION 3).
+	// clear happens IMMEDIATELY after the real dismiss keys are consumed,
+	// not after the stray-key wait — same reasoning as the trust dialog
+	// script above: DismissDialog's own post-send re-check must see a
+	// blank screen well before this script's 1-second stray-key wait ends.
+	// $_line is already captured by then, so clearing the screen doesn't
+	// lose it.
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Bypass Permissions mode'\n" +
 		"printf '%s\\n' '1. No'\n" +
 		"printf '%s\\n' '2. Yes, I accept'\n" +
 		"IFS= read -r _line\n" +
-		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"clear\n" +
+		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"printf '%s' \"$_line\" | cat -v\n" +
 		"printf ':end:'\n" +
 		"if [ \"$_extra_status\" -eq 0 ]; then printf 'stray-key'; else printf 'clean'; fi\n" +
@@ -532,7 +546,10 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 		t.Errorf("kind = %q, want %q", kind, DialogBypassPermissions)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	// See the trust dialog test above: the script's stray-key read waits a
+	// full second before printing its verdict, so this wait must clear that
+	// mark with margin.
+	time.Sleep(900 * time.Millisecond)
 	after, err := tm.CapturePane(sessionName, 30)
 	if err != nil {
 		t.Fatalf("CapturePane (after): %v", err)
@@ -563,14 +580,16 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 	// the complete key stream").
 	// The timeout is an integer second and the verdict reads the read's exit
 	// status, not $_extra's string value — see the trust dialog test above
-	// for why (codex Medium, startup_dialog_test.go:399, REVISION 3).
+	// for why (codex Medium, startup_dialog_test.go:399, REVISION 3). clear
+	// happens right after the real key is consumed, before the stray-key
+	// wait — same reasoning as the trust dialog script above.
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'\n" +
 		"printf '%s\\n' '1. Dark mode'\n" +
 		"printf '%s\\n' '2. Light mode'\n" +
 		"IFS= read -r _line\n" +
-		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"clear\n" +
+		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter\\n'; " +
 		"else printf 'unexpected: line=%s extra=%s status=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\"; fi\n"
 	scriptPath := filepath.Join(t.TempDir(), "theme.sh")
@@ -590,7 +609,10 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 		t.Errorf("kind = %q, want %q", kind, DialogThemePicker)
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	// See the trust dialog test above: the script's stray-key read waits a
+	// full second before printing its verdict, so this wait must clear that
+	// mark with margin.
+	time.Sleep(900 * time.Millisecond)
 	after, err := tm.CapturePane(sessionName, 30)
 	if err != nil {
 		t.Fatalf("CapturePane (after): %v", err)
