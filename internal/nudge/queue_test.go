@@ -507,9 +507,21 @@ func TestDrainClaims_UnackedClaimSurvivesACrash(t *testing.T) {
 		t.Fatalf("expected 1 claimed file surviving an unacked DrainClaims, got %d", claimFiles)
 	}
 
+	// The first post-crash Drain only restores the orphan (.claimed -> .json)
+	// — it isn't in that call's own directory snapshot, so it can't be
+	// delivered in the same call (see TestDrainSweepsOrphanedClaims). A
+	// second Drain picks it up.
+	firstRecovery, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("first recovery Drain: %v", err)
+	}
+	if len(firstRecovery) != 0 {
+		t.Fatalf("first recovery Drain got %d entries, want 0 (orphan is only restored, not yet delivered)", len(firstRecovery))
+	}
+
 	recovered, err := Drain(townRoot, session)
 	if err != nil {
-		t.Fatalf("recovery Drain: %v", err)
+		t.Fatalf("second recovery Drain: %v", err)
 	}
 	if len(recovered) != 1 || recovered[0].Message != "must survive a crash" {
 		t.Fatalf("orphaned claim was not recovered intact: %#v", recovered)
