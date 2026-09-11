@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,13 +55,27 @@ func newStallTestFixture(t *testing.T, stallThreshold, activityGrace string) *st
 	// Fast thresholds so tests don't wait on the 90s/60s production defaults.
 	writeTestOperationalConfig(t, townRoot, stallThreshold, activityGrace)
 
+	// Force an ISOLATED, test-private tmux socket. session.InitRegistry
+	// (called both here and internally by DetectStalledPolecats) derives its
+	// socket from townRoot's path ONLY when GT_TMUX_SOCKET is unset/
+	// "default"/"auto" (internal/session/registry.go). A GT_TMUX_SOCKET
+	// inherited from the real enclosing session — e.g. this test running
+	// inside a live polecat, which is exactly how these tests are normally
+	// run — is used AS-IS instead, which can silently target the REAL
+	// town's tmux server: an unregistered rig name resolves to the "gt"
+	// legacy prefix, so PolecatSessionName produces "gt-alpha" — a name a
+	// real session can hold. Clearing the env var here forces every
+	// InitRegistry call in this test (this one and DetectStalledPolecats'
+	// own internal one) to fall through to the per-townRoot derived socket,
+	// which is unique to this test's TempDir and touches nothing real
+	// (gtn-m7s / hq-ooijo revision 2, codex finding on this file:64).
+	t.Setenv("GT_TMUX_SOCKET", "")
+
 	// DetectStalledPolecats calls session.InitRegistry(townRoot) internally,
-	// which derives a PER-TOWN tmux socket from townRoot's path and sets it
-	// as the process-wide default (tmux.SetDefaultSocket). Doing the same
-	// here, before creating the session, ensures this fixture's session and
-	// DetectStalledPolecats' own tmux.NewTmux() resolve to the SAME socket —
-	// otherwise the session is created on whatever socket a PRIOR test left
-	// active and becomes invisible once this call flips the global socket.
+	// which sets the resolved socket as the process-wide default
+	// (tmux.SetDefaultSocket). Doing the same here, before creating the
+	// session, ensures this fixture's session and DetectStalledPolecats' own
+	// tmux.NewTmux() resolve to the SAME socket.
 	if err := session.InitRegistry(townRoot); err != nil {
 		t.Logf("session.InitRegistry (non-fatal, expected for a bare temp town): %v", err)
 	}
@@ -68,7 +83,14 @@ func newStallTestFixture(t *testing.T, stallThreshold, activityGrace string) *st
 	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 
 	tm := tmux.NewTmux()
-	_ = tm.KillSession(sessionName)
+	// Defense in depth beyond the socket isolation above: never kill or
+	// reuse a session this fixture did not create itself. If the resolved
+	// name already exists, something about the isolation assumption above
+	// is wrong, and blindly killing it (the prior behavior) is exactly the
+	// hazard this fixes — it could be a real gt-alpha/gt-bravo session.
+	if alive, _ := tm.HasSession(sessionName); alive {
+		t.Fatalf("refusing to reuse pre-existing tmux session %q — expected a fresh isolated socket", sessionName)
+	}
 	if err := tm.NewSession(sessionName, ""); err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -115,14 +137,32 @@ func writeTestOperationalConfig(t *testing.T, townRoot, stallThreshold, activity
 
 // writeTestHeartbeat writes a heartbeat file directly (bypassing
 // TouchSessionHeartbeat, which always stamps time.Now()) so tests can
-// construct a STALE heartbeat reporting a specific state.
+// construct a STALE heartbeat reporting a specific state. It stamps the
+// CURRENT live session's real incarnation (session_created), so it tests
+// the intended scenario — a stale-but-working heartbeat for THIS session,
+// not a reused/dead one — matching MatchesIncarnation's binding (gtn-m7s /
+// hq-ooijo revision 2). Use writeTestHeartbeatWithIncarnation directly to
+// construct a mismatched-incarnation fixture.
 func writeTestHeartbeat(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState) {
+	t.Helper()
+	created, err := tmux.NewTmux().GetSessionCreatedUnix(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionCreatedUnix(%s): %v", sessionName, err)
+	}
+	writeTestHeartbeatWithIncarnation(t, townRoot, sessionName, ts, state, created)
+}
+
+// writeTestHeartbeatWithIncarnation is writeTestHeartbeat with an explicit
+// Incarnation value, letting a test construct a heartbeat that belongs to a
+// DIFFERENT (or unknown, 0) session incarnation than the live session it's
+// written for.
+func writeTestHeartbeatWithIncarnation(t *testing.T, townRoot, sessionName string, ts time.Time, state polecat.HeartbeatState, incarnation int64) {
 	t.Helper()
 	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	hb := polecat.SessionHeartbeat{Timestamp: ts, State: state}
+	hb := polecat.SessionHeartbeat{Timestamp: ts, State: state, Incarnation: incarnation}
 	data, err := json.Marshal(hb)
 	if err != nil {
 		t.Fatal(err)
@@ -165,6 +205,53 @@ func TestDetectStalledPolecats_StaleWorkingHeartbeat_ZeroKeys(t *testing.T) {
 	}
 }
 
+// TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppressed
+// is the merge risk named on hq-ooijo revision 2: a tmux session name can be
+// REUSED (the old session dies, a new one is created with the identical
+// name). A stale "working" heartbeat left by the DEAD incarnation must not
+// suppress recovery for the new one — unlike the same-incarnation case above,
+// which must still be suppressed. Constructed with an Incarnation value that
+// does not match this fixture's actual live session (an arbitrary unix time
+// far from now), simulating exactly that: a heartbeat file that predates the
+// current session.
+func TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppressed(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
+		time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking, 1)
+	time.Sleep(50 * time.Millisecond)
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if result.Checked != 1 {
+		t.Fatalf("Checked = %d, want 1", result.Checked)
+	}
+	// The session shows no known dialog (plain idle shell), so with the
+	// mismatched-incarnation heartbeat correctly distrusted it must fall
+	// through to content/activity checks and be reported — not silently
+	// skipped as if the stale "working" heartbeat were trustworthy.
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "no-known-dialog" {
+		t.Errorf("Stalled = %+v, want one entry with Action=no-known-dialog "+
+			"(a heartbeat from a different session incarnation must not suppress detection)", result.Stalled)
+	}
+}
+
+// TestDetectStalledPolecats_FreshHeartbeat_WrongIncarnation_NotSuppressed
+// covers the fresh-but-wrong-incarnation case: even a heartbeat with a
+// CURRENT timestamp must not be trusted if it was not written for this
+// session's incarnation — a dead session's very last heartbeat write can be
+// timestamped moments before the new session (same name) comes up.
+func TestDetectStalledPolecats_FreshHeartbeat_WrongIncarnation_NotSuppressed(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	writeTestHeartbeatWithIncarnation(t, f.townRoot, f.sessionName,
+		time.Now(), polecat.HeartbeatWorking, 1)
+	time.Sleep(50 * time.Millisecond)
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "no-known-dialog" {
+		t.Errorf("Stalled = %+v, want one entry with Action=no-known-dialog "+
+			"(a fresh-looking heartbeat from a different incarnation must still not suppress detection)", result.Stalled)
+	}
+}
+
 // TestDetectStalledPolecats_BackgroundTaskHint_ZeroKeys is the
 // "busy-or-background-task" polarity: a pane showing tmux's own background
 // task hint must never be remediated, even with no heartbeat at all.
@@ -183,6 +270,57 @@ func TestDetectStalledPolecats_BackgroundTaskHint_ZeroKeys(t *testing.T) {
 	}
 }
 
+// TestDetectStalledPolecats_BackgroundTaskHint_ResolvesAgentPane_NotActiveWindow
+// is the agent-pane-resolution polarity: the busy and activity checks must
+// read the resolved AGENT pane (via GT_PANE_ID), never whichever pane or
+// window merely happens to be ACTIVE in the session. A second window is
+// added and declared the agent pane via GT_PANE_ID; it shows the
+// background-task hint. Window 0 — the fixture's original, genuinely idle
+// pane — is left selected as the session's active window. If the checks
+// read the active window instead of resolving the agent pane, they would
+// see a blank idle pane and miss the hint entirely (gtn-m7s / hq-ooijo
+// revision 2, codex finding on handlers.go:2348).
+func TestDetectStalledPolecats_BackgroundTaskHint_ResolvesAgentPane_NotActiveWindow(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	socket := tmux.GetDefaultSocket()
+
+	if out, err := exec.Command("tmux", "-u", "-L", socket, "new-window", "-d", "-t", f.sessionName, "-n", "agent").CombinedOutput(); err != nil {
+		t.Fatalf("tmux new-window: %v (%s)", err, out)
+	}
+	agentPaneOut, err := exec.Command("tmux", "-u", "-L", socket, "display-message", "-t", f.sessionName+":1", "-p", "#{pane_id}").Output()
+	if err != nil {
+		t.Fatalf("resolving new window's pane id: %v", err)
+	}
+	agentPane := strings.TrimSpace(string(agentPaneOut))
+
+	// Declare window 1's pane as the agent pane (mirrors GT_PANE_ID set at
+	// real session startup, gt-qmsx).
+	if err := f.tm.SetEnvironment(f.sessionName, "GT_PANE_ID", agentPane); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+
+	// Background-task hint lives in the agent's pane (window 1); `read`
+	// keeps it as the pane's last content indefinitely.
+	if out, err := exec.Command("tmux", "-u", "-L", socket, "send-keys", "-t", agentPane,
+		"clear; printf '%s\\n' 'Running in the background (down-arrow to manage)'; read -r _bg", "Enter").CombinedOutput(); err != nil {
+		t.Fatalf("send-keys to agent pane: %v (%s)", err, out)
+	}
+
+	// Window 0 — blank, genuinely idle — is left as the session's ACTIVE
+	// window, mirroring an idle auxiliary window being selected while the
+	// agent works elsewhere.
+	if out, err := exec.Command("tmux", "-u", "-L", socket, "select-window", "-t", f.sessionName+":0").CombinedOutput(); err != nil {
+		t.Fatalf("select-window 0: %v (%s)", err, out)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if len(result.Stalled) != 0 {
+		t.Errorf("Stalled = %+v, want empty — the agent pane (window 1) shows a "+
+			"background-task hint even though the idle window 0 is active", result.Stalled)
+	}
+}
+
 // TestDetectStalledPolecats_RecentWindowActivity_ZeroKeys is the
 // "detached-healthy" polarity: a session whose window_activity is recent
 // must never be remediated, regardless of session_activity (which the
@@ -193,6 +331,44 @@ func TestDetectStalledPolecats_RecentWindowActivity_ZeroKeys(t *testing.T) {
 	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
 	if len(result.Stalled) != 0 {
 		t.Errorf("Stalled = %+v, want empty (recent window_activity must never be remediated)", result.Stalled)
+	}
+}
+
+// TestDetectStalledPolecats_StaleSessionActivity_RecentWindowActivity_ZeroKeys
+// is the DISCRIMINATING version of the test above. With a 10-minute grace,
+// session_activity (frozen at session_created on every detached session,
+// hq-wisp-y46vn) is ALSO within grace immediately after creation, so that
+// test passes even if the code still keyed on session_activity — exactly
+// the bug this fix replaces (codex finding on this file: a test must be
+// able to fail). Here session_activity is made genuinely stale by a real
+// sleep past a short grace, then the pane produces output, which advances
+// window_activity but — per hq-wisp-y46vn — not session_activity on a
+// detached session. Only a check actually keyed on window_activity passes.
+func TestDetectStalledPolecats_StaleSessionActivity_RecentWindowActivity_ZeroKeys(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "700ms")
+
+	time.Sleep(900 * time.Millisecond) // past the 700ms grace: session_activity now stale
+
+	sessionActivityBefore, err := f.tm.GetSessionActivity(f.sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionActivity: %v", err)
+	}
+	if time.Since(sessionActivityBefore) < 700*time.Millisecond {
+		t.Fatalf("fixture invalid: session_activity is not yet stale (%v old)", time.Since(sessionActivityBefore))
+	}
+
+	// Real pane output advances window_activity; session_activity is
+	// documented to NOT reliably move on a detached session (hq-wisp-y46vn).
+	if err := f.tm.SendKeys(f.sessionName, "echo fresh-output"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if len(result.Stalled) != 0 {
+		t.Errorf("Stalled = %+v, want empty — window_activity is recent even though "+
+			"session_activity is stale (a check still keyed on session_activity "+
+			"would wrongly stall this)", result.Stalled)
 	}
 }
 

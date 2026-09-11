@@ -3,11 +3,16 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
 )
 
@@ -243,5 +248,142 @@ func TestPatrolScanDryRunFlag(t *testing.T) {
 	}
 	if !patrolScanDryRun {
 		t.Error("patrolScanDryRun = false after setting --dry-run=true")
+	}
+}
+
+// TestPatrolScan_DryRun_NeverSendsKeys actually RUNS the scan through
+// runPatrolScan (the CLI entry point), not just the underlying library call —
+// TestPatrolScanDryRunFlag above only checks flag wiring, so removing the
+// zombie/completion/notification guards inside runPatrolScan would leave it
+// green (codex finding on this file, gtn-m7s / hq-ooijo revision 2). Both
+// polarities against a real tmux dialog: --dry-run leaves it standing;
+// without it, the identical setup dismisses it.
+func TestPatrolScan_DryRun_NeverSendsKeys(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	// NOTE: cannot use t.Parallel() — mutates cwd, env, and package-level
+	// patrolScan* flag variables.
+
+	newFixture := func(t *testing.T) (townRoot, rigName, sessionName string, tm *tmux.Tmux) {
+		t.Helper()
+		townRoot = t.TempDir()
+		rigName = "testrig"
+		polecatName := "alpha"
+
+		if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(townRoot, rigName, "polecats", polecatName), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		// A private, test-unique tmux socket — never the inherited
+		// GT_TMUX_SOCKET, which on a real gastown host can point at the
+		// live town server (stall_detection_test.go finding, gtn-m7s).
+		t.Setenv("GT_TMUX_SOCKET", "")
+
+		if err := session.InitRegistry(townRoot); err != nil {
+			t.Logf("session.InitRegistry (non-fatal for a bare temp town): %v", err)
+		}
+		sessionName = session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+
+		tm = tmux.NewTmux()
+		if alive, _ := tm.HasSession(sessionName); alive {
+			t.Fatalf("refusing to reuse pre-existing tmux session %q", sessionName)
+		}
+		if err := tm.NewSession(sessionName, ""); err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+		if err := tm.SetEnvironment(sessionName, "GT_PROCESS_NAMES", "zsh,bash,sh"); err != nil {
+			t.Fatalf("SetEnvironment GT_PROCESS_NAMES: %v", err)
+		}
+
+		// `read` keeps the dialog text as the pane's last content
+		// indefinitely, so a session old enough to be considered for stall
+		// detection still shows it (no stall-threshold config here — the
+		// production default is 90s, so this fixture instead asserts on
+		// the CLI *not sending keys to a currently-visible dialog*, which
+		// only requires the pane content path, not session age).
+		if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg; clear; echo dialog-dismissed"); err != nil {
+			t.Fatalf("SendKeys: %v", err)
+		}
+		time.Sleep(400 * time.Millisecond)
+
+		return townRoot, rigName, sessionName, tm
+	}
+
+	runScan := func(t *testing.T, townRoot, rigName string, dryRun bool) {
+		t.Helper()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(townRoot); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		origRig, origDryRun, origJSON := patrolScanRig, patrolScanDryRun, patrolScanJSON
+		patrolScanRig, patrolScanDryRun, patrolScanJSON = rigName, dryRun, false
+		t.Cleanup(func() { patrolScanRig, patrolScanDryRun, patrolScanJSON = origRig, origDryRun, origJSON })
+
+		if err := runPatrolScan(patrolScanCmd, nil); err != nil {
+			t.Fatalf("runPatrolScan (dryRun=%v): %v", dryRun, err)
+		}
+	}
+
+	t.Run("dry-run leaves the dialog standing", func(t *testing.T) {
+		townRoot, rigName, sessionName, tm := newFixture(t)
+
+		// Give the fast test settle time; stall threshold is production
+		// default (90s) here, so classification alone (not the age gate)
+		// is what this asserts — the config write below shrinks it so the
+		// scan actually reaches ClassifyVisibleDialog.
+		writeZeroStallThresholds(t, townRoot)
+
+		runScan(t, townRoot, rigName, true)
+
+		kind, err := tm.ClassifyVisibleDialog(sessionName)
+		if err != nil {
+			t.Fatalf("ClassifyVisibleDialog: %v", err)
+		}
+		if kind != tmux.DialogWorkspaceTrust {
+			t.Errorf("dialog no longer visible after `gt patrol scan --dry-run` — a key was sent (kind=%q)", kind)
+		}
+	})
+
+	t.Run("without dry-run, the identical setup dismisses it (control)", func(t *testing.T) {
+		townRoot, rigName, sessionName, tm := newFixture(t)
+		writeZeroStallThresholds(t, townRoot)
+
+		runScan(t, townRoot, rigName, false)
+
+		kind, err := tm.ClassifyVisibleDialog(sessionName)
+		if err != nil {
+			t.Fatalf("ClassifyVisibleDialog: %v", err)
+		}
+		if kind != tmux.DialogNone {
+			t.Errorf("dialog still visible after `gt patrol scan` (no --dry-run): %q — this control proves the dry-run assertion above tests something real", kind)
+		}
+	})
+}
+
+// writeZeroStallThresholds writes operational config with zero stall/activity
+// thresholds so a freshly-created test session is immediately eligible for
+// stall classification instead of waiting out the 90s/60s production defaults.
+func writeZeroStallThresholds(t *testing.T, townRoot string) {
+	t.Helper()
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"operational":{"witness":{"startup_stall_threshold":"0s","startup_activity_grace":"0s"}}}`
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

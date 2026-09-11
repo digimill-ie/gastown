@@ -56,6 +56,22 @@ func TestClassifyStartupDialog(t *testing.T) {
 			want:    DialogNone, // prompt line after the marker means it's already resolved
 		},
 		{
+			// codex finding on gtn-k43 / hq-ooijo revision 2: an old dialog
+			// marker followed by a REAL composer that already has typed
+			// text in it must read as resolved. A composer with content
+			// does not end with its prompt character ("› review this" does
+			// not end in "›"), so a suffix-only prompt check misses it and
+			// would send the dialog's Down/Enter into that composer.
+			name:    "old bypass marker in scrollback, live composer with typed text below",
+			content: "Bypass Permissions mode\n2. Yes, I accept\n› review this",
+			want:    DialogNone,
+		},
+		{
+			name:    "old trust marker in scrollback, live empty codex composer below",
+			content: "Quick safety check - do you trust this folder?\n1. Yes, I trust this folder\n› ",
+			want:    DialogNone,
+		},
+		{
 			name:    "genuinely stalled session, no known dialog text",
 			content: "some unrelated hung output\nwith no dialog markers at all",
 			want:    DialogNone,
@@ -168,7 +184,10 @@ func TestGetWindowActivity_AdvancesOnOutput(t *testing.T) {
 		t.Fatalf("GetWindowActivity (second): %v", err)
 	}
 
-	if !second.After(first) && !second.Equal(first) {
+	// Strictly After, not Equal-or-After: an unchanged timestamp must FAIL
+	// this test, since the whole point is proving the field moves on real
+	// output (codex finding: the prior form accepted a stuck timestamp).
+	if !second.After(first) {
 		t.Errorf("window_activity did not advance after output: first=%v second=%v", first, second)
 	}
 }
@@ -289,6 +308,130 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	}
 	if kind != DialogWorkspaceTrust {
 		t.Errorf("kind = %q, want %q", kind, DialogWorkspaceTrust)
+	}
+
+	// Assert the EXACT key effect, not just the returned status: the trust
+	// dialog's own key is a single Enter, which the `read` in the fixture
+	// consumes, printing the marker. A return status alone cannot tell a
+	// correctly-dismissed dialog from one that merely stopped matching the
+	// classifier for an unrelated reason (codex finding on this file).
+	time.Sleep(200 * time.Millisecond)
+	after, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if !strings.Contains(after, "dialog-dismissed") {
+		t.Errorf("pane does not show the post-dismiss marker — Enter was not the key actually sent\npane: %q", after)
+	}
+}
+
+// TestDetectAndDismissKnownDialog_DismissesBypassDialog verifies the bypass
+// permissions dialog's exact key sequence (Down, then Enter) is sent — the
+// only case tested for classification alone until now (codex finding: "theme
+// and bypass have classifier cases only").
+func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-detect-bypass-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// A tiny menu: Down moves the selection to "2", Enter confirms it. The
+	// script prints which option was chosen so the test can verify BOTH
+	// keys were sent, not just that the dialog text went away.
+	script := `clear; printf '%s\n' 'Bypass Permissions mode'; printf '%s\n' '1. No'; printf '%s\n' '2. Yes, I accept'; ` +
+		`sel=1; while true; do read -rsn1 k; if [ "$k" = $'\x1b' ]; then read -rsn2 -t 0.1 rest; if [ "$rest" = '[B' ]; then sel=2; fi; ` +
+		`elif [ -z "$k" ]; then break; fi; done; clear; printf 'chosen=%s\n' "$sel"`
+	if err := tm.SendKeys(sessionName, script); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	kind, err := tm.DetectAndDismissKnownDialog(sessionName)
+	if err != nil {
+		t.Fatalf("DetectAndDismissKnownDialog: %v", err)
+	}
+	if kind != DialogBypassPermissions {
+		t.Errorf("kind = %q, want %q", kind, DialogBypassPermissions)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	after, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if !strings.Contains(after, "chosen=2") {
+		t.Errorf("pane does not show option 2 selected — Down then Enter was not sent as expected\npane: %q", after)
+	}
+}
+
+// TestDetectAndDismissKnownDialog_DismissesThemeDialog verifies the theme
+// picker's exact key sequence (a single Enter, default pre-highlighted) is
+// sent (codex finding: "theme and bypass have classifier cases only").
+func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-detect-theme-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'; "+
+		"printf '%s\\n' '1. Dark mode'; printf '%s\\n' '2. Light mode'; read -r _dlg; clear; echo theme-dismissed"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	kind, err := tm.DetectAndDismissKnownDialog(sessionName)
+	if err != nil {
+		t.Fatalf("DetectAndDismissKnownDialog: %v", err)
+	}
+	if kind != DialogThemePicker {
+		t.Errorf("kind = %q, want %q", kind, DialogThemePicker)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	after, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if !strings.Contains(after, "theme-dismissed") {
+		t.Errorf("pane does not show the post-dismiss marker — Enter was not sent as expected\npane: %q", after)
+	}
+}
+
+// TestDismissDialog_PersistsAfterInput covers the polarity codex found
+// missing: a dialog that is STILL showing after its dismiss keys are sent
+// (e.g. the agent process is wedged, or the wrong keys were sent) must be
+// reported as an error, not a false success. Removing DismissDialog's
+// post-send verification would leave this green (codex finding on this
+// file: "No test rejects a dialog that persists after input").
+func TestDismissDialog_PersistsAfterInput(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-dismiss-persists-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// Re-prints the SAME dialog text after every keystroke, so the trust
+	// dialog's Enter never actually clears it — simulating a stuck dialog.
+	loop := `while true; do clear; printf '%s\n' 'Quick safety check - do you trust this folder?'; read -rsn1 _; done`
+	if err := tm.SendKeys(sessionName, loop); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	err := tm.DismissDialog(sessionName, DialogWorkspaceTrust)
+	if err == nil {
+		t.Fatal("expected an error when the dialog is still visible after dismiss keys, got nil")
 	}
 }
 
