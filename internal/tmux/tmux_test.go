@@ -31,6 +31,29 @@ func newTestTmux(t *testing.T) *Tmux {
 	return NewTmux()
 }
 
+// setFakeClaudePrompt configures the session's shell prompt to render like
+// Claude Code's composer ("❯ ") so submitComposer's real verification can
+// classify a genuine cleared/turn-started state instead of probeUnknown.
+//
+// These delivery tests target a bare shell, not a real Claude Code TUI, so
+// without this the pane never has a line matching the ready prompt prefix
+// and verification is always indeterminate. Before the probeUnknown fix
+// (submit_verify.go, codex, changes-requested at 08964387/95f841e6
+// rework), that indeterminate state silently reported SUCCESS — exactly
+// the "absence of a check renders as a pass" class the review targets —
+// so these tests passed without verifying anything. Now that probeUnknown
+// is honestly unverified, the tests need a target that CAN be verified.
+func setFakeClaudePrompt(t *testing.T, tm *Tmux, sessionName string) {
+	t.Helper()
+	if _, err := tm.run("send-keys", "-t", sessionName, "-l", `PS1='❯ '`); err != nil {
+		t.Fatalf("setting fake prompt: %v", err)
+	}
+	if _, err := tm.run("send-keys", "-t", sessionName, "Enter"); err != nil {
+		t.Fatalf("submitting fake prompt: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+}
+
 func TestListSessionsNoServer(t *testing.T) {
 	tm := newTestTmux(t)
 	sessions, err := tm.ListSessions()
@@ -1887,6 +1910,7 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 
 	// Give shell a moment to initialize
 	time.Sleep(200 * time.Millisecond)
+	setFakeClaudePrompt(t, tm, sessionName)
 
 	// NudgeSession should succeed on a ready session
 	err := tm.NudgeSessionWithOpts(sessionName, "test message", NudgeOpts{})
@@ -1905,6 +1929,7 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 	defer func() { _ = tm.KillSession(sessionName) }()
 
 	time.Sleep(200 * time.Millisecond)
+	setFakeClaudePrompt(t, tm, sessionName)
 
 	paneID, err := tm.GetPaneID(sessionName)
 	if err != nil {
@@ -1940,6 +1965,11 @@ func TestNudgeSession_WakesAgentWindowNotActiveWindow(t *testing.T) {
 	defer func() { _ = tm.KillSession(sessionName) }()
 
 	time.Sleep(200 * time.Millisecond)
+	// Window 0 is the only (and active) window at this point, so targeting
+	// the bare session name reaches it — this must happen BEFORE the
+	// second window is opened below, since that makes window 1 active and
+	// a bare-session-name send-keys would then land on the wrong pane.
+	setFakeClaudePrompt(t, tm, sessionName)
 
 	// The agent pane is window 0's pane. Record it as the declared identity so
 	// FindAgentPane resolves the nudge target to it.
@@ -2126,6 +2156,10 @@ func TestNudgeSession_StalePaneIDFallsBackToFirstPane(t *testing.T) {
 	defer func() { _ = tm.KillSession(otherSession) }()
 
 	time.Sleep(200 * time.Millisecond)
+	// Window 0 is the only (and active) window at this point — set it up
+	// before the second window below makes window 1 active.
+	setFakeClaudePrompt(t, tm, sessionName)
+
 	otherPane, err := tm.GetPaneID(otherSession)
 	if err != nil {
 		t.Fatalf("GetPaneID other: %v", err)

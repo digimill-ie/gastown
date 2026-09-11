@@ -116,21 +116,29 @@ func TestWakeRigAgentsDoesNotNudgeRefinery(t *testing.T) {
 // channelevents.EmitToTown would write a REAL event into the live
 // refinery's channel — the same class of live-town pollution as hq-qyfok
 // (codex Medium, sling_helpers_test.go:112, changes-requested at
-// 08964387). Chdir into an isolated temp dir (no "mayor" marker anywhere up
-// its parent chain) so FindFromCwd finds nothing, regardless of where the
-// test binary itself happens to run from.
+// 08964387).
+//
+// A chdir alone is NOT enough: session.PrefixFor("nonexistent-rig") falls
+// back to session.DefaultPrefix ("gt" — gastown's OWN real prefix) for an
+// unregistered rig, so refinerySession resolves to a name that plausibly
+// collides with the REAL gastown refinery's session. Worse, tmux.NewTmux()
+// connects via tmux's process-global default socket
+// (tmux.GetDefaultSocket/SetDefaultSocket), which is NOT cwd-scoped: if any
+// EARLIER test in this package's process called session.InitRegistry
+// against a resolvable townRoot (real or otherwise), that call's
+// tmux.SetDefaultSocket permanently repoints the socket for the rest of
+// the test binary's process, regardless of what THIS test does with its
+// own cwd. So a plain chdir defeats only THIS test's own FindFromCwd call,
+// not a prior test's global pollution (codex, sling_helpers_test.go:136,
+// changes-requested at 08964387/95f841e6 rework — the "chdir does not
+// isolate tmux" finding). isolateTestTmuxAndWorkspace covers both: cwd,
+// AND an isolated GT_TMUX_SOCKET, AND restoring the global socket/registry
+// afterward so this test cannot pollute a later one either.
 func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 	// Ensure test log is NOT set so we exercise the real tmux path
 	t.Setenv("GT_TEST_NUDGE_LOG", "")
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(cwd) })
-	if err := os.Chdir(t.TempDir()); err != nil {
-		t.Fatalf("Chdir: %v", err)
-	}
+	isolateTestTmuxAndWorkspace(t)
 
 	// Should not panic even though no tmux session exists
 	nudgeRefinery("nonexistent-rig", "test message")

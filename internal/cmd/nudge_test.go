@@ -25,6 +25,56 @@ func setupNudgeTestRegistry(t *testing.T) {
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })
 }
 
+// isolateTestTmuxAndWorkspace protects a test that exercises runNudge (or
+// any path that can reach session.InitRegistry) from resolving to the REAL
+// live town. session.InitRegistry mutates two PROCESS-GLOBAL values: tmux's
+// default socket (tmux.SetDefaultSocket) and the session package's default
+// prefix registry — so even a test that itself sets GT_TEST_NUDGE_LOG
+// (which only gates deliverNudge's own tmux call, not runNudge's earlier
+// workspace.FindFromCwd()-driven DND/session.InitRegistry logic) can
+// corrupt those globals for every OTHER test that runs afterward in this
+// package's process, for the rest of the test binary's life. This package's
+// tests run from a worktree nested inside the actual live town
+// (gastown/polecats/<name>/gastown/internal/cmd), so an unisolated
+// FindFromCwd resolves the REAL town root, InitRegistry then points
+// tmux.defaultSocket at the REAL tmux socket, and BuildPrefixRegistryFromTown
+// can even write a "fallback copy" of the real rigs.json into the real town
+// root directory (registry.go's copyFileIfNewer) — measured causing a test
+// to nudge (attempt to type into) whatever session a later-resolved,
+// coincidentally-real session name happens to match (codex,
+// nudge_test.go:348/801/833, sling_helpers_test.go:136,
+// changes-requested at 08964387/95f841e6 rework).
+//
+// Isolates cwd (so workspace.Find finds nothing) AND GT_TMUX_SOCKET (so
+// even if InitRegistry does run against a resolvable root — e.g. via
+// GT_TOWN_ROOT/GT_ROOT env fallback, or a prior test's pollution — it
+// cannot point tmux at a real server), and restores the session default
+// registry and tmux default socket afterward so this test cannot pollute
+// any OTHER test in turn.
+func isolateTestTmuxAndWorkspace(t *testing.T) {
+	t.Helper()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	t.Setenv("GT_TMUX_SOCKET", fmt.Sprintf("gt-test-isolated-%d", time.Now().UnixNano()))
+	t.Setenv("GT_TOWN_ROOT", "")
+	t.Setenv("GT_ROOT", "")
+
+	origSocket := tmux.GetDefaultSocket()
+	origRegistry := session.DefaultRegistry()
+	t.Cleanup(func() {
+		tmux.SetDefaultSocket(origSocket)
+		session.SetDefaultRegistry(origRegistry)
+	})
+}
+
 func TestNudgeHelpUsesTownRootMessagingConfig(t *testing.T) {
 	const want = "<town-root>/config/messaging.json"
 
@@ -330,6 +380,8 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 		nudgeStdinFlag = origStdin
 		waitIdleTimeout = origTimeout
 	}()
+
+	isolateTestTmuxAndWorkspace(t)
 
 	// Route nudge transport to a log file so the test doesn't deliver "test"
 	// messages to live agents (mayor reported recurring synthetic nudges).
@@ -786,6 +838,8 @@ func TestNudgeTrailingSlashNormalization(t *testing.T) {
 		waitIdleTimeout = origTimeout
 	}()
 
+	isolateTestTmuxAndWorkspace(t)
+
 	// Route nudge transport to a log file so this test doesn't deliver to
 	// the real mayor/deacon/witness/refinery sessions on host.
 	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
@@ -820,6 +874,8 @@ func TestNudgeDogTargetRoutesToDogSession(t *testing.T) {
 		nudgeStdinFlag = origStdin
 		nudgeForceFlag = origForce
 	}()
+
+	isolateTestTmuxAndWorkspace(t)
 
 	logPath := filepath.Join(t.TempDir(), "nudge.log")
 	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
