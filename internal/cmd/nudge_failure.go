@@ -110,12 +110,28 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 	// dead-letter-immediately, retain-on-double-fault policy below.
 	unverified := errors.Is(deliverErr, tmux.ErrSubmitNotVerified) || errors.Is(deliverErr, errPriorAttemptUnresolved)
 
+	// errAttemptsExhausted and errPriorAttemptUnresolved are ROUTING
+	// sentinels, not real injection errors — partitionForInjection uses
+	// them to say "route this entry to dead-letter without attempting a
+	// live injection this cycle" (no deliverErr from an actual attempt
+	// exists for these entries THIS cycle). Recording the sentinel's
+	// generic text as LastError would destroy the real diagnostic error
+	// already on the entry from its last actual attempt (persisted across
+	// Requeue) — exactly what an operator inspecting a dead-letter entry
+	// needs (codex, nudge_failure.go:95, changes-requested at REVISION 3
+	// — Medium).
+	isRoutingSentinel := errors.Is(deliverErr, errAttemptsExhausted) || errors.Is(deliverErr, errPriorAttemptUnresolved)
+
 	var toRequeue []nudge.QueuedNudge
 	for _, n := range drained {
-		n.LastError = deliverErr.Error()
+		lastError := deliverErr.Error()
+		if isRoutingSentinel && n.LastError != "" {
+			lastError = n.LastError
+		}
+		n.LastError = lastError
 
 		if unverified || n.Attempts >= nudge.MaxInjectionAttempts {
-			dlPath, dlErr := nudge.DeadLetter(townRoot, sessionName, n, source, deliverErr.Error(), paneCapture, true)
+			dlPath, dlErr := nudge.DeadLetter(townRoot, sessionName, n, source, lastError, paneCapture, true)
 			if dlErr != nil {
 				if !unverified {
 					// Durability fallback for a bounded (verified-failed)

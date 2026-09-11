@@ -769,6 +769,35 @@ func TestPartitionForInjection_InFlightEntrySkipsInjection(t *testing.T) {
 	}
 }
 
+// TestHandleFailedInjection_ExhaustedRoutingPreservesRealLastError covers
+// the Medium finding at nudge_failure.go:95: errAttemptsExhausted (and
+// errPriorAttemptUnresolved) are ROUTING sentinels used when NO live
+// injection was attempted this cycle — overwriting the entry's LastError
+// with the sentinel's own generic text would destroy the real diagnostic
+// error recorded on a PRIOR cycle's actual attempt, which is exactly what
+// an operator inspecting a dead-letter entry needs.
+func TestHandleFailedInjection_ExhaustedRoutingPreservesRealLastError(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+	const realError = "tmux: session not found (from the actual failed attempt)"
+	drained := []nudge.QueuedNudge{
+		{ID: "exhausted-1", Sender: "test", Message: "must keep real error", Timestamp: time.Now(), Attempts: nudge.MaxInjectionAttempts, LastError: realError},
+	}
+
+	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, errAttemptsExhausted)
+
+	entries, err := nudge.ListDeadLetters(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ListDeadLetters got %d entries, want 1", len(entries))
+	}
+	if entries[0].LastError != realError {
+		t.Errorf("dead-lettered LastError = %q, want the preserved real error %q (not the errAttemptsExhausted routing sentinel's own text)", entries[0].LastError, realError)
+	}
+}
+
 // TestHandleFailedInjection_BoundedRetriesDeadLetterAfterMax covers the
 // "bounded" half for non-dirty errors: once Attempts reaches
 // nudge.MaxInjectionAttempts, the entry is dead-lettered instead of requeued

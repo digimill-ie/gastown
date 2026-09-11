@@ -14,20 +14,11 @@ import (
 // fakeComposerScript is a minimal Python program that renders a static
 // Claude-Code-like composer line ("❯ <needle>") and never clears it on its
 // own — simulating a stranded/dirty composer exactly as submitComposer
-// would see one over a real tmux capture-pane.
-//
-// tmux's "C-j" key and "Enter" key transmit DIFFERENT bytes — C-j is LF
-// (0x0A / "\n"), Enter is CR (0x0D / "\r") — but the prior version of this
-// script treated them identically (`ch in ("\n", "\r")`), clearing on
-// either with no distinguishing signal. That means this test could pass
-// even if recoverStrandedComposer's C-j send were removed entirely: the
-// composer would still clear from submitComposer's own leading
-// sendEnterVerified Enter, or the retype's trailing Enter (codex,
-// changes-requested at REVISION 3 — Medium: "StrandedComposerRecovered
-// passes without C-j"). This version keys on the byte itself: only LF
-// prints a "RECOVERED" marker line before the fresh empty prompt, so a
-// test can assert that marker actually appeared — proving a keystroke
-// shaped exactly like C-j, not an Enter, is what cleared the composer.
+// would see one over a real tmux capture-pane. It only clears (prints a
+// fresh, empty "❯ " prompt line) when it reads a newline byte from stdin —
+// i.e. when something sends it a real Enter or the C-j recovery keystroke —
+// so a test can deterministically choose whether "recovery" succeeds by
+// choosing whether to let this script see that byte.
 //
 // This exists because submitComposer's classification (submit_verify.go)
 // operates entirely on a real `tmux capture-pane` snapshot: testing it
@@ -45,14 +36,7 @@ while True:
     ch = sys.stdin.read(1)
     if not ch:
         break
-    if ch == "\n":
-        # tmux's "C-j" key transmits LF (0x0A) — the specific recovery
-        # keystroke. Mark it distinctly so a test can tell it apart from
-        # an ordinary Enter.
-        sys.stdout.write("\nRECOVERED\n❯ \n")
-        sys.stdout.flush()
-    elif ch == "\r":
-        # tmux's "Enter" key transmits CR (0x0D) — an ordinary submit.
+    if ch in ("\n", "\r"):
         sys.stdout.write("\n❯ \n")
         sys.stdout.flush()
 `
@@ -141,6 +125,20 @@ func TestSubmitComposer_DirtyStateHeldAfterEnter(t *testing.T) {
 // sitting there, un-dimmed) must be recoverable via the validated C-j path
 // — recoverStrandedComposer sends C-j, observes the composer clear, retypes
 // the message, and confirms it lands.
+//
+// KNOWN GAP (codex, changes-requested at REVISION 3 — Medium): this test
+// passes even with recoverStrandedComposer's C-j send removed entirely,
+// because submitComposer's own leading Enter (sendEnterVerified) also
+// clears fakeComposerScript's composer, and nothing here distinguishes
+// which keystroke did it. An attempted fix assumed tmux's "Enter" and
+// "C-j" keys transmit different bytes (CR vs LF) and tried to make the
+// fake composer key on that — but empirically (tmux send-keys Enter vs
+// send-keys C-j against a raw-mode stdin reader, verified standalone)
+// tmux sends the SAME byte (LF) for both in this environment, so no
+// stdin-byte-level distinction is possible here. Actually verifying C-j
+// specifically fired would need to intercept the tmux command itself, not
+// the fake composer's input. Left as the original, weaker assertion
+// rather than ship a distinguishing mechanism that doesn't work.
 func TestSubmitComposer_StrandedComposerRecovered(t *testing.T) {
 	tm := newTestTmux(t)
 	const needle = "resume the patrol"
@@ -154,20 +152,12 @@ func TestSubmitComposer_StrandedComposerRecovered(t *testing.T) {
 		t.Fatalf("submitComposer() = %v, want nil (recovered via C-j)", err)
 	}
 
+	// The fake composer must show the RETYPED needle after recovery
+	// cleared it and recoverStrandedComposer sent it again.
 	content, err := tm.CapturePane(sessionName, 10)
 	if err != nil {
 		t.Fatalf("CapturePane: %v", err)
 	}
-	// Prove recovery specifically used a C-j-shaped keystroke (a bare
-	// newline with nothing typed first), not the retype's own eventual
-	// Enter landing early — see fakeComposerScript's doc comment (codex,
-	// changes-requested at REVISION 3 — Medium: this test previously
-	// passed even when nothing recognizable as C-j was ever sent).
-	if !strings.Contains(content, "RECOVERED") {
-		t.Errorf("post-recovery pane = %q, want a RECOVERED marker proving a bare (C-j-shaped) keystroke cleared the composer", content)
-	}
-	// The fake composer must show the RETYPED needle after recovery
-	// cleared it and recoverStrandedComposer sent it again.
 	if !strings.Contains(content, needle) {
 		t.Errorf("post-recovery pane = %q, want it to contain retyped needle %q", content, needle)
 	}
