@@ -928,7 +928,7 @@ func TestDismissDialogGated_NotAuthorized_SendsNoKeys(t *testing.T) {
 	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg"); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	before, err := tm.CapturePane(sessionName, 30)
 	if err != nil {

@@ -3,7 +3,9 @@ package polecat
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -357,5 +359,380 @@ func TestReadSessionHeartbeat_V2AllStates(t *testing.T) {
 				t.Errorf("bead = %q, want %q", read.Bead, "gt-test-bead")
 			}
 		})
+	}
+}
+
+// The tests below cover the revision-3 startup-window gate (gtn-qp7 /
+// hq-ooijo): IsStartupWindowOpen, the startup-closed latch, and the
+// launcher-vs-agent Writer distinction. Pure-logic cases construct
+// heartbeat/latch files directly and never touch tmux; live-tmux cases are
+// suffixed accordingly and use their own isolated tmux socket.
+
+func TestReadSessionHeartbeatChecked_MissingVsMalformed(t *testing.T) {
+	townRoot := t.TempDir()
+
+	hb, malformed := ReadSessionHeartbeatChecked(townRoot, "nonexistent")
+	if hb != nil || malformed {
+		t.Errorf("missing file: got (%v, %v), want (nil, false)", hb, malformed)
+	}
+
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "corrupt.json"), []byte("{not valid json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	hb, malformed = ReadSessionHeartbeatChecked(townRoot, "corrupt")
+	if hb != nil || !malformed {
+		t.Errorf("malformed file: got (%v, %v), want (nil, true)", hb, malformed)
+	}
+}
+
+func TestIsStartupWindowOpen_NoFiles_Open(t *testing.T) {
+	townRoot := t.TempDir()
+	status := IsStartupWindowOpen(townRoot, "gt-test-fresh", "$1", 1000)
+	if !status.Open {
+		t.Errorf("Open = false (%s), want true — a session with no heartbeat or latch is the ordinary fresh-startup case", status.Reason)
+	}
+}
+
+func TestIsStartupWindowOpen_UnresolvableCurrentIdentity_Closed(t *testing.T) {
+	townRoot := t.TempDir()
+	tests := []struct {
+		name      string
+		sessionID string
+		created   int64
+	}{
+		{"empty session id", "", 1000},
+		{"zero created", "$1", 0},
+		{"both unresolvable", "", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := IsStartupWindowOpen(townRoot, "gt-test-unresolvable", tt.sessionID, tt.created)
+			if status.Open {
+				t.Error("Open = true, want false — an unresolvable current incarnation must refuse to authorize")
+			}
+		})
+	}
+}
+
+func writeTestLatch(t *testing.T, townRoot, sessionName, sessionID string, created int64) {
+	t.Helper()
+	dir := filepath.Join(townRoot, ".runtime", "startup-latches")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(StartupLatch{SessionID: sessionID, Created: created})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsStartupWindowOpen_LatchMatchesCurrent_Closed(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestLatch(t, townRoot, "gt-test-latched", "$3", 5000)
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-latched", "$3", 5000)
+	if status.Open {
+		t.Error("Open = true, want false — a latch matching the current incarnation must close the window")
+	}
+}
+
+func TestIsStartupWindowOpen_LatchDifferentIncarnation_Open(t *testing.T) {
+	townRoot := t.TempDir()
+	// Latch belongs to an OLDER incarnation of this session name (name
+	// reuse): different session id, same created second is the exact
+	// merge risk named on hq-ooijo revision 3 ("a name reused within one
+	// second inherits the previous incarnation's closed window").
+	writeTestLatch(t, townRoot, "gt-test-reused", "$3", 5000)
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-reused", "$4", 5000)
+	if !status.Open {
+		t.Errorf("Open = false (%s), want true — a latch from a different session id must not close the NEW incarnation's window", status.Reason)
+	}
+}
+
+func TestIsStartupWindowOpen_LatchMalformed_ClosedFailSafe(t *testing.T) {
+	townRoot := t.TempDir()
+	dir := filepath.Join(townRoot, ".runtime", "startup-latches")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gt-test-badlatch.json"), []byte("{not valid json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-badlatch", "$3", 5000)
+	if status.Open {
+		t.Error("Open = true, want false — a malformed latch file must refuse to authorize, not default to open")
+	}
+}
+
+func writeTestHeartbeatForWindow(t *testing.T, townRoot, sessionName, sessionID string, created int64, writer HeartbeatWriter) {
+	t.Helper()
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	hb := SessionHeartbeat{
+		Timestamp:   time.Now().UTC(),
+		State:       HeartbeatWorking,
+		Incarnation: created,
+		SessionID:   sessionID,
+		Writer:      writer,
+	}
+	data, err := json.Marshal(hb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsStartupWindowOpen_AgentHeartbeatMatchesCurrent_Closed(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestHeartbeatForWindow(t, townRoot, "gt-test-agent-hb", "$3", 5000, HeartbeatWriterAgent)
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-agent-hb", "$3", 5000)
+	if status.Open {
+		t.Error("Open = true, want false — an agent-written heartbeat for this incarnation must close the window")
+	}
+}
+
+// TestIsStartupWindowOpen_LauncherHeartbeatMatchesCurrent_Open covers item 3
+// (gtn-qp7 / hq-ooijo revision 3): a launcher-written heartbeat — even one
+// matching the current incarnation exactly — must NOT close the window.
+// AcceptStartupDialogs and WaitForRuntimeReady are both non-fatal, so this
+// is exactly what a session parked on a genuine, still-unhandled startup
+// dialog looks like; trusting it would strand that dialog forever.
+func TestIsStartupWindowOpen_LauncherHeartbeatMatchesCurrent_Open(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestHeartbeatForWindow(t, townRoot, "gt-test-launcher-hb", "$3", 5000, HeartbeatWriterLauncher)
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-launcher-hb", "$3", 5000)
+	if !status.Open {
+		t.Errorf("Open = false (%s), want true — a launcher heartbeat must never close the startup window", status.Reason)
+	}
+}
+
+// TestIsStartupWindowOpen_LegacyHeartbeatNoWriter_Open covers a pre-v2.2
+// heartbeat file with no Writer field at all (Writer == ""): must be
+// treated the same as a launcher write — never proof the agent has run.
+func TestIsStartupWindowOpen_LegacyHeartbeatNoWriter_Open(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestHeartbeatForWindow(t, townRoot, "gt-test-legacy-hb", "$3", 5000, "")
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-legacy-hb", "$3", 5000)
+	if !status.Open {
+		t.Errorf("Open = false (%s), want true — a legacy heartbeat with no Writer field must not close the window", status.Reason)
+	}
+}
+
+// TestIsStartupWindowOpen_AgentHeartbeatDifferentIncarnation_Open is the
+// same-second session-replacement case (gtn-qp7 / hq-ooijo revision 3, item
+// 1 and its dedicated test): an agent heartbeat closed the OLD incarnation's
+// window (same created second, different session id). The new incarnation's
+// window must still read open.
+func TestIsStartupWindowOpen_AgentHeartbeatDifferentIncarnation_Open(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestHeartbeatForWindow(t, townRoot, "gt-test-replaced", "$3", 5000, HeartbeatWriterAgent)
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-replaced", "$4", 5000)
+	if !status.Open {
+		t.Errorf("Open = false (%s), want true — an agent heartbeat from a DIFFERENT session id (same-second replacement) must not close the new incarnation's window", status.Reason)
+	}
+}
+
+func TestIsStartupWindowOpen_HeartbeatMalformed_ClosedFailSafe(t *testing.T) {
+	townRoot := t.TempDir()
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gt-test-badhb.json"), []byte("{not valid json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-badhb", "$3", 5000)
+	if status.Open {
+		t.Error("Open = true, want false — a malformed heartbeat file must refuse to authorize, not default to open")
+	}
+}
+
+// TestIsStartupWindowOpen_AgentHeartbeatUnknownIdentity_ClosedFailSafe
+// covers a well-formed but identity-incomplete agent heartbeat (Writer=agent
+// but SessionID empty or Incarnation zero — e.g. a write-time tmux query
+// partially failed): "unknown or corrupt identity means refuse to send"
+// (revision 3, item 2).
+func TestIsStartupWindowOpen_AgentHeartbeatUnknownIdentity_ClosedFailSafe(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestHeartbeatForWindow(t, townRoot, "gt-test-unknown-identity", "", 5000, HeartbeatWriterAgent)
+
+	status := IsStartupWindowOpen(townRoot, "gt-test-unknown-identity", "$3", 5000)
+	if status.Open {
+		t.Error("Open = true, want false — an agent heartbeat with unknown identity must refuse to authorize")
+	}
+}
+
+// requireLiveTmuxForHeartbeat returns an isolated Tmux + socket for a live
+// startup-window test. The socket name is short and counter-based, not
+// derived from t.Name(): the full test name plus the town's /private/tmp
+// prefix overruns sockaddr_un's ~104-byte path limit ("File name too long"
+// from tmux itself, measured directly), which is unrelated to anything this
+// PR changes and must not be worked around by naming tests less clearly.
+func requireLiveTmuxForHeartbeat(t *testing.T) (tm *tmux.Tmux, socket string) {
+	t.Helper()
+	requireTmux(t)
+	socket = fmt.Sprintf("gt-test-hb-%d", testSessionCounter.Add(1))
+	tm = tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socket, "kill-server").Run() })
+	return tm, socket
+}
+
+// TestCloseStartupWindow_ClosesForLiveIncarnation is the live-tmux
+// end-to-end check that CloseStartupWindow's write is readable by
+// IsStartupWindowOpen using the SAME identity a real caller would resolve
+// (GetSessionID + GetSessionCreatedUnix), not a hand-picked one.
+func TestCloseStartupWindow_ClosesForLiveIncarnation(t *testing.T) {
+	tm, socket := requireLiveTmuxForHeartbeat(t)
+	townRoot := t.TempDir()
+	sessionName := "gt-test-close-window"
+
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// currentSessionIdentity resolves via tmux.NewTmux() (the process-wide
+	// default socket), so point it at this test's isolated socket for the
+	// duration of the call.
+	old := tmux.GetDefaultSocket()
+	tmux.SetDefaultSocket(socket)
+	defer tmux.SetDefaultSocket(old)
+
+	sessionID, err := tm.GetSessionID(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionID: %v", err)
+	}
+	created, err := tm.GetSessionCreatedUnix(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionCreatedUnix: %v", err)
+	}
+
+	if status := IsStartupWindowOpen(townRoot, sessionName, sessionID, created); !status.Open {
+		t.Fatalf("window unexpectedly closed before CloseStartupWindow: %s", status.Reason)
+	}
+
+	CloseStartupWindow(townRoot, sessionName)
+
+	status := IsStartupWindowOpen(townRoot, sessionName, sessionID, created)
+	if status.Open {
+		t.Error("Open = true, want false after CloseStartupWindow for this exact incarnation")
+	}
+}
+
+// TestTouchSessionHeartbeatWithState_ClosesStartupWindow_Live covers the
+// real call path: every agent-written heartbeat (persistentPreRun, `gt
+// done`, `gt heartbeat`) closes its own incarnation's startup window as a
+// side effect.
+func TestTouchSessionHeartbeatWithState_ClosesStartupWindow_Live(t *testing.T) {
+	tm, socket := requireLiveTmuxForHeartbeat(t)
+	townRoot := t.TempDir()
+	sessionName := "gt-test-touch-closes"
+
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	old := tmux.GetDefaultSocket()
+	tmux.SetDefaultSocket(socket)
+	defer tmux.SetDefaultSocket(old)
+
+	TouchSessionHeartbeatWithState(townRoot, sessionName, HeartbeatWorking, "", "")
+
+	hb := ReadSessionHeartbeat(townRoot, sessionName)
+	if hb == nil {
+		t.Fatal("expected non-nil heartbeat")
+	}
+	if hb.Writer != HeartbeatWriterAgent {
+		t.Errorf("Writer = %q, want %q", hb.Writer, HeartbeatWriterAgent)
+	}
+	if hb.SessionID == "" {
+		t.Error("expected non-empty SessionID on a live-tmux write")
+	}
+
+	sessionID, err := tm.GetSessionID(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionID: %v", err)
+	}
+	created, err := tm.GetSessionCreatedUnix(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionCreatedUnix: %v", err)
+	}
+	if status := IsStartupWindowOpen(townRoot, sessionName, sessionID, created); status.Open {
+		t.Error("Open = true, want false — TouchSessionHeartbeatWithState must close the startup window")
+	}
+}
+
+// TestTouchLauncherStartupHeartbeat_DoesNotCloseStartupWindow_Live is the
+// sibling case: the launcher's own placeholder write leaves the window
+// open (item 3).
+func TestTouchLauncherStartupHeartbeat_DoesNotCloseStartupWindow_Live(t *testing.T) {
+	tm, socket := requireLiveTmuxForHeartbeat(t)
+	townRoot := t.TempDir()
+	sessionName := "gt-test-touch-launcher"
+
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	old := tmux.GetDefaultSocket()
+	tmux.SetDefaultSocket(socket)
+	defer tmux.SetDefaultSocket(old)
+
+	TouchLauncherStartupHeartbeat(townRoot, sessionName)
+
+	hb := ReadSessionHeartbeat(townRoot, sessionName)
+	if hb == nil {
+		t.Fatal("expected non-nil heartbeat")
+	}
+	if hb.Writer != HeartbeatWriterLauncher {
+		t.Errorf("Writer = %q, want %q", hb.Writer, HeartbeatWriterLauncher)
+	}
+
+	sessionID, err := tm.GetSessionID(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionID: %v", err)
+	}
+	created, err := tm.GetSessionCreatedUnix(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionCreatedUnix: %v", err)
+	}
+	if status := IsStartupWindowOpen(townRoot, sessionName, sessionID, created); !status.Open {
+		t.Errorf("Open = false (%s), want true — TouchLauncherStartupHeartbeat must never close the startup window", status.Reason)
+	}
+}
+
+func TestRemoveSessionHeartbeat_AlsoRemovesStartupLatch(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-remove-latch"
+	writeTestLatch(t, townRoot, sessionName, "$3", 5000)
+
+	if latch, malformed := readStartupLatchChecked(townRoot, sessionName); latch == nil || malformed {
+		t.Fatal("expected latch to exist before removal")
+	}
+
+	RemoveSessionHeartbeat(townRoot, sessionName)
+
+	if latch, malformed := readStartupLatchChecked(townRoot, sessionName); latch != nil || malformed {
+		t.Errorf("expected latch to be gone after RemoveSessionHeartbeat, got (%v, %v)", latch, malformed)
 	}
 }

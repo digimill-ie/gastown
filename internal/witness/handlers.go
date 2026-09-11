@@ -2320,16 +2320,21 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 			continue // Dead agent — zombie detection handles this
 		}
 
-		// Session created time is fetched FIRST: it is needed both to bind
-		// heartbeat trust to this specific session incarnation (below) and
-		// to compute session age. session_created is stable regardless of
-		// attach state, unlike session_activity below.
+		// Session created time and session id are fetched FIRST: together
+		// they identify THIS session incarnation, needed both to bind
+		// heartbeat trust (below) and to gate dismiss authorization later
+		// (IsStartupWindowOpen) — and to compute session age.
+		// session_created is stable regardless of attach state, unlike
+		// session_activity below. sessionID is best-effort: a query failure
+		// leaves it empty, which every match against it below correctly
+		// treats as a non-match rather than a wildcard.
 		createdUnix, err := t.GetSessionCreatedUnix(sessionName)
 		if err != nil {
 			result.Errors = append(result.Errors,
 				fmt.Errorf("getting session created time for %s: %w", sessionName, err))
 			continue
 		}
+		sessionID, _ := t.GetSessionID(sessionName)
 
 		// Heartbeat v2 check (gt-3vr5): if the agent has a fresh heartbeat,
 		// it's alive and making progress — skip stall detection entirely.
@@ -2342,15 +2347,18 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 		// missing heartbeat file reads as hb == nil and falls through to the
 		// content-based checks below, same as before.
 		//
-		// MatchesIncarnation binds trust to THIS session's current
-		// session_created: a tmux session name can be reused (old session
-		// dies, a new one is created with the same name), and a stale
-		// "working" heartbeat left by the dead incarnation must never
+		// MatchesFullIncarnation binds trust to THIS session's current
+		// session_created AND session_id: a tmux session name can be reused
+		// (old session dies, a new one is created with the same name), and a
+		// stale "working" heartbeat left by the dead incarnation must never
 		// suppress recovery for the new one — the merge risk named on
-		// hq-ooijo revision 2. A heartbeat that fails the incarnation check
-		// falls through to the content/activity checks below exactly like a
-		// missing heartbeat.
-		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() && hb.MatchesIncarnation(createdUnix) {
+		// hq-ooijo revision 2, sharpened in revision 3 (gtn-qp7): matching on
+		// session_created alone lets a same-second replacement (identical
+		// name, identical created timestamp, different session id) inherit
+		// the dead incarnation's trust. A heartbeat that fails the
+		// incarnation check falls through to the content/activity checks
+		// below exactly like a missing heartbeat.
+		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() && hb.MatchesFullIncarnation(sessionID, createdUnix) {
 			if time.Since(hb.Timestamp) < polecat.SessionHeartbeatStaleThreshold {
 				continue // Fresh v2 heartbeat — agent is alive, not stalled
 			}
@@ -2422,10 +2430,9 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 		// heartbeat. This is checked BEFORE dialog content decides
 		// anything: text classification alone no longer authorises a
 		// send, it only picks which known dialog is present once the
-		// window has already authorised acting. sessionID is best-effort
-		// (empty on a query failure); IsStartupWindowOpen treats that the
-		// same as any other unresolvable identity and refuses to open.
-		sessionID, _ := t.GetSessionID(sessionName)
+		// window has already authorised acting. sessionID was resolved
+		// above (best-effort; IsStartupWindowOpen treats an empty value the
+		// same as any other unresolvable identity and refuses to open).
 		windowStatus := polecat.IsStartupWindowOpen(townRoot, sessionName, sessionID, createdUnix)
 		authorized := func() bool {
 			return polecat.IsStartupWindowOpen(townRoot, sessionName, sessionID, createdUnix).Open

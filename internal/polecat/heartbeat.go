@@ -116,6 +116,19 @@ func (h *SessionHeartbeat) MatchesIncarnation(currentSessionCreated int64) bool 
 	return h.Incarnation != 0 && currentSessionCreated != 0 && h.Incarnation == currentSessionCreated
 }
 
+// MatchesFullIncarnation is MatchesIncarnation strengthened with SessionID
+// (tmux's own never-reused #{session_id}): created-timestamp matching alone
+// cannot distinguish a session from a same-second REPLACEMENT of the
+// identical name (gtn-qp7 / hq-ooijo revision 3, item 1 — the merge risk
+// codex named against MatchesIncarnation's single-field binding: "a name
+// reused within one second inherits the previous incarnation's closed
+// window"). An unknown SessionID on either side (a pre-v2.2 heartbeat, or a
+// write-time lookup failure) is a mismatch, never a wildcard.
+func (h *SessionHeartbeat) MatchesFullIncarnation(currentSessionID string, currentSessionCreated int64) bool {
+	return h.SessionID != "" && currentSessionID != "" && h.SessionID == currentSessionID &&
+		h.MatchesIncarnation(currentSessionCreated)
+}
+
 // heartbeatsDir returns the directory for polecat session heartbeat files.
 // Heartbeats live under <townRoot>/.runtime/heartbeats/, parallel to .runtime/pids/.
 func heartbeatsDir(townRoot string) string {
