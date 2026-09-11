@@ -130,7 +130,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-				requeueDrainedNudges(townRoot, sessionName, "nudge-poller", drained)
+				deadLetterDrainedNudges(t, townRoot, sessionName, drained, err)
 			}
 		}
 	}
@@ -138,4 +138,27 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
 	return hasPromptDetection && waitErr != nil
+}
+
+// deadLetterDrainedNudges is the poller's injection error path: an entry
+// that failed tmux delivery is never retyped, so it cannot duplicate
+// content or loop forever. It is (a) logged to the session's durable
+// injection-error log with a pane capture, then (b) written once to the
+// dead-letter store for later inspection and manual replay
+// (`gt nudge dead-letter list/replay`). There is no requeue and no retry: a
+// crash between the failed injection and this write still loses the
+// message, exactly as at base (hq-g52db).
+func deadLetterDrainedNudges(t *tmux.Tmux, townRoot, sessionName string, drained []nudge.QueuedNudge, deliverErr error) {
+	const source = "nudge-poller"
+
+	paneCapture, _ := t.CapturePane(sessionName, 25)
+	if err := nudge.LogInjectionError(townRoot, sessionName, source, deliverErr, paneCapture); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: injection-error log for %s failed: %v\n", source, sessionName, err)
+	}
+
+	for _, n := range drained {
+		if _, err := nudge.DeadLetter(townRoot, sessionName, n, source, deliverErr.Error()); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: dead-letter write for %s failed, message lost: %v\n", source, sessionName, err)
+		}
+	}
 }
