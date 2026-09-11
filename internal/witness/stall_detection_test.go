@@ -345,15 +345,19 @@ func TestDetectStalledPolecats_RecentWindowActivity_ZeroKeys(t *testing.T) {
 // window_activity but — per hq-wisp-y46vn — not session_activity on a
 // detached session. Only a check actually keyed on window_activity passes.
 func TestDetectStalledPolecats_StaleSessionActivity_RecentWindowActivity_ZeroKeys(t *testing.T) {
-	f := newStallTestFixture(t, "0s", "700ms")
+	// tmux's activity timestamps are second-granularity, so the margins here
+	// are generous: 3.5s past a 3s grace makes session_activity clearly
+	// stale, then a fresh 1.5s window_activity reading is still clearly
+	// inside the 3s grace, with over a full second of headroom either side.
+	f := newStallTestFixture(t, "0s", "3s")
 
-	time.Sleep(900 * time.Millisecond) // past the 700ms grace: session_activity now stale
+	time.Sleep(3500 * time.Millisecond) // past the 3s grace: session_activity now stale
 
 	sessionActivityBefore, err := f.tm.GetSessionActivity(f.sessionName)
 	if err != nil {
 		t.Fatalf("GetSessionActivity: %v", err)
 	}
-	if time.Since(sessionActivityBefore) < 700*time.Millisecond {
+	if time.Since(sessionActivityBefore) < 3*time.Second {
 		t.Fatalf("fixture invalid: session_activity is not yet stale (%v old)", time.Since(sessionActivityBefore))
 	}
 
@@ -362,7 +366,7 @@ func TestDetectStalledPolecats_StaleSessionActivity_RecentWindowActivity_ZeroKey
 	if err := f.tm.SendKeys(f.sessionName, "echo fresh-output"); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 
 	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
 	if len(result.Stalled) != 0 {

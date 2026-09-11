@@ -1,6 +1,9 @@
 package tmux
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -339,13 +342,15 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// A tiny menu: Down moves the selection to "2", Enter confirms it. The
-	// script prints which option was chosen so the test can verify BOTH
-	// keys were sent, not just that the dialog text went away.
-	script := `clear; printf '%s\n' 'Bypass Permissions mode'; printf '%s\n' '1. No'; printf '%s\n' '2. Yes, I accept'; ` +
-		`sel=1; while true; do read -rsn1 k; if [ "$k" = $'\x1b' ]; then read -rsn2 -t 0.1 rest; if [ "$rest" = '[B' ]; then sel=2; fi; ` +
-		`elif [ -z "$k" ]; then break; fi; done; clear; printf 'chosen=%s\n' "$sel"`
-	if err := tm.SendKeys(sessionName, script); err != nil {
+	// Reads one full LINE (canonical mode): tmux's "Down" sends the raw
+	// ESC-[-B escape sequence, which the tty driver does not interpret as a
+	// control character — it lands as literal bytes in the line, terminated
+	// by the Enter that follows. `cat -v` renders the ESC byte visibly
+	// (^[) so the test can assert BOTH keys were sent, in order, not just
+	// that the dialog text disappeared.
+	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Bypass Permissions mode'; "+
+		"printf '%s\\n' '1. No'; printf '%s\\n' '2. Yes, I accept'; "+
+		"IFS= read -r _line; clear; printf '%s' \"$_line\" | cat -v; printf ':end\\n'"); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -363,8 +368,8 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CapturePane (after): %v", err)
 	}
-	if !strings.Contains(after, "chosen=2") {
-		t.Errorf("pane does not show option 2 selected — Down then Enter was not sent as expected\npane: %q", after)
+	if !strings.Contains(after, "^[[B:end") {
+		t.Errorf("pane does not show the Down escape sequence before Enter — Down then Enter was not sent as expected\npane: %q", after)
 	}
 }
 
@@ -432,6 +437,64 @@ func TestDismissDialog_PersistsAfterInput(t *testing.T) {
 	err := tm.DismissDialog(sessionName, DialogWorkspaceTrust)
 	if err == nil {
 		t.Fatal("expected an error when the dialog is still visible after dismiss keys, got nil")
+	}
+}
+
+// TestDismissDialog_BypassDialogClearedBetweenDownAndEnter covers the
+// revalidation added between Down and Enter for the bypass dialog: if the
+// dialog disappears in that gap (another actor, or a race), DismissDialog
+// must refuse to send Enter into whatever now has focus rather than send it
+// blind (codex finding: "the bypass Enter goes out after an unvalidated
+// 200ms gap").
+func TestDismissDialog_BypassDialogClearedBetweenDownAndEnter(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-dismiss-bypass-race-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// A real script file (bash, not whatever the interactive login shell's
+	// `read` flags happen to be) so the Down keypress is consumed
+	// deterministically: the FIRST byte of Down's escape sequence triggers
+	// an immediate switch to an unrelated screen ending in a real prompt
+	// line (so classifyStartupDialog reads the old dialog marker, now in
+	// scrollback, as resolved — same rule as "prompt appears after it"),
+	// with a composer waiting below it. If Enter is sent blind (the
+	// regression this guards), the composer's empty line is submitted and
+	// the marker FILE below is created; a correctly revalidating
+	// DismissDialog never lets that happen. Verifying via a file — not
+	// screen-scraped pane text — avoids matching this script's own echoed
+	// source line for a marker string.
+	marker := filepath.Join(t.TempDir(), "enter-reached")
+	script := "#!/bin/bash\n" +
+		"clear; printf '%s\\n' 'Bypass Permissions mode'; printf '%s\\n' '1. No'; printf '%s\\n' '2. Yes, I accept'\n" +
+		"IFS= read -rsn1 _c\n" +
+		"IFS= read -rsn2 -t 0.2 _rest\n" +
+		"clear; printf '%s\\n' 'unrelated screen, dialog already gone'; printf '%s' '$ '\n" +
+		"IFS= read -r _cmd\n" +
+		"touch " + marker + "\n"
+	scriptPath := filepath.Join(t.TempDir(), "race.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := tm.SendKeys(sessionName, "clear; bash "+scriptPath); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	err := tm.DismissDialog(sessionName, DialogBypassPermissions)
+	if err == nil {
+		t.Fatal("expected an error when the dialog disappears between Down and Enter, got nil")
+	}
+
+	// Confirm no stray Enter reached the unrelated composer — a blind send
+	// would have submitted its empty buffer and created the marker file.
+	time.Sleep(300 * time.Millisecond)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("marker file exists — a stray Enter reached the composer that replaced the dialog")
 	}
 }
 
