@@ -1772,21 +1772,6 @@ func isTmuxIndex(value string) bool {
 	return err == nil && n >= 0
 }
 
-// ResolveAgentTarget returns the tmux target for the pane actually running
-// the agent in session — the same resolution NudgeSessionWithOpts uses to
-// choose where to type. Callers that capture pane content for diagnostics
-// (e.g. a failed-injection log) should use this instead of the bare session
-// name, which captures whatever pane happens to be focused in a multi-pane
-// session rather than the pane a delivery attempt actually targeted.
-// Falls back to the session's first pane if no agent pane can be found.
-func (t *Tmux) ResolveAgentTarget(session string) string {
-	target := session + ":0.0"
-	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
-		target = t.canonicalPaneTarget(session, agentPane)
-	}
-	return target
-}
-
 // NudgeSessionWithOpts is like NudgeSession but accepts delivery options.
 // See NudgeOpts for available options.
 func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) error {

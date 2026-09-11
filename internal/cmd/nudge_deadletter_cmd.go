@@ -18,9 +18,8 @@ func init() {
 var nudgeDeadLetterCmd = &cobra.Command{
 	Use:   "dead-letter",
 	Short: "Inspect and replay nudges that failed delivery",
-	Long: `A nudge is dead-lettered instead of being retyped forever when delivery
-fails in a way that automatic retry cannot fix (a known-dirty composer) or
-after retrying once (any other injection error). See hq-g52db.
+	Long: `A nudge is dead-lettered, not retried, when tmux injection fails. See
+hq-g52db.
 
 Dead-lettered entries are never delivered automatically — use "replay" to
 put one back in the active queue after fixing whatever caused delivery to
@@ -64,12 +63,8 @@ func runNudgeDeadLetterList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s %s\n", style.Bold.Render("ID:"), e.ID)
 		fmt.Printf("  Dead-lettered: %s (source: %s)\n", e.DeadLetteredAt.Format("2006-01-02T15:04:05Z07:00"), e.Source)
 		fmt.Printf("  Sender:  %s\n", e.Sender)
-		fmt.Printf("  Attempts: %d, uncertain delivery: %v\n", e.Attempts, e.UncertainDelivery)
-		fmt.Printf("  Last error: %s\n", e.LastError)
+		fmt.Printf("  Error:   %s\n", e.Error)
 		fmt.Printf("  Message: %s\n", e.Message)
-		if e.PaneCapture != "" {
-			fmt.Printf("  Pane capture at failure:\n%s\n", indentLines(e.PaneCapture, "    "))
-		}
 		fmt.Println()
 	}
 	fmt.Printf("Replay one: gt nudge dead-letter replay %s <id>\n", sessionName)
@@ -91,16 +86,4 @@ func runNudgeDeadLetterReplay(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("%s Replayed %s for %s — re-enqueued for delivery\n", style.Bold.Render("✓"), id, sessionName)
 	return nil
-}
-
-// indentLines prefixes every line of s with indent, for nested display.
-func indentLines(s, indent string) string {
-	out := indent
-	for _, r := range s {
-		out += string(r)
-		if r == '\n' {
-			out += indent
-		}
-	}
-	return out
 }

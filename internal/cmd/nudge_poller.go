@@ -104,15 +104,8 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				return nil // session gone, exit
 			}
 
-			// Check if there is anything at all in the queue — a fresh
-			// entry, or a leftover .claimed file from a crashed drainer.
-			// Pending alone (counts .json only) would never trigger the
-			// DrainClaims call below when the queue holds only .claimed
-			// files, so the orphan sweep inside DrainClaims (the only thing
-			// that restores a stale claim) would never run (codex,
-			// nudge_poller.go:111, changes-requested at 08964387/95f841e6
-			// rework).
-			if has, _ := nudge.PendingOrClaimed(townRoot, sessionName); !has {
+			// Check if there are queued nudges.
+			if n, _ := nudge.Pending(townRoot, sessionName); n == 0 {
 				continue
 			}
 
@@ -124,65 +117,48 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			// Drain via claims, not Drain: the claim files stay on disk
-			// until explicitly acked below, so a crash between draining and
-			// the dead-letter/requeue write leaves the entry recoverable
-			// instead of lost (nudge.DrainClaims, hq-g52db rework).
-			claims, err := nudge.DrainClaims(townRoot, sessionName)
+			// Drain and inject.
+			drained, err := nudge.Drain(townRoot, sessionName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: drain error for %s: %v\n", sessionName, err)
 				continue
 			}
-			if len(claims) == 0 {
+			if len(drained) == 0 {
 				continue // someone else drained it
 			}
 
-			// Entries that already exhausted MaxInjectionAttempts on a prior
-			// cycle (reached only via the dead-letter-write durability
-			// fallback), or whose prior attempt never reported an outcome
-			// at all (InFlight, restored by the orphan sweep after a
-			// crash), must not be retyped again — route them straight to
-			// another dead-letter attempt.
-			toInject, exhausted, staleInFlight := partitionForInjection(claims)
-			var unresolved []nudge.QueuedNudge
-			if len(exhausted) > 0 {
-				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(exhausted), errAttemptsExhausted)...)
+			formatted := nudge.FormatForInjection(drained)
+			if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
+				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
+				deadLetterDrainedNudges(t, townRoot, sessionName, drained, err)
 			}
-			if len(staleInFlight) > 0 {
-				unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(staleInFlight), errPriorAttemptUnresolved)...)
-			}
-			if len(toInject) > 0 {
-				// Persist the incremented Attempts count to each claim
-				// BEFORE the batch injection attempt — see Claim.MarkAttempt
-				// — so a crash mid-injection leaves the correct count
-				// behind instead of a stale, pre-attempt one. A claim whose
-				// persist itself fails is excluded from injection this
-				// cycle (see markAttempts) and left un-acked.
-				marked, failedPersist := markAttempts(sourceNudgePoller, sessionName, toInject)
-				if len(failedPersist) > 0 {
-					unresolved = append(unresolved, claimNudges(failedPersist)...)
-				}
-				if len(marked) > 0 {
-					formatted := nudge.FormatForInjection(claimNudges(marked))
-					if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
-						fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-						unresolved = append(unresolved, handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(marked), err)...)
-					}
-				}
-			}
-
-			// Ack every RESOLVED claim only now: handleFailedInjection has
-			// already durably dead-lettered or requeued each entry (or, for
-			// the documented double-fault, dropped it with a loud log), so
-			// the original claim is redundant for those. An entry in
-			// unresolved did NOT durably land anywhere (its requeue write
-			// itself failed) — its claim is left un-acked so the orphan
-			// sweep can recover it instead of losing it here.
-			ackClaims(sourceNudgePoller, sessionName, claims, unresolved)
 		}
 	}
 }
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
 	return hasPromptDetection && waitErr != nil
+}
+
+// deadLetterDrainedNudges is the poller's injection error path: an entry
+// that failed tmux delivery is never retyped, so it cannot duplicate
+// content or loop forever. It is (a) logged to the session's durable
+// injection-error log with a pane capture, then (b) written once to the
+// dead-letter store for later inspection and manual replay
+// (`gt nudge dead-letter list/replay`). There is no requeue and no retry: a
+// crash between the failed injection and this write still loses the
+// message, exactly as at base (hq-g52db).
+func deadLetterDrainedNudges(t *tmux.Tmux, townRoot, sessionName string, drained []nudge.QueuedNudge, deliverErr error) {
+	const source = "nudge-poller"
+
+	paneCapture, _ := t.CapturePane(sessionName, 25)
+	if err := nudge.LogInjectionError(townRoot, sessionName, source, deliverErr, paneCapture); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: injection-error log for %s failed: %v\n", source, sessionName, err)
+	}
+
+	for _, n := range drained {
+		if _, err := nudge.DeadLetter(townRoot, sessionName, n, source, deliverErr.Error()); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: dead-letter write for %s failed, message lost: %v\n", source, sessionName, err)
+		}
+	}
 }
