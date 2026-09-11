@@ -160,7 +160,7 @@ func gitRootOf(dir string) string {
 }
 
 type startupPromptSession interface {
-	NudgeSession(sessionID, message string) error
+	NudgeSessionWithOpts(sessionID, message string, opts tmux.NudgeOpts) error
 	WaitForRuntimeReady(sessionID string, rc *config.RuntimeConfig, timeout time.Duration) error
 }
 
@@ -203,11 +203,14 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 	return []string{command}
 }
 
-// RunStartupFallback sends the startup fallback commands via tmux.
-func RunStartupFallback(t *tmux.Tmux, sessionID, role string, rc *config.RuntimeConfig) error {
+// RunStartupFallback sends the startup fallback commands via tmux. townRoot
+// enables the cross-process nudge flock (see tmux.NudgeOpts.TownRoot) so a
+// concurrent direct `gt nudge` to the same session serializes instead of
+// interleaving keystrokes (gtn-9vt, codex changes-requested at 08964387).
+func RunStartupFallback(t *tmux.Tmux, sessionID, role, townRoot string, rc *config.RuntimeConfig) error {
 	commands := StartupFallbackCommands(role, rc)
 	for _, cmd := range commands {
-		if err := t.NudgeSession(sessionID, cmd); err != nil {
+		if err := t.NudgeSessionWithOpts(sessionID, cmd, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 			return err
 		}
 	}
@@ -303,10 +306,11 @@ func GetStartupPromptFallback(rc *config.RuntimeConfig) StartupPromptFallback {
 }
 
 // DeliverStartupPromptFallback sends the startup prompt via nudge for runtimes
-// that cannot accept the prompt as a CLI argument.
+// that cannot accept the prompt as a CLI argument. townRoot enables the
+// cross-process nudge flock — see RunStartupFallback.
 func DeliverStartupPromptFallback(
 	t startupPromptSession,
-	sessionID, prompt string,
+	sessionID, prompt, townRoot string,
 	rc *config.RuntimeConfig,
 	timeout time.Duration,
 ) error {
@@ -321,7 +325,7 @@ func DeliverStartupPromptFallback(
 		}
 	}
 
-	if err := t.NudgeSession(sessionID, prompt); err != nil {
+	if err := t.NudgeSessionWithOpts(sessionID, prompt, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 		return fmt.Errorf("nudging startup prompt fallback: %w", err)
 	}
 	return nil

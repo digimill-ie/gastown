@@ -121,7 +121,7 @@ func runBroadcast(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		if err := t.NudgeSession(agent.Name, message); err != nil {
+		if err := t.NudgeSessionWithOpts(agent.Name, message, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 			failed++
 			failures = append(failures, fmt.Sprintf("%s: %v", agentName, err))
 			fmt.Printf("  %s %s %s\n", style.ErrorPrefix, AgentTypeIcons[agent.Type], agentName)

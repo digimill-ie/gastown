@@ -1772,6 +1772,41 @@ func isTmuxIndex(value string) bool {
 	return err == nil && n >= 0
 }
 
+// ResolveAgentTarget returns the tmux target for the pane actually running
+// the agent in session — the same resolution NudgeSessionWithOpts uses to
+// choose where to type. Callers that capture pane content for diagnostics
+// (e.g. a failed-injection log) should use this instead of the bare session
+// name, which captures whatever pane happens to be focused in a multi-pane
+// session rather than the pane a delivery attempt actually targeted (codex,
+// nudge_failure.go:43, changes-requested at 08964387). Falls back to the
+// session's first pane if no agent pane can be found.
+func (t *Tmux) ResolveAgentTarget(session string) string {
+	target := session + ":0.0"
+	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
+		target = t.canonicalPaneTarget(session, agentPane)
+	}
+	return target
+}
+
+// skipEscapeForAgent reports whether the Escape keystroke used to exit
+// vim-mode composers and to dismiss Claude Code's Rewind menu is unsafe to
+// send to a session running agentName, because Escape cancels in-flight
+// generation for that runtime rather than harmlessly exiting vim INSERT mode
+// (GH#gt-wasn, hq-isz). An empty or unrecognized agentName defaults to
+// false — assume Claude Code, the historic behavior.
+func skipEscapeForAgent(agentName string) bool {
+	if agentName == "" {
+		return false
+	}
+	if agentName == "copilot" {
+		return true
+	}
+	if preset := config.GetAgentPresetByName(agentName); preset != nil {
+		return preset.EscapeCancelsRequest
+	}
+	return false
+}
+
 // NudgeSessionWithOpts is like NudgeSession but accepts delivery options.
 // See NudgeOpts for available options.
 func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) error {
@@ -1797,16 +1832,28 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 
 	// Resolve the correct target: in multi-pane sessions, find the pane
 	// running the agent rather than sending to the focused pane.
-	target := session + ":0.0"
-	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
-		target = t.canonicalPaneTarget(session, agentPane)
+	target := t.ResolveAgentTarget(session)
+
+	// Resolve whether Escape is unsafe for this session's runtime BEFORE any
+	// Escape-based recovery (Rewind dismissal, vim-mode exit) is attempted —
+	// previously this resolution happened after the pre-delivery Rewind
+	// dismissal below, so that dismissal ignored opts.SkipEscape and the
+	// runtime's own EscapeCancelsRequest preset entirely (codex,
+	// nudge.go:1809 [now the block below], changes-requested at 08964387).
+	if !opts.SkipEscape {
+		agentType, _ := t.GetEnvironment(session, "GT_AGENT")
+		if skipEscapeForAgent(agentType) {
+			opts.SkipEscape = true
+		}
 	}
 
 	// 0. Pre-delivery: dismiss Rewind menu if the session is stuck in it.
 	// A previous nudge or user action may have triggered Claude Code's
 	// double-Escape Rewind UI, which captures all input. Dismiss it first
-	// so the nudge can be delivered normally. (GH#gt-8el)
-	if t.isInRewindMode(target) {
+	// so the nudge can be delivered normally. (GH#gt-8el) Skipped when
+	// Escape is unsafe for this runtime — sending it here would bypass the
+	// same gate the deliberate step-5 Escape below respects.
+	if !opts.SkipEscape && t.isInRewindMode(target) {
 		t.dismissRewindMode(target)
 	}
 
@@ -1820,15 +1867,6 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 2. Sanitize control characters that corrupt delivery
 	sanitized := sanitizeNudgeMessage(message)
 
-	if !opts.SkipEscape {
-		// Auto-skip Escape for Copilot CLI sessions. Escape cancels in-flight
-		// generation in Copilot CLI (like Gemini), leaving the nudge text
-		// stranded in the input field without Enter being processed. (hq-isz)
-		agentType, _ := t.GetEnvironment(session, "GT_AGENT")
-		if agentType == "copilot" {
-			opts.SkipEscape = true
-		}
-	}
 	// Snapshot before typing the nudge so the message text itself cannot look
 	// like the agent's busy indicator.
 	sendEscape := !opts.SkipEscape && t.shouldSendEscape(target)
@@ -1898,8 +1936,22 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	}
 	defer releaseNudgeLock(pane)
 
-	// 0. Pre-delivery: dismiss Rewind menu if active. (GH#gt-8el)
-	if t.isInRewindMode(pane) {
+	// Resolve whether Escape is unsafe for this pane's runtime BEFORE any
+	// Escape-based recovery (Rewind dismissal, vim-mode exit) is attempted.
+	// NudgePane is used for dispatch/sling to freshly started sessions,
+	// which are NOT Claude-only (see the recovery-keystrokes comment on the
+	// submitComposer call below) — so this needs the same runtime gate
+	// NudgeSessionWithOpts applies, previously entirely absent here (codex,
+	// tmux.go:1931 [Escape send below], changes-requested at 08964387).
+	skipEscape := false
+	if sessionName := t.sessionNameForTarget(pane); sessionName != "" {
+		agentType, _ := t.GetEnvironment(sessionName, "GT_AGENT")
+		skipEscape = skipEscapeForAgent(agentType)
+	}
+
+	// 0. Pre-delivery: dismiss Rewind menu if active. (GH#gt-8el) Skipped
+	// when Escape is unsafe for this runtime — see above.
+	if !skipEscape && t.isInRewindMode(pane) {
 		t.dismissRewindMode(pane)
 	}
 
@@ -1914,7 +1966,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	sanitized := sanitizeNudgeMessage(message)
 	// Snapshot before typing the nudge so the message text itself cannot look
 	// like the agent's busy indicator.
-	sendEscape := t.shouldSendEscape(pane)
+	sendEscape := !skipEscape && t.shouldSendEscape(pane)
 
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
@@ -3368,15 +3420,25 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 
 // recoveryKeystrokesValidatedForSession reports whether stranded-composer
 // recovery keystrokes (C-j) are known safe for the session's agent runtime.
-// No GT_AGENT env defaults to true — the historic behavior, since the
-// overwhelming majority of sessions without GT_AGENT set are Claude Code.
-// Any GT_AGENT value (known preset or an unrecognized/custom one) defaults to
-// false, requiring an explicit RecoveryKeystrokesValidated on the preset,
-// since an unvalidated key on an unfamiliar runtime can be destructive (e.g.,
-// aborting in-flight generation) rather than merely resetting the composer.
+// No GT_AGENT env (err == nil, agentName == "") defaults to true — the
+// historic behavior, since the overwhelming majority of sessions without
+// GT_AGENT set are Claude Code. Any GT_AGENT value (known preset or an
+// unrecognized/custom one) defaults to false, requiring an explicit
+// RecoveryKeystrokesValidated on the preset, since an unvalidated key on an
+// unfamiliar runtime can be destructive (e.g., aborting in-flight
+// generation) rather than merely resetting the composer.
+//
+// A LOOKUP FAILURE (err != nil — tmux error, session gone) is deliberately
+// NOT treated the same as "no GT_AGENT set": that would fail OPEN into
+// sending an unvalidated recovery keystroke to a runtime we couldn't even
+// identify. An unknown state must default to false, same as an unrecognized
+// agent (codex, tmux.go:3379, changes-requested at 08964387).
 func recoveryKeystrokesValidatedForSession(t *Tmux, session string) bool {
 	agentName, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil || agentName == "" {
+	if err != nil {
+		return false
+	}
+	if agentName == "" {
 		return true
 	}
 	return recoveryKeystrokesValidatedForAgent(agentName)
@@ -3396,13 +3458,15 @@ func recoveryKeystrokesValidatedForAgent(agentName string) bool {
 // recoveryKeystrokesValidatedForPane is recoveryKeystrokesValidatedForSession
 // for a pane target instead of a session name: it resolves the pane's owning
 // session first, since GT_AGENT is a session-level environment variable.
-// Defaults to true (assume Claude) if the owning session cannot be resolved,
-// matching recoveryKeystrokesValidatedForSession's no-GT_AGENT default —
-// this is strictly no worse than this function's behavior before it existed.
+// Defaults to FALSE if the owning session cannot be resolved (stale pane, no
+// server): an unresolvable target is an unknown state, and an unknown state
+// must not fail open into an unvalidated recovery keystroke — same
+// reasoning as the lookup-failure case in recoveryKeystrokesValidatedForSession
+// (codex, tmux.go:3405, changes-requested at 08964387).
 func recoveryKeystrokesValidatedForPane(t *Tmux, pane string) bool {
 	sessionName := t.sessionNameForTarget(pane)
 	if sessionName == "" {
-		return true
+		return false
 	}
 	return recoveryKeystrokesValidatedForSession(t, sessionName)
 }

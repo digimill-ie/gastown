@@ -312,8 +312,8 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
 		log.Printf("warning: could not start nudge poller for %s: %v", sessionID, pollerErr)
 	}
 
-	_ = runtime.RunStartupFallback(t, sessionID, "refinery", runtimeConfig)
-	_ = runtime.DeliverStartupPromptFallback(t, sessionID, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
+	_ = runtime.RunStartupFallback(t, sessionID, "refinery", townRoot, runtimeConfig)
+	_ = runtime.DeliverStartupPromptFallback(t, sessionID, initialPrompt, townRoot, runtimeConfig, constants.ClaudeStartTimeout)
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
 	if err := session.TrackSessionPID(townRoot, sessionID, t); err != nil {

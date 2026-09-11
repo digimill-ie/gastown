@@ -249,32 +249,37 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			if !errors.Is(deliverErr, tmux.ErrSubmitNotVerified) {
 				return deliverErr
 			}
-			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)
+			fmt.Fprintf(os.Stderr, "wait-idle: %v; dead-lettering for %s\n", deliverErr, sessionName)
 			pending := nudge.QueuedNudge{
 				Sender:   sender,
 				Message:  message,
 				Priority: nudgePriorityFlag,
+				Attempts: 1,
 			}
-			// Zero retypes after a composer-dirty delivery: enqueuing this
-			// entry would just have the poller/idle-watcher retype it into
-			// the same dirty composer on the next cycle. Dead-letter instead
-			// of falling into that loop (hq-g52db). Any other unverified
-			// failure still queues for later retry — bounded once queued,
-			// via handleFailedInjection's Attempts count.
-			if errors.Is(deliverErr, tmux.ErrComposerDirty) {
-				paneCapture, _ := t.CapturePane(sessionName, 25)
-				_ = nudge.LogInjectionError(townRoot, sessionName, sourceWaitIdle, deliverErr, paneCapture)
-				pending.Attempts = 1
-				if _, dlErr := nudge.DeadLetter(townRoot, sessionName, pending, sourceWaitIdle, deliverErr.Error(), paneCapture, false); dlErr != nil {
-					fmt.Fprintf(os.Stderr, "wait-idle: dead-letter for %s failed, queueing instead: %v\n", sessionName, dlErr)
-				} else {
-					alertDeadLetter(townRoot, sessionName, sourceWaitIdle, pending)
-					return nil
-				}
+			// Zero retypes after ANY unverified delivery — a known-dirty
+			// composer, a stranded composer, or simply "typed but could not
+			// confirm Enter delivered it" (ack lost after typing). Enqueuing
+			// this entry as an ordinary retry would just have the
+			// poller/idle-watcher retype it on the next cycle, risking
+			// duplicate content exactly the way a composer-dirty retype
+			// would (hq-g52db). REVISION 3 requires this for dirty AND
+			// uncertain deliveries alike — previously only ErrComposerDirty
+			// (not the broader ErrSubmitNotVerified) got this treatment, so
+			// an ack-lost-after-typing failure fell through to an ordinary
+			// Attempts=0 requeue below (codex, nudge.go:268, changes-requested
+			// at 08964387).
+			paneCapture, _ := t.CapturePane(t.ResolveAgentTarget(sessionName), 25)
+			_ = nudge.LogInjectionError(townRoot, sessionName, sourceWaitIdle, deliverErr, paneCapture)
+			if _, dlErr := nudge.DeadLetter(townRoot, sessionName, pending, sourceWaitIdle, deliverErr.Error(), paneCapture, true); dlErr != nil {
+				// Dead-letter write failed too: do NOT fall back to
+				// enqueuing — that would resume the exact retype loop this
+				// policy exists to stop (codex, nudge.go:268/275, the same
+				// finding). Drop the message, logged loudly, matching
+				// handleFailedInjection's documented double-fault policy.
+				fmt.Fprintf(os.Stderr, "wait-idle: CRITICAL: dead-letter for unverified delivery to %s failed and it will NOT be queued (would resume the retype loop): %v\n", sessionName, dlErr)
+				return nil
 			}
-			if qErr := nudge.Enqueue(townRoot, sessionName, pending); qErr != nil {
-				return fmt.Errorf("queue fallback after unverified submit failed: %v (original: %w)", qErr, deliverErr)
-			}
+			alertDeadLetter(townRoot, sessionName, sourceWaitIdle, pending)
 			return nil
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
@@ -359,18 +364,30 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 		// This avoids false positives during inter-tool-call gaps where
 		// the prompt briefly appears while Claude Code is still working.
 		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {
-			// Drain atomically claims queued entries (rename-based).
-			// If another process raced and drained first, we get an
-			// empty slice and skip delivery to avoid duplicates.
-			drained, _ := nudge.Drain(townRoot, sessionName)
-			if len(drained) == 0 {
+			// DrainClaims atomically claims queued entries (rename-based)
+			// but does not delete them — see nudge.DrainClaims. If another
+			// process raced and drained first, we get an empty slice and
+			// skip delivery to avoid duplicates.
+			claims, _ := nudge.DrainClaims(townRoot, sessionName)
+			if len(claims) == 0 {
 				return
 			}
-			formatted := nudge.FormatForInjection(drained)
-			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
-				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
-				handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, drained, err)
+
+			toInject, exhausted := partitionForInjection(claims)
+			if len(exhausted) > 0 {
+				handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(exhausted), errAttemptsExhausted)
 			}
+			if len(toInject) > 0 {
+				formatted := nudge.FormatForInjection(claimNudges(toInject))
+				if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+					fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+					handleFailedInjection(t, townRoot, sessionName, sourceIdleWatcher, claimNudges(toInject), err)
+				}
+			}
+
+			// Ack only after every entry's outcome is durable — see the
+			// matching comment in nudge_poller.go.
+			ackClaims(sourceIdleWatcher, sessionName, claims)
 			return
 		}
 	}

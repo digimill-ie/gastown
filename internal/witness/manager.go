@@ -274,13 +274,13 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		log.Printf("warning: could not start nudge poller for %s: %v", sessionID, pollerErr)
 	}
 
-	_ = runtime.RunStartupFallback(t, sessionID, "witness", runtimeConfig)
+	_ = runtime.RunStartupFallback(t, sessionID, "witness", townRoot, runtimeConfig)
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: session.BeaconRecipient("witness", "", m.rig.Name),
 		Sender:    "deacon",
 		Topic:     "patrol",
 	}, "Run `gt prime --hook` and begin patrol.")
-	_ = runtime.DeliverStartupPromptFallback(t, sessionID, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
+	_ = runtime.DeliverStartupPromptFallback(t, sessionID, initialPrompt, townRoot, runtimeConfig, constants.ClaudeStartTimeout)
 
 	// Stream witness's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {

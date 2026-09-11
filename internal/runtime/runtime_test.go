@@ -6,21 +6,24 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 type fakeStartupPromptSession struct {
 	nudges    []string
+	nudgeOpts []tmux.NudgeOpts
 	waitCalls int
 	waitRC    *config.RuntimeConfig
 	waitErr   error
 	nudgeErr  error
 }
 
-func (f *fakeStartupPromptSession) NudgeSession(_ string, message string) error {
+func (f *fakeStartupPromptSession) NudgeSessionWithOpts(_ string, message string, opts tmux.NudgeOpts) error {
 	if f.nudgeErr != nil {
 		return f.nudgeErr
 	}
 	f.nudges = append(f.nudges, message)
+	f.nudgeOpts = append(f.nudgeOpts, opts)
 	return nil
 }
 
@@ -472,7 +475,7 @@ func TestDeliverStartupPromptFallback_NoPromptWaitsAndNudges(t *testing.T) {
 	}
 	tm := &fakeStartupPromptSession{}
 
-	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", rc, 30*time.Second)
+	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", "/tmp/test-town", rc, 30*time.Second)
 	if err != nil {
 		t.Fatalf("DeliverStartupPromptFallback() error = %v", err)
 	}
@@ -491,6 +494,12 @@ func TestDeliverStartupPromptFallback_NoPromptWaitsAndNudges(t *testing.T) {
 	if len(tm.nudges) != 1 || tm.nudges[0] != "begin patrol" {
 		t.Fatalf("nudges = %#v, want [\"begin patrol\"]", tm.nudges)
 	}
+	// TownRoot must reach the delivery call so the cross-process nudge flock
+	// is enabled (gtn-9vt, codex changes-requested at 08964387) — previously
+	// this path used the bare NudgeSession, which never carried TownRoot.
+	if len(tm.nudgeOpts) != 1 || tm.nudgeOpts[0].TownRoot != "/tmp/test-town" {
+		t.Fatalf("nudgeOpts = %#v, want TownRoot=/tmp/test-town", tm.nudgeOpts)
+	}
 }
 
 func TestDeliverStartupPromptFallback_WithPromptNoOp(t *testing.T) {
@@ -502,7 +511,7 @@ func TestDeliverStartupPromptFallback_WithPromptNoOp(t *testing.T) {
 	}
 	tm := &fakeStartupPromptSession{}
 
-	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", rc, 30*time.Second)
+	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", "/tmp/test-town", rc, 30*time.Second)
 	if err != nil {
 		t.Fatalf("DeliverStartupPromptFallback() error = %v", err)
 	}
@@ -523,7 +532,7 @@ func TestDeliverStartupPromptFallback_WaitError(t *testing.T) {
 	}
 	tm := &fakeStartupPromptSession{waitErr: os.ErrDeadlineExceeded}
 
-	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", rc, 30*time.Second)
+	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", "/tmp/test-town", rc, 30*time.Second)
 	if err == nil {
 		t.Fatal("DeliverStartupPromptFallback() error = nil, want non-nil")
 	}

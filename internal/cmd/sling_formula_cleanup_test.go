@@ -117,7 +117,7 @@ func TestRunSlingFormulaExistingHookedDogStartsDelayedSession(t *testing.T) {
 	existingBlock = existingBlock[:stepIdx]
 	startIdx := strings.Index(existingBlock, "delayedDogInfo.StartDelayedSession()")
 	completeIdx := strings.Index(existingBlock, "delayedDogComplete = true")
-	nudgeIdx := strings.Index(existingBlock, "nudgeFormulaDog(delayedDogInfo, formulaSlingPrompt(formulaName))")
+	nudgeIdx := strings.Index(existingBlock, "nudgeFormulaDog(townRoot, delayedDogInfo, formulaSlingPrompt(formulaName))")
 	returnIdx := strings.LastIndex(existingBlock, "return nil")
 	if startIdx == -1 {
 		t.Fatal("existing hooked formula path must start the delayed dog session")
@@ -149,7 +149,7 @@ func TestRunSlingFormulaNonOwnedDogReuseCannotCreateFreshWisp(t *testing.T) {
 func TestRunSlingFormulaDogNudgeBeforeEmptyPaneReturn(t *testing.T) {
 	body := runSlingFormulaSourceForTest(t)
 
-	dogNudgeIdx := strings.LastIndex(body, "nudgeFormulaDog(delayedDogInfo, prompt)")
+	dogNudgeIdx := strings.LastIndex(body, "nudgeFormulaDog(townRoot, delayedDogInfo, prompt)")
 	emptyPaneIdx := strings.Index(body, "if targetPane == \"\" {")
 	if dogNudgeIdx == -1 {
 		t.Fatal("dog-specific nudge call not found")

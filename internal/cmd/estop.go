@@ -345,7 +345,7 @@ func nudgeAllSessions(t *tmux.Tmux, townRoot string, rigFilter string) int {
 		if rigFilter != "" && !isRigSession(sess, rigPrefix) {
 			continue
 		}
-		if err := t.NudgeSession(sess, "E-stop cleared. Work may resume."); err == nil {
+		if err := t.NudgeSessionWithOpts(sess, "E-stop cleared. Work may resume.", tmux.NudgeOpts{TownRoot: townRoot}); err == nil {
 			nudged++
 		}
 	}

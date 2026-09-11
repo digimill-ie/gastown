@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -518,11 +519,108 @@ func TestHandleFailedInjection_ComposerDirtyDeadLettersImmediately(t *testing.T)
 	if got.Message != "stuck payload" || got.Sender != "test" {
 		t.Errorf("dead-letter payload = %#v, want Message=%q Sender=%q", got, "stuck payload", "test")
 	}
-	if got.UncertainDelivery {
-		t.Errorf("dead-letter UncertainDelivery = true, want false for a known composer-dirty failure")
+	// A composer-dirty snapshot proves nothing about what happened to our
+	// message before the other content appeared, so it must NOT be recorded
+	// as certain non-delivery (codex Medium, nudge_failure.go:57,
+	// changes-requested at 08964387).
+	if !got.UncertainDelivery {
+		t.Errorf("dead-letter UncertainDelivery = false, want true: a composer-dirty snapshot cannot prove the message was not delivered")
 	}
 	if got.Source != sourceNudgePoller {
 		t.Errorf("dead-letter Source = %q, want %q", got.Source, sourceNudgePoller)
+	}
+}
+
+// TestHandleFailedInjection_UncertainSubmitDeadLettersImmediately covers the
+// other half of the "zero retypes for dirty OR uncertain" requirement: an
+// unverified submission that is NOT specifically composer-dirty (e.g. an
+// acknowledgement lost after typing, or a stranded-composer recovery attempt
+// that itself could not be confirmed) must also dead-letter on the FIRST
+// failure, never requeued — previously only tmux.ErrComposerDirty got this
+// treatment, so this class fell through to an ordinary bounded retry and
+// could be retyped (codex High, nudge_failure.go:49, changes-requested at
+// 08964387).
+func TestHandleFailedInjection_UncertainSubmitDeadLettersImmediately(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+	drained := []nudge.QueuedNudge{
+		{ID: "uncertain-submit", Sender: "test", Message: "ack lost after typing", Timestamp: time.Now()},
+	}
+	// Mirrors submit_verify.go's C-j-reset-failed wrapping: ErrSubmitNotVerified
+	// alone, with no ErrComposerDirty.
+	deliverErr := fmt.Errorf("%w (C-j reset failed: pane gone)", tmux.ErrSubmitNotVerified)
+
+	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+
+	requeued, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(requeued) != 0 {
+		t.Fatalf("Drain got %d entries requeued, want 0 (an unverified submission must not be retyped)", len(requeued))
+	}
+
+	entries, err := nudge.ListDeadLetters(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ListDeadLetters got %d entries, want 1 (first failure, not yet at MaxInjectionAttempts)", len(entries))
+	}
+	if !entries[0].UncertainDelivery {
+		t.Errorf("dead-letter UncertainDelivery = false, want true")
+	}
+}
+
+// TestPartitionForInjection_ExhaustedEntriesSkipInjection covers "the poller
+// injects before checking attempts": an entry that already reached
+// nudge.MaxInjectionAttempts on a prior cycle (via the dead-letter-write
+// durability fallback, which requeues past the bound rather than losing the
+// message) must not be handed to a live tmux injection attempt again —
+// otherwise a persistently broken dead-letter store turns into an
+// indefinite retype loop until TTL expiry (codex High, nudge_failure.go:66 /
+// nudge_poller.go:134, changes-requested at 08964387).
+func TestPartitionForInjection_ExhaustedEntriesSkipInjection(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+
+	seed := []nudge.QueuedNudge{
+		{ID: "fresh", Sender: "test", Message: "m1", Attempts: 0, Timestamp: time.Now().Add(-3 * time.Millisecond)},
+		{ID: "one-attempt", Sender: "test", Message: "m2", Attempts: nudge.MaxInjectionAttempts - 1, Timestamp: time.Now().Add(-2 * time.Millisecond)},
+		{ID: "exhausted", Sender: "test", Message: "m3", Attempts: nudge.MaxInjectionAttempts, Timestamp: time.Now().Add(-1 * time.Millisecond)},
+		{ID: "over-exhausted", Sender: "test", Message: "m4", Attempts: nudge.MaxInjectionAttempts + 3, Timestamp: time.Now()},
+	}
+	for _, n := range seed {
+		if err := nudge.Enqueue(townRoot, sessionName, n); err != nil {
+			t.Fatalf("Enqueue(%s): %v", n.ID, err)
+		}
+	}
+
+	claims, err := nudge.DrainClaims(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("DrainClaims: %v", err)
+	}
+	if len(claims) != len(seed) {
+		t.Fatalf("DrainClaims got %d claims, want %d", len(claims), len(seed))
+	}
+
+	toInject, exhausted := partitionForInjection(claims)
+
+	var injectIDs, exhaustedIDs []string
+	for _, c := range toInject {
+		injectIDs = append(injectIDs, c.Nudge.ID)
+	}
+	for _, c := range exhausted {
+		exhaustedIDs = append(exhaustedIDs, c.Nudge.ID)
+	}
+
+	wantInject := []string{"fresh", "one-attempt"}
+	wantExhausted := []string{"exhausted", "over-exhausted"}
+	if !reflect.DeepEqual(injectIDs, wantInject) {
+		t.Errorf("toInject IDs = %v, want %v", injectIDs, wantInject)
+	}
+	if !reflect.DeepEqual(exhaustedIDs, wantExhausted) {
+		t.Errorf("exhausted IDs = %v, want %v", exhaustedIDs, wantExhausted)
 	}
 }
 

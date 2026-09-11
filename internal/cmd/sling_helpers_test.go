@@ -106,10 +106,31 @@ func TestWakeRigAgentsDoesNotNudgeRefinery(t *testing.T) {
 
 // TestNudgeRefineryNoOpWithoutLog verifies that nudgeRefinery doesn't panic
 // or error when called without the test log env var and without a real tmux session.
-// The tmux NudgeSession call should fail silently.
+// The tmux NudgeSessionWithOpts call should fail silently.
+//
+// Deliberately exercising the real (non-test-log) path here means
+// nudgeRefinery's workspace.FindFromCwd() call runs for real too. This
+// package's tests run from a worktree nested inside the actual live town
+// (gastown/polecats/<name>/gastown/internal/cmd), so without isolating cwd,
+// FindFromCwd would resolve to the REAL town root and
+// channelevents.EmitToTown would write a REAL event into the live
+// refinery's channel — the same class of live-town pollution as hq-qyfok
+// (codex Medium, sling_helpers_test.go:112, changes-requested at
+// 08964387). Chdir into an isolated temp dir (no "mayor" marker anywhere up
+// its parent chain) so FindFromCwd finds nothing, regardless of where the
+// test binary itself happens to run from.
 func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 	// Ensure test log is NOT set so we exercise the real tmux path
 	t.Setenv("GT_TEST_NUDGE_LOG", "")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
 
 	// Should not panic even though no tmux session exists
 	nudgeRefinery("nonexistent-rig", "test message")

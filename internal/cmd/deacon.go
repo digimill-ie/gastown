@@ -580,7 +580,7 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 
 	deaconTownRoot, _ := workspace.FindFromCwdOrError()
 	runtimeCfg := config.ResolveRoleAgentConfig("deacon", deaconTownRoot, "")
-	_ = runtime.RunStartupFallback(t, sessionName, "deacon", runtimeCfg)
+	_ = runtime.RunStartupFallback(t, sessionName, "deacon", townRoot, runtimeCfg)
 	startDeaconNudgePoller(townRoot, sessionName)
 
 	return nil
@@ -911,7 +911,7 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 	// defer until the next turn boundary, causing the 30s timeout to expire
 	// and producing false negatives that kill healthy agents.
 	healthMsg := "HEALTH_CHECK: respond with any action to confirm responsiveness"
-	if err := t.NudgeSession(sessionName, healthMsg); err != nil {
+	if err := t.NudgeSessionWithOpts(sessionName, healthMsg, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 		return fmt.Errorf("sending health check nudge: %w", err)
 	}
 

@@ -1,6 +1,7 @@
 package nudge
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -166,5 +167,58 @@ func TestReplayDeadLetterNotFound(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := ReplayDeadLetter(townRoot, "gt-test-no-entries", "does-not-exist"); err == nil {
 		t.Fatal("expected an error replaying a nonexistent dead-letter entry, got nil")
+	}
+}
+
+// TestReplayDeadLetterConcurrentDoesNotDoubleQueue covers the race codex
+// found (deadletter.go:160, changes-requested at 08964387): replay neither
+// claimed nor locked the entry, so two concurrent replays of the same ID
+// could both re-enqueue it. ReplayDeadLetter now atomically claims the
+// entry (rename to .replaying) before re-enqueuing, so only one of two
+// concurrent replays can win; the loser must fail rather than double-queue
+// the payload.
+func TestReplayDeadLetterConcurrentDoesNotDoubleQueue(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-replay-race"
+
+	n := QueuedNudge{ID: "race-me", Sender: "test", Message: "only once", Timestamp: time.Now()}
+	if _, err := DeadLetter(townRoot, session, n, "nudge-poller", "boom", "", true); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	const attempts = 8
+	results := make(chan error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- ReplayDeadLetter(townRoot, session, "race-me")
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var succeeded, failed int
+	for err := range results {
+		if err == nil {
+			succeeded++
+		} else {
+			failed++
+		}
+	}
+	if succeeded != 1 {
+		t.Errorf("succeeded replays = %d, want exactly 1 (a race must not double-queue the payload)", succeeded)
+	}
+	if failed != attempts-1 {
+		t.Errorf("failed replays = %d, want %d", failed, attempts-1)
+	}
+
+	drained, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drained) != 1 {
+		t.Fatalf("queue got %d entries after concurrent replay, want exactly 1 (no duplication)", len(drained))
 	}
 }

@@ -120,21 +120,41 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			// Drain and inject.
-			drained, err := nudge.Drain(townRoot, sessionName)
+			// Drain via claims, not Drain: the claim files stay on disk
+			// until explicitly acked below, so a crash between draining and
+			// the dead-letter/requeue write leaves the entry recoverable
+			// instead of lost (nudge.DrainClaims, hq-g52db rework).
+			claims, err := nudge.DrainClaims(townRoot, sessionName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: drain error for %s: %v\n", sessionName, err)
 				continue
 			}
-			if len(drained) == 0 {
+			if len(claims) == 0 {
 				continue // someone else drained it
 			}
 
-			formatted := nudge.FormatForInjection(drained)
-			if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
-				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-				handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, drained, err)
+			// Entries that already exhausted MaxInjectionAttempts on a prior
+			// cycle (reached only via the dead-letter-write durability
+			// fallback) must not be retyped again — route them straight to
+			// another dead-letter attempt.
+			toInject, exhausted := partitionForInjection(claims)
+			if len(exhausted) > 0 {
+				handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(exhausted), errAttemptsExhausted)
 			}
+			if len(toInject) > 0 {
+				formatted := nudge.FormatForInjection(claimNudges(toInject))
+				if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
+					fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
+					handleFailedInjection(t, townRoot, sessionName, sourceNudgePoller, claimNudges(toInject), err)
+				}
+			}
+
+			// Ack every claim only now: handleFailedInjection has already
+			// durably dead-lettered or requeued each entry (or, for the
+			// documented double-fault, dropped it with a loud log), so the
+			// original claim is redundant. Acking after, not before, keeps
+			// the crash window closed.
+			ackClaims(sourceNudgePoller, sessionName, claims)
 		}
 	}
 }

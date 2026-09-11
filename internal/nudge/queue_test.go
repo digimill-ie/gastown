@@ -451,6 +451,142 @@ func TestDrainSweepsOrphanedClaims(t *testing.T) {
 	}
 }
 
+// TestDrainClaims_UnackedClaimSurvivesACrash is REVISION 3's required test
+// for fix 3 (claim-then-deliver-then-delete ordering): kill the caller
+// between drain and its dead-letter/requeue write, and show the entry
+// still exists in one of the two places. Previously (queue.go:305) Drain
+// deleted the claimed file as soon as it was unmarshaled, before the caller
+// even attempted delivery, so a crash right here lost the entry with no
+// durable trace anywhere (codex, changes-requested at 08964387).
+//
+// DrainClaims closes that window: it claims the entry but does not delete
+// it, so a caller that crashes before calling Ack leaves the original
+// .claimed file in place — recoverable first by direct inspection, and
+// second, once staleClaimThreshold has passed, by a future
+// Drain/DrainClaims call's orphan sweep restoring it to the pending queue.
+func TestDrainClaims_UnackedClaimSurvivesACrash(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-crash-test"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "must survive a crash"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claims, err := DrainClaims(townRoot, session)
+	if err != nil {
+		t.Fatalf("DrainClaims: %v", err)
+	}
+	if len(claims) != 1 {
+		t.Fatalf("DrainClaims got %d claims, want 1", len(claims))
+	}
+	if claims[0].Nudge.Message != "must survive a crash" {
+		t.Fatalf("claimed nudge = %#v", claims[0].Nudge)
+	}
+
+	// Simulate a crash right here: the caller never Acks, never
+	// dead-letters, never requeues. Place 1: the claim file must still be
+	// on disk, not deleted by DrainClaims itself.
+	dir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var claimFiles int
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".claimed") {
+			claimFiles++
+			// Age it past staleClaimThreshold so the next Drain's orphan
+			// sweep restores it, proving place 2: recovery via the queue.
+			old := time.Now().Add(-staleClaimThreshold - time.Minute)
+			if err := os.Chtimes(filepath.Join(dir, e.Name()), old, old); err != nil {
+				t.Fatalf("Chtimes: %v", err)
+			}
+		}
+	}
+	if claimFiles != 1 {
+		t.Fatalf("expected 1 claimed file surviving an unacked DrainClaims, got %d", claimFiles)
+	}
+
+	recovered, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("recovery Drain: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0].Message != "must survive a crash" {
+		t.Fatalf("orphaned claim was not recovered intact: %#v", recovered)
+	}
+}
+
+// TestClaimAck_RemovesUnderlyingFile is a direct unit test of Claim.Ack:
+// once a caller has durably resolved an entry's outcome, Ack must remove
+// the now-redundant original claim file, and calling it again (idempotent
+// double-ack, e.g. after a partial failure and retry) must not error.
+func TestClaimAck_RemovesUnderlyingFile(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-ack-test"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "ack me"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claims, err := DrainClaims(townRoot, session)
+	if err != nil {
+		t.Fatalf("DrainClaims: %v", err)
+	}
+	if len(claims) != 1 {
+		t.Fatalf("got %d claims, want 1", len(claims))
+	}
+
+	if err := claims[0].Ack(); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if err := claims[0].Ack(); err != nil {
+		t.Fatalf("second Ack (idempotent) errored: %v", err)
+	}
+
+	dir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".claimed") {
+			t.Errorf("claim file %q still present after Ack", e.Name())
+		}
+	}
+}
+
+// TestDrain_MatchesDrainClaimsThenAck asserts Drain's public contract is
+// unchanged by its DrainClaims-based reimplementation: immediate delete,
+// same payload, same behavior every existing Drain caller (the
+// turn-boundary hook, internal/acp/propulsion.go) already depends on.
+func TestDrain_MatchesDrainClaimsThenAck(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-drain-contract-test"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "m1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "s", Message: "m2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 2 {
+		t.Fatalf("Drain got %d nudges, want 2", len(nudges))
+	}
+
+	dir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Drain left %d files behind, want 0 (immediate delete on success)", len(entries))
+	}
+}
+
 func TestConcurrentEnqueueNoDuplicateLoss(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-test-concurrent"

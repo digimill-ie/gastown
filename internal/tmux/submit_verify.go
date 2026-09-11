@@ -344,7 +344,17 @@ func (t *Tmux) recoverStrandedComposer(target, message, needle, promptPrefix str
 		}
 		time.Sleep(adaptiveTextDelay(len(message)))
 		_ = t.sendEnterVerified(target)
-	case probeStranded, probeComposerDirty, probeUnknown:
+	case probeStranded, probeComposerDirty:
+		// The composer still visibly holds the needle (stranded) or other
+		// content (dirty) after the C-j reset attempt: a caller that treats
+		// this as an ordinary bounded failure and retypes on the next
+		// attempt would type straight on top of it. Wrap ErrComposerDirty
+		// too, not just ErrSubmitNotVerified, so a caller keying on either
+		// error sees the same "do not retype" signal a fresh (non-recovery)
+		// dirty/stranded probe already gives (codex, submit_verify.go:348,
+		// changes-requested at 08964387).
+		return fmt.Errorf("%w: %w (composer state after C-j: %s)", ErrSubmitNotVerified, ErrComposerDirty, probe)
+	case probeUnknown:
 		return fmt.Errorf("%w (composer state after C-j: %s)", ErrSubmitNotVerified, probe)
 	}
 
