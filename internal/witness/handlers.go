@@ -2415,6 +2415,40 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 				fmt.Errorf("classifying pane for %s: %w", sessionName, err))
 			continue
 		}
+
+		// Startup-window gate (gtn-qp7 / hq-ooijo revision 3): dismiss keys
+		// may be sent ONLY while this session incarnation's startup window
+		// is still open — before the AGENT has written its own first
+		// heartbeat. This is checked BEFORE dialog content decides
+		// anything: text classification alone no longer authorises a
+		// send, it only picks which known dialog is present once the
+		// window has already authorised acting. sessionID is best-effort
+		// (empty on a query failure); IsStartupWindowOpen treats that the
+		// same as any other unresolvable identity and refuses to open.
+		sessionID, _ := t.GetSessionID(sessionName)
+		windowStatus := polecat.IsStartupWindowOpen(townRoot, sessionName, sessionID, createdUnix)
+		authorized := func() bool {
+			return polecat.IsStartupWindowOpen(townRoot, sessionName, sessionID, createdUnix).Open
+		}
+
+		if !windowStatus.Open {
+			// After the window: report a genuine-looking dialog as an
+			// apparent blocker for explicit recovery, never dismiss it.
+			// Neither age, state, nor startup context reopens eligibility
+			// (revision 3, item 5).
+			action := "no-known-dialog"
+			if kind != tmux.DialogNone {
+				action = fmt.Sprintf("post-window-dialog:%s", kind)
+			}
+			result.Stalled = append(result.Stalled, StalledResult{
+				PolecatName: polecatName,
+				StallType:   "startup-stall",
+				Action:      action,
+				Error:       fmt.Errorf("startup window closed: %s", windowStatus.Reason),
+			})
+			continue
+		}
+
 		if kind == tmux.DialogNone {
 			result.Stalled = append(result.Stalled, StalledResult{
 				PolecatName: polecatName,
@@ -2430,7 +2464,7 @@ func DetectStalledPolecats(workDir, rigName string, dryRun bool) *DetectStalledP
 		}
 		if dryRun {
 			stalled.Action = fmt.Sprintf("would-dismiss:%s", kind)
-		} else if err := t.DismissDialog(sessionName, kind); err != nil {
+		} else if err := t.DismissDialogGated(sessionName, kind, authorized); err != nil {
 			stalled.Action = "escalated"
 			stalled.Error = fmt.Errorf("dismiss %s failed: %w", kind, err)
 		} else {

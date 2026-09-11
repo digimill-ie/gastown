@@ -889,6 +889,152 @@ func TestDismissDialog_InvalidKind(t *testing.T) {
 	}
 }
 
+// TestGetSessionID_ReturnsNonEmpty is a sanity check for the new incarnation
+// primitive (gtn-qp7 / hq-ooijo revision 3): a live session always has a
+// non-empty tmux #{session_id} (e.g. "$3").
+func TestGetSessionID_ReturnsNonEmpty(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-session-id-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	id, err := tm.GetSessionID(sessionName)
+	if err != nil {
+		t.Fatalf("GetSessionID: %v", err)
+	}
+	if id == "" {
+		t.Error("expected a non-empty session id")
+	}
+}
+
+// TestDismissDialogGated_NotAuthorized_SendsNoKeys covers the primary
+// authorization gate (gtn-qp7 / hq-ooijo revision 3, item 4): even with a
+// real, currently-visible dialog, an authorized func returning false must
+// refuse to send ANY key, never falling back to the unguarded sequence.
+func TestDismissDialogGated_NotAuthorized_SendsNoKeys(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-dismiss-gated-unauthorized-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	before, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (before): %v", err)
+	}
+
+	err = tm.DismissDialogGated(sessionName, DialogWorkspaceTrust, func() bool { return false })
+	if err == nil {
+		t.Fatal("expected error when authorized() is always false, got nil")
+	}
+
+	after, err := tm.CapturePane(sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if before != after {
+		t.Errorf("pane content changed with authorized()=false — a key was sent\nbefore: %q\nafter:  %q", before, after)
+	}
+}
+
+// TestDismissDialogGated_AuthorizedThroughout_DismissesTrustDialog is the
+// positive case: with authorized() always true, DismissDialogGated behaves
+// exactly like DismissDialog.
+func TestDismissDialogGated_AuthorizedThroughout_DismissesTrustDialog(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-dismiss-gated-authorized-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.SendKeys(sessionName, "clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'; read -r _dlg; clear; echo dialog-dismissed"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.DismissDialogGated(sessionName, DialogWorkspaceTrust, func() bool { return true }); err != nil {
+		t.Fatalf("DismissDialogGated: %v", err)
+	}
+}
+
+// TestDismissDialogGated_BypassDialog_DeauthorizedBetweenDownAndEnter_Aborts
+// covers the mid-sequence abort itself (gtn-qp7 / hq-ooijo revision 3, item
+// 4): authorized() is true for the pre-Down check and false for every check
+// after — the exact shape of an agent writing its first heartbeat (closing
+// the startup window) in the 200ms gap between Down and Enter. Enter must
+// never be sent. Uses the same blocking-read marker technique as
+// TestDismissDialog_BypassDialogClearedBetweenDownAndEnter: the script only
+// reaches `touch` if a line (Enter) actually arrives, so a hung/timed-out
+// read proves zero keys reached it — sleeping past a timeout could not.
+func TestDismissDialogGated_BypassDialog_DeauthorizedBetweenDownAndEnter_Aborts(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-dismiss-gated-bypass-deauth-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	marker := filepath.Join(t.TempDir(), "enter-reached")
+	script := "#!/bin/bash\n" +
+		"clear; printf '%s\\n' 'Bypass Permissions mode'; printf '%s\\n' '1. No'; printf '%s\\n' '2. Yes, I accept'\n" +
+		"IFS= read -rsn1 _c\n" +
+		// Integer timeout — bash 3.2 rejects "0.2" outright (invalid timeout
+		// specification, exit 1, no wait at all), same host issue noted on
+		// the sibling race test above (codex Medium, REVISION 3). Drains the
+		// rest of Down's escape sequence; its value is unused.
+		"IFS= read -rsn2 -t 1 _rest\n" +
+		// Blocks forever unless a line (Enter) actually arrives — a timeout
+		// here would let the script fall through to `touch` regardless of
+		// whether a key was sent, which is exactly the false-pass this test
+		// must not produce.
+		"IFS= read -r _maybe_enter\n" +
+		"touch " + marker + "\n"
+	scriptPath := filepath.Join(t.TempDir(), "gated-deauth.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := tm.SendKeys(sessionName, "clear; bash "+scriptPath); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	calls := 0
+	authorized := func() bool {
+		calls++
+		return calls == 1 // authorized for the pre-Down check only
+	}
+
+	err := tm.DismissDialogGated(sessionName, DialogBypassPermissions, authorized)
+	if err == nil {
+		t.Fatal("expected error when authorization closes between Down and Enter, got nil")
+	}
+	if calls < 2 {
+		t.Fatalf("authorized() called %d times, want at least 2 (pre-Down and pre-Enter)", calls)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("marker file exists — Enter reached the dialog after authorization closed")
+	}
+}
+
 // TestIsRuleLine pins the structural signature isClaudeComposerOpen and
 // isClaudeComposerStale both depend on: Claude Code's own horizontal-rule
 // chrome line. If this stops matching the real rule, both structural

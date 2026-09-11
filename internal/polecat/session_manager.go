@@ -606,7 +606,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// genuine agent-driven one (see StartupHeartbeatContext: AcceptStartupDialogs
 	// and WaitForRuntimeReady above are both non-fatal, so this write happens
 	// even when startup left a dialog unhandled).
-	TouchSessionHeartbeatWithState(townRoot, sessionID, HeartbeatWorking, StartupHeartbeatContext, "")
+	TouchLauncherStartupHeartbeat(townRoot, sessionID)
 
 	// Stream polecat's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {

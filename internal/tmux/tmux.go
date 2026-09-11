@@ -2629,6 +2629,91 @@ func (t *Tmux) DismissDialog(session string, kind StartupDialogKind) error {
 	return nil
 }
 
+// DismissDialogGated behaves like DismissDialog, but takes an authorized
+// func that must return true immediately before EVERY key in the sequence
+// is sent, aborting the whole sequence — never sending the remaining keys —
+// the instant it returns false. This binds a multi-key dismiss (Down then
+// Enter for the bypass-permissions dialog) to an authorization that can
+// close mid-sequence: the caller supplies a fresh, re-evaluated check (e.g.
+// the startup window closing because the agent wrote its first heartbeat
+// between the two keys), not a value captured once at entry
+// (gtn-qp7 / hq-ooijo revision 3, item 4).
+func (t *Tmux) DismissDialogGated(session string, kind StartupDialogKind, authorized func() bool) error {
+	target := t.AgentTarget(session)
+
+	if !authorized() {
+		return fmt.Errorf("not authorized to dismiss %s: startup window closed", kind)
+	}
+	recheck, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("revalidating pane: %w", err)
+	}
+	if classifyStartupDialog(recheck) != kind {
+		return fmt.Errorf("%s dialog no longer visible at send time", kind)
+	}
+
+	if err := t.dialogDismissKeysGated(target, kind, authorized); err != nil {
+		return err
+	}
+
+	after, err := t.CapturePane(target, 80)
+	if err != nil {
+		return fmt.Errorf("verifying dismiss: %w", err)
+	}
+	if classifyStartupDialog(after) == kind {
+		return fmt.Errorf("%s dialog still visible after dismiss keys", kind)
+	}
+	return nil
+}
+
+// dialogDismissKeysGated is dialogDismissKeys with the same per-key
+// authorized() re-check DismissDialogGated documents. The bypass-permissions
+// sequence rechecks authorized() a SECOND time in the gap between Down and
+// Enter, in addition to the pre-existing dialog-still-showing recheck: the
+// two guard different failures (the dialog was dismissed by something else,
+// vs. the startup window closed because the agent has since proven it is
+// running) and either one aborts the sequence.
+func (t *Tmux) dialogDismissKeysGated(target string, kind StartupDialogKind, authorized func() bool) error {
+	switch kind {
+	case DialogWorkspaceTrust, DialogThemePicker:
+		if !authorized() {
+			return fmt.Errorf("not authorized to send Enter for %s: startup window closed", kind)
+		}
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	case DialogBypassPermissions:
+		if !authorized() {
+			return fmt.Errorf("not authorized to send Down for %s: startup window closed", kind)
+		}
+		if _, err := t.run("send-keys", "-t", target, "Down"); err != nil {
+			return fmt.Errorf("sending Down for %s: %w", kind, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if !authorized() {
+			return fmt.Errorf("not authorized to send Enter for %s: startup window closed mid-sequence", kind)
+		}
+		// Revalidate before the second key: something else (the agent
+		// itself, or an unrelated actor) may have dismissed the dialog in
+		// the gap between Down and Enter. Sending Enter blind here would
+		// submit whatever now has focus.
+		recheck, err := t.CapturePane(target, 80)
+		if err != nil {
+			return fmt.Errorf("revalidating %s before Enter: %w", kind, err)
+		}
+		if classifyStartupDialog(recheck) != kind {
+			return fmt.Errorf("%s dialog no longer visible after Down, refusing to send Enter", kind)
+		}
+		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
+			return fmt.Errorf("sending Enter for %s: %w", kind, err)
+		}
+	default:
+		return fmt.Errorf("unknown dialog kind %q", kind)
+	}
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
 // DetectAndDismissKnownDialog inspects the agent pane's current content and,
 // only when a specific known dialog is detected, sends the exact key
 // sequence that dialog needs. If no known dialog is visible it is a no-op —
@@ -4728,6 +4813,25 @@ func EnsureBindingsOnSocket(socket, townSocket string) error {
 	}
 
 	return nil
+}
+
+// GetSessionID returns tmux's own session identifier (#{session_id}, e.g.
+// "$3") for session. Session IDs are never reused for the lifetime of the
+// tmux server, unlike session NAMES, which can be reused after a session
+// dies and a new one is created with the identical name. #{session_created}
+// alone cannot always distinguish that reuse: a replacement created within
+// the same second carries an identical timestamp. Combining session id with
+// created timestamp closes that gap (gtn-qp7 / hq-ooijo revision 3).
+func (t *Tmux) GetSessionID(session string) (string, error) {
+	out, err := t.run("display-message", "-t", session, "-p", "#{session_id}")
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(out)
+	if id == "" {
+		return "", fmt.Errorf("empty session id for session %s", session)
+	}
+	return id, nil
 }
 
 // GetSessionCreatedUnix returns the Unix timestamp when a session was created.
