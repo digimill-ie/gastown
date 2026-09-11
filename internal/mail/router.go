@@ -1659,8 +1659,11 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		// inter-tool-call gaps. See: https://github.com/steveyegge/gastown/issues/2032
 		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
 		if waitErr == nil {
-			// Agent is idle — deliver directly for immediate wakeup.
-			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
+			// Agent is idle — deliver directly for immediate wakeup. Passes
+			// r.townRoot so this serializes with a concurrent poller/direct
+			// nudge to the same session via the cross-process flock
+			// (hq-g52db) — NudgeSession alone never took that lock.
+			if err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot}); err == nil {
 				r.enqueueReplyReminder(msg, sessionID)
 				notified++
 				continue
@@ -1696,8 +1699,10 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			notified++
 			continue
 		}
-		// No town root available — last resort direct delivery.
-		err = r.tmux.NudgeSession(sessionID, notification)
+		// No town root available — last resort direct delivery. r.townRoot
+		// is empty here (the branch above already handled the non-empty
+		// case), so this carries no flock — same as before this existed.
+		err = r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot})
 		if err == nil {
 			r.enqueueReplyReminder(msg, sessionID)
 			notified++

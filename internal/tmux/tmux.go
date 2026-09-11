@@ -20,7 +20,6 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/telemetry"
-	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // sessionNudgeLocks serializes nudges to the same session.
@@ -1698,23 +1697,7 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 // queue up and execute one at a time. This prevents garbled input when
 // SessionStart hooks and nudges arrive simultaneously.
 func (t *Tmux) NudgeSession(session, message string) error {
-	return t.NudgeSessionWithOpts(session, message, NudgeOpts{TownRoot: resolveTownRootForLock()})
-}
-
-// resolveTownRootForLock finds the town root from the current working
-// directory for cross-process nudge-lock purposes. Every caller of
-// NudgeSession runs inside a Gas Town process (mayor, witness, deacon, cmd
-// handlers, sling helpers, ...), so cwd-based resolution succeeds in
-// practice. Empty is a safe fallback: NudgeSessionWithOpts simply skips the
-// cross-process flock when TownRoot is empty, same as before this existed.
-// This closes the gap where "the option-less path" (tmux.go, hq-g52db) never
-// took the cross-process lock at all: previously only nudge.go's
-// NudgeModeWaitIdle/NudgeModeQueue callers passed TownRoot explicitly, while
-// NudgeSession — used by session_manager, sling helpers, witness handlers,
-// mail delivery, and more — never did.
-func resolveTownRootForLock() string {
-	townRoot, _ := workspace.FindFromCwd()
-	return townRoot
+	return t.NudgeSessionWithOpts(session, message, NudgeOpts{})
 }
 
 // NudgeOpts controls optional behavior for nudge delivery.
