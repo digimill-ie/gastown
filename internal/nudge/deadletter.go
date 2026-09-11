@@ -55,6 +55,14 @@ func DeadLetter(townRoot, session string, n QueuedNudge, source, lastError, pane
 		return "", fmt.Errorf("creating dead-letter dir: %w", err)
 	}
 
+	// Assign an ID before marshaling, not just for the filename: a caller
+	// that builds a QueuedNudge inline (e.g. the wait-idle composer-dirty
+	// path in cmd.deliverNudge, which never goes through Enqueue) would
+	// otherwise persist a record with an empty `id` field, making it
+	// impossible to name via `gt nudge dead-letter replay`.
+	if n.ID == "" {
+		n.ID = randomSuffix() + randomSuffix()
+	}
 	n.LastError = lastError
 	entry := DeadLetterEntry{
 		QueuedNudge:       n,
@@ -69,11 +77,7 @@ func DeadLetter(townRoot, session string, n QueuedNudge, source, lastError, pane
 		return "", fmt.Errorf("marshaling dead-letter entry: %w", err)
 	}
 
-	id := entry.ID
-	if id == "" {
-		id = randomSuffix() + randomSuffix()
-	}
-	filename := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), id)
+	filename := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), entry.ID)
 	path := filepath.Join(dir, filename)
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return "", fmt.Errorf("writing dead-letter entry: %w", err)

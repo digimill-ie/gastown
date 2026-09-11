@@ -56,10 +56,23 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 		if dirty || n.Attempts >= nudge.MaxInjectionAttempts {
 			dlPath, dlErr := nudge.DeadLetter(townRoot, sessionName, n, source, deliverErr.Error(), paneCapture, !dirty)
 			if dlErr != nil {
-				// Durability fallback: don't lose the message because the
-				// dead-letter write itself failed — requeue instead.
-				fmt.Fprintf(os.Stderr, "%s: dead-letter for %s failed, requeuing instead: %v\n", source, sessionName, dlErr)
-				toRequeue = append(toRequeue, n)
+				if !dirty {
+					// Durability fallback for a bounded (non-dirty) failure:
+					// don't lose the message because the dead-letter write
+					// itself failed — requeue instead. Safe because the next
+					// cycle retries an ordinary injection, not a retype into
+					// a known-dirty composer.
+					fmt.Fprintf(os.Stderr, "%s: dead-letter for %s failed, requeuing instead: %v\n", source, sessionName, dlErr)
+					toRequeue = append(toRequeue, n)
+					continue
+				}
+				// A dirty entry must NOT requeue even here: requeuing would
+				// resume the exact retype-into-dirty-composer loop this fix
+				// exists to stop the moment the entry is drained again. This
+				// double fault (composer dirty AND dead-letter unwritable,
+				// e.g. a full disk) drops the message — logged loudly — in
+				// preference to reproducing the duplicate-spam bug.
+				fmt.Fprintf(os.Stderr, "%s: CRITICAL: dead-letter for known-dirty entry %s on %s failed and it will NOT be requeued (would resume the retype loop): %v\n", source, n.ID, sessionName, dlErr)
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "%s: dead-lettered entry %s for %s (%s)\n", source, n.ID, sessionName, dlPath)
@@ -79,10 +92,15 @@ func handleFailedInjection(t *tmux.Tmux, townRoot, sessionName, source string, d
 }
 
 // alertDeadLetter sends a nudge-free (--no-notify equivalent) mail to the
-// rig witness and the mayor when an entry is dead-lettered, so a stuck
-// delivery is visible without anyone polling the dead-letter store. Errors
-// are logged, not returned — a failed alert must not block dead-lettering
-// (which has already durably persisted the entry).
+// rig witness and the mayor when an entry is dead-lettered. SuppressNotify
+// skips the router's proactive tmux/queue nudge to the recipient (router.go
+// notifyRecipient) — that is the point: the bead asks for a "nudge-free
+// alert", precisely so a dead-lettered entry does not itself become another
+// injection into a possibly-still-busy session. The alert is durable and
+// shows up in the recipient's ordinary `gt mail inbox`; it is not a proactive
+// interruption, and does not make the dead-letter store itself unnecessary to
+// check. Errors are logged, not returned — a failed alert must not block
+// dead-lettering (which has already durably persisted the entry).
 //
 // Uses the given townRoot directly rather than findMailWorkDir's cwd/env
 // detection: mail.NewRouter falls back to GT_TOWN_ROOT/GT_ROOT when its

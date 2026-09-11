@@ -48,6 +48,39 @@ func TestDeadLetterAndList(t *testing.T) {
 	}
 }
 
+// TestDeadLetterAssignsIDWhenEntryHasNone covers a code-review finding: a
+// caller that builds a QueuedNudge inline rather than through Enqueue (e.g.
+// cmd.deliverNudge's wait-idle composer-dirty path) passes an entry with no
+// ID. DeadLetter must assign one and persist it in the record, not merely
+// use a locally generated id for the filename and discard it — otherwise
+// the entry can never be named via `gt nudge dead-letter replay`.
+func TestDeadLetterAssignsIDWhenEntryHasNone(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-deadletter-no-id"
+
+	n := QueuedNudge{Sender: "test", Message: "no id yet", Timestamp: time.Now()}
+	if _, err := DeadLetter(townRoot, session, n, "wait-idle", "composer dirty", "", false); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	entries, err := ListDeadLetters(townRoot, session)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(entries))
+	}
+	if entries[0].ID == "" {
+		t.Error("persisted entry has empty ID; gt nudge dead-letter replay can never name it")
+	}
+
+	// The assigned ID must also be replayable — a locally generated
+	// filename-only id would pass ListDeadLetters but fail here.
+	if err := ReplayDeadLetter(townRoot, session, entries[0].ID); err != nil {
+		t.Errorf("ReplayDeadLetter(%q) failed using the persisted ID: %v", entries[0].ID, err)
+	}
+}
+
 func TestListDeadLettersEmptyIsNotError(t *testing.T) {
 	townRoot := t.TempDir()
 	entries, err := ListDeadLetters(townRoot, "gt-no-such-session")

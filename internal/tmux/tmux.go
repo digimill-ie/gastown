@@ -1961,11 +1961,13 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	// 7. Submit with verification — confirms Enter was processed and the
 	// message actually left the composer instead of being stranded by a
 	// swallowed carriage return. (GH#gt-0b5, PR #4461 replacement)
-	// NudgePane targets a specific pane rather than a session, so there is no
-	// session env to look up an agent preset from. This path is used for
-	// direct pane addressing (dispatch/sling), which is Claude-only today, so
-	// recovery keystrokes are assumed validated as before this change.
-	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix, true); err != nil {
+	// NudgePane targets a pane, not a session name, so the GT_AGENT lookup
+	// needs an extra step: resolve the pane's owning session first. This path
+	// is used for dispatch/sling to freshly started sessions, which are NOT
+	// Claude-only — ensureAgentReady (sling_helpers.go) explicitly handles
+	// non-Claude presets here, so recovery keystrokes must be gated the same
+	// way NudgeSessionWithOpts gates them, not assumed validated.
+	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix, recoveryKeystrokesValidatedForPane(t, pane)); err != nil {
 		return fmt.Errorf("nudge to pane %q: %w", pane, err)
 	}
 
@@ -3406,6 +3408,31 @@ func recoveryKeystrokesValidatedForAgent(agentName string) bool {
 		return false
 	}
 	return preset.RecoveryKeystrokesValidated
+}
+
+// recoveryKeystrokesValidatedForPane is recoveryKeystrokesValidatedForSession
+// for a pane target instead of a session name: it resolves the pane's owning
+// session first, since GT_AGENT is a session-level environment variable.
+// Defaults to true (assume Claude) if the owning session cannot be resolved,
+// matching recoveryKeystrokesValidatedForSession's no-GT_AGENT default —
+// this is strictly no worse than this function's behavior before it existed.
+func recoveryKeystrokesValidatedForPane(t *Tmux, pane string) bool {
+	sessionName := t.sessionNameForTarget(pane)
+	if sessionName == "" {
+		return true
+	}
+	return recoveryKeystrokesValidatedForSession(t, sessionName)
+}
+
+// sessionNameForTarget resolves the tmux session name that owns the given
+// target (a pane ID like "%23", or a "session:window.pane" string). Returns
+// "" if the target cannot be resolved (stale pane, no server).
+func (t *Tmux) sessionNameForTarget(target string) string {
+	out, err := t.run("display-message", "-t", target, "-p", "#{session_name}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {

@@ -918,6 +918,21 @@ func wakeRigAgents(rigName string) {
 	// nudges would be stuck forever. Direct delivery is safe: if the
 	// agent is busy, text buffers in tmux and is processed at next prompt.
 	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
+
+	// Test hook: same pattern as nudgeWitness/nudgeRefinery below. Without
+	// this, a test exercising the dispatch path with a real rig name (e.g.
+	// "gastown", the rig this very test suite lives in) sends a REAL nudge
+	// to that rig's REAL witness session on the host — hq-g52db, confirmed
+	// live 2026-09-11.
+	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+		entry := fmt.Sprintf("nudge:%s:Polecat dispatched - check for work\n", witnessSession)
+		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			_, _ = f.WriteString(entry)
+			_ = f.Close()
+		}
+		return
+	}
+
 	t := tmux.NewTmux()
 	if err := t.NudgeSession(witnessSession, "Polecat dispatched - check for work"); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to nudge witness %s: %v\n", witnessSession, err)

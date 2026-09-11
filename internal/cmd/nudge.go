@@ -543,12 +543,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("%s Nudged deacon (%s)\n", style.Bold.Render("✓"), nudgeModeFlag)
-
-		// Log nudge event
-		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-			_ = LogNudge(townRoot, constants.RoleDeacon, message)
-		}
-		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", constants.RoleDeacon, message))
+		logNudgeSent("", constants.RoleDeacon, sender, message)
 		return nil
 	}
 	if dogName, ok := mail.DogAddressName(target); ok {
@@ -568,10 +563,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("%s Nudged %s (%s)\n", style.Bold.Render("✓"), target, nudgeModeFlag)
-		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-			_ = LogNudge(townRoot, target, message)
-		}
-		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", target, message))
+		logNudgeSent("", target, sender, message)
 		return nil
 	}
 	if strings.HasPrefix(target, constants.RoleMayor+"/") || strings.HasPrefix(target, constants.RoleDeacon+"/") {
@@ -638,12 +630,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("%s Nudged %s/%s (%s)\n", style.Bold.Render("✓"), rigName, polecatName, nudgeModeFlag)
-
-		// Log nudge event
-		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-			_ = LogNudge(townRoot, target, message)
-		}
-		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload(rigName, target, message))
+		logNudgeSent(rigName, target, sender, message)
 	} else {
 		// Raw session name (legacy)
 		// Check for ACP session - ACP agents don't have tmux sessions but can receive nudges via queue
@@ -664,15 +651,31 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		fmt.Printf("✓ Nudged %s (%s)\n", target, nudgeModeFlag)
-
-		// Log nudge event
-		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-			_ = LogNudge(townRoot, target, message)
-		}
-		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", target, message))
+		logNudgeSent("", target, sender, message)
 	}
 
 	return nil
+}
+
+// logNudgeSent records a successful nudge send in the town log and activity
+// feed. Skipped entirely when GT_TEST_NUDGE_LOG is set: that means
+// deliverNudge intercepted the send instead of actually delivering it (see
+// its own test hook), so logging it as sent would be false. It matters
+// beyond correctness: LogNudge and events.LogFeed both resolve their town
+// root by walking up from the CURRENT WORKING DIRECTORY, not from any
+// townRoot the caller already has — so without this guard, a test run from a
+// worktree nested inside a real Gas Town workspace writes these records into
+// the REAL town's town.log and .events.jsonl. Confirmed live 2026-09-11
+// (hq-g52db): an unfiltered `go test ./internal/cmd/...` run wrote real
+// "nudge sent" records for gastown/alpha, hq-mayor, deacon, and others.
+func logNudgeSent(rigName, target, sender, message string) {
+	if os.Getenv("GT_TEST_NUDGE_LOG") != "" {
+		return
+	}
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		_ = LogNudge(townRoot, target, message)
+	}
+	_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload(rigName, target, message))
 }
 
 // runNudgeChannel nudges all members of a named channel.
@@ -762,8 +765,11 @@ func runNudgeChannel(channelName, message, sender string) error {
 
 	fmt.Println()
 
-	// Log nudge event
-	_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", "channel:"+channelName, message))
+	// Log nudge event. See logNudgeSent's doc comment for why this is
+	// skipped under GT_TEST_NUDGE_LOG.
+	if os.Getenv("GT_TEST_NUDGE_LOG") == "" {
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", "channel:"+channelName, message))
+	}
 
 	if failed > 0 {
 		summary := fmt.Sprintf("Channel nudge complete: %d succeeded, %d failed", succeeded, failed)

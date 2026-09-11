@@ -564,12 +564,10 @@ func TestHandleFailedInjection_BoundedRetriesDeadLetterAfterMax(t *testing.T) {
 // "dead-letter write failure (the queue file must survive)" test the review
 // asked for: if DeadLetter itself cannot write, the entry falls back to
 // requeue rather than being silently dropped.
-func TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead(t *testing.T) {
-	townRoot := t.TempDir()
-	sessionName := "gt-crew-test"
-
-	// Force nudge.DeadLetter to fail by occupying its target directory path
-	// with a regular file, so MkdirAll cannot create the directory there.
+// blockDeadLetterDir occupies a session's dead-letter directory path with a
+// regular file, so nudge.DeadLetter's MkdirAll fails deterministically.
+func blockDeadLetterDir(t *testing.T, townRoot, sessionName string) {
+	t.Helper()
 	safeName := strings.ReplaceAll(sessionName, "/", "_")
 	deadLetterParent := filepath.Join(townRoot, ".runtime", "nudge_deadletter")
 	if err := os.MkdirAll(deadLetterParent, 0755); err != nil {
@@ -578,9 +576,49 @@ func TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead(t *testing.
 	if err := os.WriteFile(filepath.Join(deadLetterParent, safeName), []byte("blocking file"), 0644); err != nil {
 		t.Fatalf("setup WriteFile: %v", err)
 	}
+}
+
+// TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead covers the
+// BOUNDED (non-dirty) failure path: if DeadLetter itself cannot write, the
+// entry falls back to requeue rather than being silently dropped. Safe here
+// because the next cycle attempts an ordinary retry, not a retype into a
+// known-dirty composer.
+func TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+	blockDeadLetterDir(t, townRoot, sessionName)
 
 	drained := []nudge.QueuedNudge{
-		{ID: "willfail", Sender: "test", Message: "must not be lost", Timestamp: time.Now()},
+		{ID: "willfail", Sender: "test", Message: "must not be lost", Attempts: nudge.MaxInjectionAttempts - 1, Timestamp: time.Now()},
+	}
+	deliverErr := errors.New("uncertain delivery")
+
+	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+
+	requeued, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(requeued) != 1 {
+		t.Fatalf("Drain got %d entries, want 1 (dead-letter write failed on a bounded failure, must fall back to requeue)", len(requeued))
+	}
+	if requeued[0].Message != "must not be lost" {
+		t.Errorf("requeued message = %q, want %q", requeued[0].Message, "must not be lost")
+	}
+}
+
+// TestHandleFailedInjection_DirtyDeadLetterWriteFailureDropsRatherThanRequeues
+// covers the double-fault the review found: when the entry is composer-dirty
+// AND the dead-letter write itself fails, requeuing would resume the exact
+// retype-into-dirty-composer loop hq-g52db was filed to fix. The corrected
+// policy drops the message (loud log) instead of requeuing it.
+func TestHandleFailedInjection_DirtyDeadLetterWriteFailureDropsRatherThanRequeues(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+	blockDeadLetterDir(t, townRoot, sessionName)
+
+	drained := []nudge.QueuedNudge{
+		{ID: "dirty-and-unwritable", Sender: "test", Message: "must not be retyped", Timestamp: time.Now()},
 	}
 	deliverErr := fmt.Errorf("%w: %w", tmux.ErrSubmitNotVerified, tmux.ErrComposerDirty)
 
@@ -590,11 +628,8 @@ func TestHandleFailedInjection_DeadLetterWriteFailureRequeuesInstead(t *testing.
 	if err != nil {
 		t.Fatalf("Drain: %v", err)
 	}
-	if len(requeued) != 1 {
-		t.Fatalf("Drain got %d entries, want 1 (dead-letter write failed, must fall back to requeue)", len(requeued))
-	}
-	if requeued[0].Message != "must not be lost" {
-		t.Errorf("requeued message = %q, want %q", requeued[0].Message, "must not be lost")
+	if len(requeued) != 0 {
+		t.Fatalf("Drain got %d entries requeued, want 0 (a dirty entry must never be requeued, even when dead-lettering it failed)", len(requeued))
 	}
 }
 

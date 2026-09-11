@@ -12,13 +12,15 @@ import (
 // transport could not prove it left the target composer.
 var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in composer")
 
-// ErrComposerDirty reports that, after Enter, the composer holds normal
-// (non-ghost) text that is neither the sent needle nor its prefix. Retyping
-// into this state duplicates content rather than fixing anything, so callers
-// must not retry delivery on this error — see nudge.MaxInjectionAttempts and
-// the poller's dead-letter path. Always wrapped together with
-// ErrSubmitNotVerified; check with errors.Is.
-var ErrComposerDirty = errors.New("composer dirty: retyping would duplicate content")
+// ErrComposerDirty reports a composer state where retyping the message on
+// the next attempt would corrupt or duplicate content rather than fix
+// anything: either the composer holds normal (non-ghost) text that is
+// neither the sent needle nor its prefix, or the needle itself is still
+// sitting there stranded and no validated recovery keystroke can clear it
+// first. Either way, callers must not retry delivery on this error — see
+// nudge.MaxInjectionAttempts and the poller's dead-letter path. Always
+// wrapped together with ErrSubmitNotVerified; check with errors.Is.
+var ErrComposerDirty = errors.New("composer dirty: retyping would corrupt or duplicate content")
 
 type submitProbe int
 
@@ -312,7 +314,14 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string, recoveryVali
 		return fmt.Errorf("%w: %w (composer contains other text after Enter)", ErrSubmitNotVerified, ErrComposerDirty)
 	case probeStranded:
 		if !recoveryValidated {
-			return fmt.Errorf("%w (stranded; recovery keystrokes not validated for this runtime)", ErrSubmitNotVerified)
+			// Wrapped with ErrComposerDirty too, even though the pane state
+			// is "stranded" not "dirty": the needle text is still sitting in
+			// the composer, so a caller that treats this as an ordinary
+			// bounded failure and retypes on the next attempt would type the
+			// new message straight on top of the stranded leftover with no
+			// clear step first — corrupting the composer exactly as a real
+			// dirty-composer retype would. Callers must not retry either.
+			return fmt.Errorf("%w: %w (stranded; recovery keystrokes not validated for this runtime)", ErrSubmitNotVerified, ErrComposerDirty)
 		}
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
