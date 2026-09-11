@@ -116,6 +116,41 @@ func TestClassifyStartupDialog(t *testing.T) {
 			content: "Bypass Permissions mode\n❯ 1. No\n  2. Yes, I accept",
 			want:    DialogBypassPermissions,
 		},
+		{
+			// codex High, tmux.go:2175, REVISION 3: a composer holding
+			// user-typed NUMBERED text was excluded from prompt-indicator
+			// status by the same pattern that (correctly) excludes a
+			// dialog's own "❯ 1. Dark mode" cursor line. That let this
+			// composer's own text re-classify as the dialog it merely
+			// mentions. The exclusion is now scoped to the '❯' glyph only
+			// — never '>' or '›', the real composer leads — so numbered
+			// composer text is recognised as a live prompt like any other.
+			name:    "composer holding numbered text quoting a dialog marker — must not authorise a dismissal",
+			content: "› 1. Explain Quick safety check",
+			want:    DialogNone,
+		},
+		{
+			name:    "composer holding numbered text quoting the bypass marker — must not authorise a dismissal",
+			content: "> 1. What does Bypass Permissions mode do?",
+			want:    DialogNone,
+		},
+		{
+			// codex High, tmux.go:2355, REVISION 3: "the marker is on a
+			// later line than the prompt". A multi-line composer entry —
+			// one open '›' line followed by more typed/pasted lines with
+			// no glyph of their own — is still ALL composer content; only
+			// its first line carries the lead glyph. The old check only
+			// rejected a marker on a line BEFORE a later prompt; it never
+			// rejected a marker appearing AFTER an already-open composer.
+			name:    "composer holding a multi-line quotation of the trust prompt — must not authorise a dismissal",
+			content: "› what happens if I decline to trust this folder, exactly?\nQuick safety check - do you trust this folder?",
+			want:    DialogNone,
+		},
+		{
+			name:    "composer holding a multi-line quotation of the bypass marker — must not authorise a dismissal",
+			content: "› explain this to me:\n  Bypass Permissions mode",
+			want:    DialogNone,
+		},
 	}
 
 	for _, tt := range tests {
@@ -386,20 +421,24 @@ func TestDetectAndDismissKnownDialog_DismissesTrustDialog(t *testing.T) {
 	// finding: startup_dialog_test.go:326 — "positive tests assert
 	// substrings, not the complete key stream").
 	//
-	// A real SCRIPT FILE, run via `bash <path>` — not a multi-line string
-	// handed straight to SendKeys — because SendKeys pastes its whole
-	// argument as one literal burst: a `read` mid-script would consume the
-	// NEXT queued line of that same paste as its own input instead of
-	// blocking on a separately-sent key, corrupting the intended sequence
-	// (same reasoning as TestDismissDialog_BypassDialogClearedBetweenDownAndEnter
-	// below).
+	// The second read's timeout is an INTEGER second, not "0.2": the host's
+	// bash (3.2.57) rejects a fractional -t value outright ("invalid timeout
+	// specification", exit 1) without waiting at all, which silently turned
+	// the stray-key check into a no-op — it always saw an empty, never-read
+	// $_extra regardless of what was actually sent (codex Medium,
+	// startup_dialog_test.go:399, REVISION 3). The check itself now reads
+	// $_extra's READ EXIT STATUS, not its string value: a stray bare Enter
+	// is a single newline byte, which `read -n1` consumes and then reports
+	// as an EMPTY value indistinguishable from "nothing arrived" — only the
+	// exit status (0 = something was read, non-zero = the read timed out)
+	// tells them apart.
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Quick safety check - do you trust this folder?'\n" +
 		"IFS= read -r _line\n" +
-		"IFS= read -rsn1 -t 0.2 _extra\n" +
+		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"clear\n" +
-		"if [ -z \"$_line\" ] && [ -z \"$_extra\" ]; then printf 'exact-single-enter\\n'; " +
-		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi\n"
+		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter\\n'; " +
+		"else printf 'unexpected: line=%s extra=%s status=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\"; fi\n"
 	scriptPath := filepath.Join(t.TempDir(), "trust.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -458,17 +497,23 @@ func TestDetectAndDismissKnownDialog_DismissesBypassDialog(t *testing.T) {
 	// — "positive tests assert substrings, not the complete key stream").
 	//
 	// A script FILE, not an inline multi-line string handed to SendKeys —
-	// see the trust dialog test above for why.
+	// see the trust dialog test above for why. The timeout is an integer
+	// second (bash 3.2 rejects "0.2" outright, silently no-op'ing the wait —
+	// see the trust dialog test above), and the stray-key verdict reads the
+	// read's EXIT STATUS rather than $_extra's string value: a stray bare
+	// Enter is a lone newline byte, which `read -n1` consumes and reports as
+	// an empty value indistinguishable from "nothing arrived" (codex Medium,
+	// startup_dialog_test.go:399, REVISION 3).
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Bypass Permissions mode'\n" +
 		"printf '%s\\n' '1. No'\n" +
 		"printf '%s\\n' '2. Yes, I accept'\n" +
 		"IFS= read -r _line\n" +
-		"IFS= read -rsn1 -t 0.2 _extra\n" +
+		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"clear\n" +
 		"printf '%s' \"$_line\" | cat -v\n" +
 		"printf ':end:'\n" +
-		"if [ -n \"$_extra\" ]; then printf 'stray-key'; else printf 'clean'; fi\n" +
+		"if [ \"$_extra_status\" -eq 0 ]; then printf 'stray-key'; else printf 'clean'; fi\n" +
 		"printf '\\n'\n"
 	scriptPath := filepath.Join(t.TempDir(), "bypass.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
@@ -516,15 +561,18 @@ func TestDetectAndDismissKnownDialog_DismissesThemeDialog(t *testing.T) {
 	// before it and nothing after, prints the marker (codex finding:
 	// startup_dialog_test.go:326 — "positive tests assert substrings, not
 	// the complete key stream").
+	// The timeout is an integer second and the verdict reads the read's exit
+	// status, not $_extra's string value — see the trust dialog test above
+	// for why (codex Medium, startup_dialog_test.go:399, REVISION 3).
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Choose the text style that looks best with your terminal:'\n" +
 		"printf '%s\\n' '1. Dark mode'\n" +
 		"printf '%s\\n' '2. Light mode'\n" +
 		"IFS= read -r _line\n" +
-		"IFS= read -rsn1 -t 0.2 _extra\n" +
+		"IFS= read -rsn1 -t 1 _extra; _extra_status=$?\n" +
 		"clear\n" +
-		"if [ -z \"$_line\" ] && [ -z \"$_extra\" ]; then printf 'exact-single-enter\\n'; " +
-		"else printf 'unexpected: line=%s extra=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\"; fi\n"
+		"if [ -z \"$_line\" ] && [ \"$_extra_status\" -ne 0 ]; then printf 'exact-single-enter\\n'; " +
+		"else printf 'unexpected: line=%s extra=%s status=%s\\n' \"$(printf '%s' \"$_line\" | cat -v)\" \"$(printf '%s' \"$_extra\" | cat -v)\" \"$_extra_status\"; fi\n"
 	scriptPath := filepath.Join(t.TempDir(), "theme.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -614,7 +662,12 @@ func TestDismissDialog_BypassDialogClearedBetweenDownAndEnter(t *testing.T) {
 	script := "#!/bin/bash\n" +
 		"clear; printf '%s\\n' 'Bypass Permissions mode'; printf '%s\\n' '1. No'; printf '%s\\n' '2. Yes, I accept'\n" +
 		"IFS= read -rsn1 _c\n" +
-		"IFS= read -rsn2 -t 0.2 _rest\n" +
+		// Integer timeout — bash 3.2 rejects "0.2" outright (invalid timeout
+		// specification, exit 1, no wait at all), same host issue as the
+		// exact-key-stream tests above (codex Medium,
+		// startup_dialog_test.go:399, REVISION 3). This read only drains any
+		// remaining bytes of Down's escape sequence; its value is unused.
+		"IFS= read -rsn2 -t 1 _rest\n" +
 		"clear; printf '%s\\n' 'unrelated screen, dialog already gone'; printf '%s' '$ '\n" +
 		"IFS= read -r _cmd\n" +
 		"touch " + marker + "\n"

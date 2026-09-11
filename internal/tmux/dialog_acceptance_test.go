@@ -291,6 +291,29 @@ Bypass Permissions mode
 			wantBlocked: true,
 			wantName:    "bypass permissions prompt",
 		},
+		{
+			// codex Medium, tmux.go:2089, REVISION 3: "the same-line fix
+			// does not reach CheckStartupBlocked". Before the fix, this
+			// function matched trust/bypass markers against the raw joined
+			// content directly, bypassing every same-line and open-composer
+			// exclusion classifyStartupDialog already applied — so a
+			// composer merely quoting "Bypass Permissions mode" still
+			// reported a blocker, and CheckStartupBlocked could kill a
+			// healthy session over it (session_manager.go:514).
+			name:        "composer line quotes bypass dialog text on the same line — must not report a blocker",
+			content:     "› explain Bypass Permissions mode",
+			wantBlocked: false,
+		},
+		{
+			name:        "composer line quotes workspace trust text on the same line — must not report a blocker",
+			content:     "› what happens if I decline to trust this folder?",
+			wantBlocked: false,
+		},
+		{
+			name:        "composer holding a multi-line quotation of the bypass marker — must not report a blocker",
+			content:     "› explain this to me:\n  Bypass Permissions mode",
+			wantBlocked: false,
+		},
 	}
 
 	for _, tt := range tests {

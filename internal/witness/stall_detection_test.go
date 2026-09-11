@@ -263,6 +263,48 @@ func TestDetectStalledPolecats_StaleStartupHeartbeat_NotSuppressed(t *testing.T)
 	}
 }
 
+// TestDetectStalledPolecats_StaleStartupHeartbeat_ComposerQuotesDialogText_ZeroKeys
+// is the end-to-end danger scenario codex named for the High finding (codex,
+// tmux.go:2175/:2355, REVISION 3): "with the start-up placeholder present ...
+// Enter or Down/Enter can reach a WORKING composer." A session that never ran
+// a single `gt` command has its startup-placeholder heartbeat correctly
+// distrusted (the sibling test above) and reaches dialog classification —
+// but the pane merely holds a composer QUOTING dialog marker text (numbered,
+// as a user might type it), never having shown the real dialog at all. The
+// fixed classifier must read this as DialogNone; before the fix it
+// misclassified the composer's own text as a still-showing dialog and this
+// test would receive real dismiss keys into that composer.
+func TestDetectStalledPolecats_StaleStartupHeartbeat_ComposerQuotesDialogText_ZeroKeys(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "0s")
+	writeTestStartupHeartbeat(t, f.townRoot, f.sessionName, time.Now().Add(-1*time.Hour), polecat.HeartbeatWorking)
+
+	// `read` keeps the composer's quoted text as the pane's last content
+	// indefinitely, same technique as the classifier's own live-tmux tests.
+	if err := f.tm.SendKeys(f.sessionName, "clear; printf '%s' '› 1. Explain Quick safety check'; read -r _dlg"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	before, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (before): %v", err)
+	}
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+
+	after, err := f.tm.CapturePane(f.sessionName, 30)
+	if err != nil {
+		t.Fatalf("CapturePane (after): %v", err)
+	}
+	if before != after {
+		t.Errorf("pane content changed — a key reached the composer quoting dialog text\nbefore: %q\nafter:  %q", before, after)
+	}
+	if len(result.Stalled) != 1 || result.Stalled[0].Action != "no-known-dialog" {
+		t.Errorf("Stalled = %+v, want one entry with Action=no-known-dialog "+
+			"(numbered composer text quoting a dialog marker must never classify as that dialog)", result.Stalled)
+	}
+}
+
 // TestDetectStalledPolecats_StaleWorkingHeartbeat_WrongIncarnation_NotSuppressed
 // is the merge risk named on hq-ooijo revision 2: a tmux session name can be
 // REUSED (the old session dies, a new one is created with the identical
@@ -376,6 +418,67 @@ func TestDetectStalledPolecats_BackgroundTaskHint_ResolvesAgentPane_NotActiveWin
 	if len(result.Stalled) != 0 {
 		t.Errorf("Stalled = %+v, want empty — the agent pane (window 1) shows a "+
 			"background-task hint even though the idle window 0 is active", result.Stalled)
+	}
+}
+
+// TestDetectStalledPolecats_WindowActivity_ResolvesAgentPane_NotActiveWindow
+// is the agent-pane-resolution polarity for GetWindowActivity specifically
+// (codex Medium, stall_detection_test.go:341, REVISION 3): "no test
+// independently covers agent-window activity targeting. The agent-pane test
+// exits on its background hint before it reads activity, so reverting only
+// GetWindowActivity to the active window stays green." The background-hint
+// test above short-circuits at the busy-hint check before ever reaching
+// GetWindowActivity, so it cannot catch a regression there. This test
+// carries NO busy hint on either window, forcing detection past the busy
+// check and into the activity read itself: window 0 (the session's ACTIVE
+// window) is left stale past the grace period while window 1 (the resolved
+// AGENT pane, via GT_PANE_ID) gets fresh output just before the check runs.
+// Only a check that resolves the AGENT pane — not whichever window merely
+// happens to be active — reads the fresh timestamp and stays quiet.
+func TestDetectStalledPolecats_WindowActivity_ResolvesAgentPane_NotActiveWindow(t *testing.T) {
+	f := newStallTestFixture(t, "0s", "3s")
+	socket := tmux.GetDefaultSocket()
+
+	if out, err := exec.Command("tmux", "-u", "-L", socket, "new-window", "-d", "-t", f.sessionName, "-n", "agent").CombinedOutput(); err != nil {
+		t.Fatalf("tmux new-window: %v (%s)", err, out)
+	}
+	agentPaneOut, err := exec.Command("tmux", "-u", "-L", socket, "display-message", "-t", f.sessionName+":1", "-p", "#{pane_id}").Output()
+	if err != nil {
+		t.Fatalf("resolving new window's pane id: %v", err)
+	}
+	agentPane := strings.TrimSpace(string(agentPaneOut))
+
+	// Declare window 1's pane as the agent pane (mirrors GT_PANE_ID set at
+	// real session startup, gt-qmsx).
+	if err := f.tm.SetEnvironment(f.sessionName, "GT_PANE_ID", agentPane); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+
+	// Both windows are freshly created and silent right now. Sleep past the
+	// 3s grace so both start out stale — same discriminating pattern as
+	// TestDetectStalledPolecats_StaleSessionActivity_RecentWindowActivity_ZeroKeys.
+	time.Sleep(3500 * time.Millisecond)
+
+	// Window 0 — blank, genuinely idle — is left as the session's ACTIVE
+	// window, mirroring an idle auxiliary window being selected while the
+	// agent works elsewhere.
+	if out, err := exec.Command("tmux", "-u", "-L", socket, "select-window", "-t", f.sessionName+":0").CombinedOutput(); err != nil {
+		t.Fatalf("select-window 0: %v (%s)", err, out)
+	}
+
+	// Only the AGENT pane (window 1) produces fresh output.
+	if out, err := exec.Command("tmux", "-u", "-L", socket, "send-keys", "-t", agentPane,
+		"echo fresh-output-on-agent-pane", "Enter").CombinedOutput(); err != nil {
+		t.Fatalf("send-keys to agent pane: %v (%s)", err, out)
+	}
+	time.Sleep(1500 * time.Millisecond)
+
+	result := DetectStalledPolecats(f.townRoot, f.rigName, false)
+	if len(result.Stalled) != 0 {
+		t.Errorf("Stalled = %+v, want empty — the AGENT pane (window 1) has fresh "+
+			"activity even though the idle, stale window 0 is active; a check "+
+			"reading the active window instead of the resolved agent pane would "+
+			"wrongly report this as stalled", result.Stalled)
 	}
 }
 

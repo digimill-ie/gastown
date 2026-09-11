@@ -2043,60 +2043,34 @@ func containsWorkspaceTrustDialog(content string) bool {
 		strings.Contains(content, "Do you trust the contents of this directory?")
 }
 
+// containsBlockingStartupDialog reports whether content shows a known
+// startup modal that must fail CheckStartupBlocked fast. Trust and bypass
+// detection is delegated to classifyStartupDialog — the SAME line-scoped,
+// composer-aware classifier DetectAndDismissKnownDialog uses — rather than
+// matching markers against the raw joined content directly. The two used to
+// diverge: raw whole-content substring checks here ignored every same-line
+// and open-composer exclusion classifyStartupDialog already applied, so a
+// composer merely quoting "Bypass Permissions mode" still reported a
+// blocker and could kill a healthy session (codex Medium, tmux.go:2089 /
+// session_manager.go:514).
+//
+// codex-update is checked separately: its own three markers ("Update
+// available!", "Update now", "Skip until next version") render on three
+// separate lines, so it has never been a per-line match — this preserves
+// that pre-existing, unchanged behavior rather than folding it into
+// classifyStartupDialog's per-line switch, which is out of this fix's scope.
 func containsBlockingStartupDialog(content string) (string, bool) {
-	if promptAppearsAfterStartupBlocker(content) {
-		return "", false
-	}
 	if containsCodexUpdateDialog(content) {
 		return "codex update prompt", true
 	}
-	if containsWorkspaceTrustDialog(content) {
+	switch classifyStartupDialog(content) {
+	case DialogWorkspaceTrust:
 		return "workspace trust prompt", true
-	}
-	if strings.Contains(content, "Bypass Permissions mode") {
+	case DialogBypassPermissions:
 		return "bypass permissions prompt", true
+	default:
+		return "", false
 	}
-	return "", false
-}
-
-func promptAppearsAfterStartupBlocker(content string) bool {
-	promptLine := lastPromptIndicatorLine(content)
-	if promptLine < 0 {
-		return false
-	}
-	blockerLine := lastStartupBlockerLine(content)
-	return blockerLine >= 0 && promptLine > blockerLine
-}
-
-func lastStartupBlockerLine(content string) int {
-	markers := []string{
-		"Update available!",
-		"Update now",
-		"Skip until next version",
-		"trust this folder",
-		"Quick safety check",
-		"Do you trust the contents of this directory?",
-		"Bypass Permissions mode",
-	}
-	last := -1
-	for i, line := range strings.Split(content, "\n") {
-		// A live composer line that happens to QUOTE a marker string (e.g.
-		// "› explain Bypass Permissions mode") is not the dialog itself —
-		// same-line quoted text must never register as a blocker, or a
-		// healthy session gets killed for typing about the dialog it just
-		// dismissed (codex finding, tmux.go:2313 — the sibling bug in
-		// classifyStartupDialog/lastKnownDialogLine below).
-		if lineIsPromptIndicator(line) {
-			continue
-		}
-		for _, marker := range markers {
-			if strings.Contains(line, marker) {
-				last = i
-				break
-			}
-		}
-	}
-	return last
 }
 
 func containsCodexUpdateDialog(content string) bool {
@@ -2122,12 +2096,23 @@ var composerPrefixes = []string{">", "›", "❯"}
 
 // dialogOptionLinePattern matches a numbered option immediately after a
 // composer-lead glyph (e.g. "1. Dark mode", "2. Yes, I accept"). A dialog's
-// own selection cursor is drawn with the same glyphs as a live composer
+// own selection cursor is drawn with the same glyph shape as a live composer
 // ("❯ 1. Dark mode"), so without this check a still-showing dialog's own
 // option line reads as an already-answered composer and suppresses
 // detection of the dialog that is rendering it (codex finding, tmux.go:2145
 // — "a selection cursor reads as composer"; startup_dialog_test.go:38,43
 // omitted this case entirely).
+//
+// This exclusion applies ONLY to the '❯' glyph in lineIsPromptIndicator —
+// never to '>' or '›', the real composer leads for Claude and Codex
+// respectively (see composerPrefixes). '❯' is the TUI's own selection-cursor
+// glyph and is never used to render live, user-typed composer input, so a
+// numbered '❯' line can only be the dialog's cursor. '>' and '›' ARE real
+// composer leads, so numbered text after either is ordinary typed content
+// (e.g. a user typing "1. Explain Quick safety check") — excluding it there
+// let that composer skip prompt-indicator status entirely, which let its own
+// numbered content re-classify as a still-showing dialog (codex High,
+// tmux.go:2175).
 var dialogOptionLinePattern = regexp.MustCompile(`^\d+\.\s`)
 
 // containsPromptIndicator checks if pane content contains a prompt indicator
@@ -2168,11 +2153,13 @@ func lineIsPromptIndicator(line string) bool {
 		if !ok {
 			continue
 		}
-		// A numbered option right after the lead glyph is the dialog's own
-		// selection cursor pointing at one of its choices, not user-typed
+		// A numbered option right after the '❯' cursor glyph is the dialog's
+		// own selection cursor pointing at one of its choices, not user-typed
 		// composer content — reject it so a still-showing dialog's option
-		// list can't read as an already-answered prompt.
-		if dialogOptionLinePattern.MatchString(rest) {
+		// list can't read as an already-answered prompt. Scoped to '❯' only:
+		// see dialogOptionLinePattern's doc comment for why '>' and '›' must
+		// NOT get this exclusion.
+		if prefix == "❯" && dialogOptionLinePattern.MatchString(rest) {
 			continue
 		}
 		return true
@@ -2311,13 +2298,27 @@ func ContainsBackgroundTaskHint(content string) bool {
 		strings.Contains(content, "esc to interrupt")
 }
 
+// isOpenCodexComposerLine reports whether line is Codex's own live
+// input-echo ("› ..." or a bare "›") rather than Claude's composer or
+// Codex's static informational banner text — both of which use '>', the
+// SAME character Codex's own trust-dialog banner prints immediately above
+// the real dialog question ("> You are in <dir>"). '>' therefore must never
+// be treated as marking an open composer, or a genuine, never-yet-answered
+// Codex trust dialog would stop being detected. Only '›' — documented as
+// Codex's composer lead in composerPrefixes, and never used for static
+// banner text — is safe to treat this way.
+func isOpenCodexComposerLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed == "›" || strings.HasPrefix(trimmed, "› ")
+}
+
 // lastKnownDialogLine scans content line by line and returns the line index
 // and kind of the LAST known dialog marker found, or (-1, DialogNone) if
-// none appear. Scanning line-by-line and keeping only the last match mirrors
-// lastStartupBlockerLine so both functions agree on "current" vs "historical".
+// none appear.
 func lastKnownDialogLine(content string) (int, StartupDialogKind) {
 	lastLine := -1
 	lastKind := DialogNone
+	composerOpen := false
 	for i, line := range strings.Split(content, "\n") {
 		// A live composer line that QUOTES dialog text on the same line
 		// (e.g. "› explain Bypass Permissions mode") is not the dialog —
@@ -2328,6 +2329,22 @@ func lastKnownDialogLine(content string) (int, StartupDialogKind) {
 		// detection AND revalidation both authorised keys into that
 		// composer (codex High, tmux.go:2313, REVISION 2).
 		if lineIsPromptIndicator(line) {
+			// An OPEN Codex composer is always the last thing rendered in
+			// a captured pane — nothing else can appear below it until it
+			// is submitted or dismissed. So once one is found, every line
+			// from here to the end of content is that SAME open composer,
+			// even a multi-line paste whose later lines verbatim quote a
+			// dialog marker on their own line ("› explain this:" then
+			// "Bypass Permissions mode" below it puts the marker on a
+			// LATER line than the composer, which the old line-order
+			// check never rejected — codex High, tmux.go:2355, "the
+			// marker is on a later line than the prompt").
+			if isOpenCodexComposerLine(line) {
+				composerOpen = true
+			}
+			continue
+		}
+		if composerOpen {
 			continue
 		}
 		switch {
@@ -2346,7 +2363,8 @@ func lastKnownDialogLine(content string) (int, StartupDialogKind) {
 // CURRENTLY showing in captured pane content. It rejects historical or
 // quoted dialog text still sitting in scrollback: if a prompt indicator
 // appears on a later line than the dialog marker, the dialog has already
-// been answered (same rule as promptAppearsAfterStartupBlocker).
+// been answered. (lastKnownDialogLine separately rejects a marker that
+// appears AFTER an open Codex composer starts, for the reverse ordering.)
 func classifyStartupDialog(content string) StartupDialogKind {
 	blockerLine, kind := lastKnownDialogLine(content)
 	if kind == DialogNone {
