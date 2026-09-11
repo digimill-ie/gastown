@@ -63,16 +63,56 @@ func isolateTestTmuxAndWorkspace(t *testing.T) {
 		t.Fatalf("Chdir: %v", err)
 	}
 
-	t.Setenv("GT_TMUX_SOCKET", fmt.Sprintf("gt-test-isolated-%d", time.Now().UnixNano()))
+	// tmux.NewTmux() — what every command under test actually calls —
+	// resolves its socket from tmux.GetDefaultSocket() first, THEN falls
+	// back to the GT_TOWN_SOCKET env var. It never reads GT_TMUX_SOCKET;
+	// that variable is read only by session.InitRegistry at init
+	// (session/registry.go:128). The previous version of this helper set
+	// ONLY GT_TMUX_SOCKET and never touched GetDefaultSocket(), so any
+	// code under test that called tmux.NewTmux() resolved to whatever
+	// socket the test binary inherited — a REAL, live tmux server, not an
+	// isolated one (codex, nudge_test.go:66, changes-requested at
+	// REVISION 3 — High 8). isolatedSocketProof (below) exercises this
+	// helper and proves nothing lands on the real town socket.
+	isolatedSocket := fmt.Sprintf("gt-test-isolated-%d", time.Now().UnixNano())
+	t.Setenv("GT_TMUX_SOCKET", isolatedSocket)
+	t.Setenv("GT_TOWN_SOCKET", isolatedSocket)
 	t.Setenv("GT_TOWN_ROOT", "")
 	t.Setenv("GT_ROOT", "")
 
 	origSocket := tmux.GetDefaultSocket()
 	origRegistry := session.DefaultRegistry()
+	tmux.SetDefaultSocket(isolatedSocket)
 	t.Cleanup(func() {
 		tmux.SetDefaultSocket(origSocket)
 		session.SetDefaultRegistry(origRegistry)
 	})
+}
+
+// TestIsolateTestTmuxAndWorkspaceRedirectsNewTmux proves that
+// isolateTestTmuxAndWorkspace actually redirects tmux.NewTmux() — what
+// every command under test calls — to a private, non-default socket.
+// Without the tmux.SetDefaultSocket call in the helper (the shape this
+// helper had before High 8), tmux.NewTmux() ignores GT_TMUX_SOCKET
+// entirely and falls through to the default/inherited server: this test
+// goes RED if that call is removed, because SocketName() would then
+// report "" (the default socket) instead of the isolated name.
+func TestIsolateTestTmuxAndWorkspaceRedirectsNewTmux(t *testing.T) {
+	isolateTestTmuxAndWorkspace(t)
+
+	got := tmux.NewTmux().SocketName()
+	if got == "" {
+		t.Fatal("tmux.NewTmux() resolved to the default/inherited socket (empty SocketName) — a test using this helper could reach a REAL tmux server")
+	}
+	if !strings.HasPrefix(got, "gt-test-isolated-") {
+		t.Fatalf("tmux.NewTmux() socket = %q, want a gt-test-isolated-* private socket", got)
+	}
+	if got != tmux.GetDefaultSocket() {
+		t.Fatalf("tmux.NewTmux() socket %q does not match tmux.GetDefaultSocket() %q", got, tmux.GetDefaultSocket())
+	}
+	if envSocket := os.Getenv("GT_TMUX_SOCKET"); envSocket == "" {
+		t.Fatal("GT_TMUX_SOCKET must still be set — session.InitRegistry reads it directly at init (session/registry.go:128), separately from NewTmux's own resolution")
+	}
 }
 
 func TestNudgeHelpUsesTownRootMessagingConfig(t *testing.T) {
@@ -499,14 +539,23 @@ func testTmuxNoSession() *tmux.Tmux {
 
 // TestHandleFailedInjection_GenericErrorRequeuesFirst covers the "any other
 // injection error is bounded" half of hq-g52db's fix 2: a first failure that
-// is NOT composer-dirty is requeued (not dead-lettered), with Attempts
-// incremented so a second failure crosses nudge.MaxInjectionAttempts.
+// is NOT composer-dirty is requeued (not dead-lettered).
+//
+// drained is seeded with Attempts: 1, not 0: handleFailedInjection itself
+// does NOT increment Attempts (see its doc comment) — a real caller
+// persists that increment BEFORE the attempt via Claim.MarkAttempt, so by
+// the time handleFailedInjection sees an entry, Attempts already reflects
+// this attempt. The previous version of this test passed Attempts 0 and
+// asserted the requeued entry came back as 1, which no longer matches the
+// handler (codex, nudge_test.go:525, changes-requested at REVISION 3):
+// this now proves handleFailedInjection PRESERVES the already-incremented
+// count rather than incrementing it a second time.
 func TestHandleFailedInjection_GenericErrorRequeuesFirst(t *testing.T) {
 	townRoot := t.TempDir()
 	sessionName := "gt-crew-test"
 	drained := []nudge.QueuedNudge{
-		{ID: "abc123", Sender: "test", Message: "first", Timestamp: time.Now().Add(-time.Second)},
-		{ID: "def456", Sender: "test", Message: "second", Timestamp: time.Now()},
+		{ID: "abc123", Sender: "test", Message: "first", Timestamp: time.Now().Add(-time.Second), Attempts: 1},
+		{ID: "def456", Sender: "test", Message: "second", Timestamp: time.Now(), Attempts: 1},
 	}
 
 	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceIdleWatcher, drained, errors.New("generic injection failure"))
@@ -523,7 +572,7 @@ func TestHandleFailedInjection_GenericErrorRequeuesFirst(t *testing.T) {
 			t.Fatalf("requeued[%d] = %#v, want %#v", i, got[i], drained[i])
 		}
 		if got[i].Attempts != 1 {
-			t.Errorf("requeued[%d].Attempts = %d, want 1", i, got[i].Attempts)
+			t.Errorf("requeued[%d].Attempts = %d, want 1 (preserved, not re-incremented)", i, got[i].Attempts)
 		}
 	}
 
@@ -656,7 +705,7 @@ func TestPartitionForInjection_ExhaustedEntriesSkipInjection(t *testing.T) {
 		t.Fatalf("DrainClaims got %d claims, want %d", len(claims), len(seed))
 	}
 
-	toInject, exhausted := partitionForInjection(claims)
+	toInject, exhausted, staleInFlight := partitionForInjection(claims)
 
 	var injectIDs, exhaustedIDs []string
 	for _, c := range toInject {
@@ -674,6 +723,50 @@ func TestPartitionForInjection_ExhaustedEntriesSkipInjection(t *testing.T) {
 	if !reflect.DeepEqual(exhaustedIDs, wantExhausted) {
 		t.Errorf("exhausted IDs = %v, want %v", exhaustedIDs, wantExhausted)
 	}
+	if len(staleInFlight) != 0 {
+		t.Errorf("staleInFlight = %v, want none (no seeded entry has InFlight set)", staleInFlight)
+	}
+}
+
+// TestPartitionForInjection_InFlightEntrySkipsInjection covers High 2
+// (nudge_failure.go:152): an entry restored by the orphan sweep with
+// InFlight still true — its prior attempt was interrupted before recording
+// an outcome — must not be handed to a live tmux injection attempt again,
+// regardless of how low its Attempts count is, because we cannot rule out
+// that some of the message already reached the composer.
+func TestPartitionForInjection_InFlightEntrySkipsInjection(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-crew-test"
+
+	if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		ID: "crashed-mid-attempt", Sender: "test", Message: "m1",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claims, err := nudge.DrainClaims(townRoot, sessionName)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("DrainClaims: claims=%d err=%v", len(claims), err)
+	}
+	// Simulate MarkAttempt's pre-attempt persist, then a crash: InFlight
+	// stays true because nothing ever cleared it.
+	if err := claims[0].MarkAttempt(); err != nil {
+		t.Fatalf("MarkAttempt: %v", err)
+	}
+	if !claims[0].Nudge.InFlight {
+		t.Fatalf("MarkAttempt did not set InFlight")
+	}
+
+	toInject, exhausted, staleInFlight := partitionForInjection(claims)
+	if len(toInject) != 0 {
+		t.Errorf("toInject = %v, want none: an in-flight entry must never be retyped", toInject)
+	}
+	if len(exhausted) != 0 {
+		t.Errorf("exhausted = %v, want none: Attempts (1) is below MaxInjectionAttempts", exhausted)
+	}
+	if len(staleInFlight) != 1 || staleInFlight[0].Nudge.ID != "crashed-mid-attempt" {
+		t.Fatalf("staleInFlight = %v, want [crashed-mid-attempt]", staleInFlight)
+	}
 }
 
 // TestHandleFailedInjection_BoundedRetriesDeadLetterAfterMax covers the
@@ -681,11 +774,20 @@ func TestPartitionForInjection_ExhaustedEntriesSkipInjection(t *testing.T) {
 // nudge.MaxInjectionAttempts, the entry is dead-lettered instead of requeued
 // again, so an uncertain (but not provably-dirty) failure does not retype
 // forever either.
+//
+// drained is seeded with Attempts: nudge.MaxInjectionAttempts (the count a
+// real caller has already persisted via Claim.MarkAttempt before THIS,
+// the failing, attempt), not MaxInjectionAttempts-1: handleFailedInjection
+// checks n.Attempts >= nudge.MaxInjectionAttempts, and does not itself
+// increment Attempts (see its doc comment) — MaxInjectionAttempts-1 never
+// crosses that bound, so the previous version of this test asserted an
+// outcome (dead-letter) the handler does not actually produce for that
+// input (codex, nudge_test.go:697, changes-requested at REVISION 3).
 func TestHandleFailedInjection_BoundedRetriesDeadLetterAfterMax(t *testing.T) {
 	townRoot := t.TempDir()
 	sessionName := "gt-crew-test"
 	drained := []nudge.QueuedNudge{
-		{ID: "uncertain1", Sender: "test", Message: "ack lost after typing", Timestamp: time.Now(), Attempts: nudge.MaxInjectionAttempts - 1},
+		{ID: "uncertain1", Sender: "test", Message: "ack lost after typing", Timestamp: time.Now(), Attempts: nudge.MaxInjectionAttempts},
 	}
 
 	handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceIdleWatcher, drained, errors.New("uncertain delivery"))

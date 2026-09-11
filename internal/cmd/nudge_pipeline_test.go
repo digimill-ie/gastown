@@ -66,7 +66,11 @@ func TestPipeline_AckLostAfterTyping_DeadLettersAndAcksClaim(t *testing.T) {
 	// Simulate the poller's real sequence: persist the attempt before
 	// injecting, then the injection fails with an unverified (ack-lost)
 	// error — mirrors submit_verify.go's post-C-j "pane gone" wrapping.
-	claims = markAttempts(sourceNudgePoller, sessionName, claims)
+	marked, failedPersist := markAttempts(sourceNudgePoller, sessionName, claims)
+	if len(failedPersist) != 0 {
+		t.Fatalf("markAttempts: %d claims failed to persist, want 0", len(failedPersist))
+	}
+	claims = marked
 	deliverErr := fmt.Errorf("%w (C-j reset failed: pane gone)", tmux.ErrSubmitNotVerified)
 
 	drained := claimNudges(claims)
@@ -186,6 +190,73 @@ func TestPipeline_BoundedDoubleFault_KeepsClaimForRecovery(t *testing.T) {
 	// same sabotage that made ListDeadLetters itself unable to even read
 	// that directory (it's a file, not a directory) — which is itself
 	// proof nothing was written there.
+	if _, err := nudge.ListDeadLetters(townRoot, sessionName); err == nil {
+		t.Fatalf("ListDeadLetters succeeded against a directory this test replaced with a file — sabotage didn't take")
+	}
+}
+
+// TestPipeline_UnverifiedDoubleFault_RetainsClaim covers High 1
+// (nudge_failure.go:121, R2 hq-g52db REVISION 3): an UNVERIFIED entry
+// (ErrSubmitNotVerified — we cannot rule out partial delivery) whose
+// dead-letter write ALSO fails must be RETAINED, never dropped. The
+// previous version of this code acked the original claim anyway, calling
+// it a "deliberate drop" — this proves the fixed behavior: the claim
+// comes back in unresolved and survives ackClaims, and — because
+// requeuing an unverified entry risks retyping into a possibly-already-
+// typed composer — it must NOT appear back in the live queue either.
+func TestPipeline_UnverifiedDoubleFault_RetainsClaim(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-pipeline-unverified-doublefault"
+
+	if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		ID: "unverified-double-fault-1", Sender: "test", Message: "must not be dropped",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claims, err := nudge.DrainClaims(townRoot, sessionName)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("DrainClaims: claims=%d err=%v", len(claims), err)
+	}
+	if claimFileCount(t, townRoot, sessionName) != 1 {
+		t.Fatalf("expected 1 claim file on disk before injection")
+	}
+
+	// Force the dead-letter write to fail, same sabotage as the bounded
+	// double-fault test above.
+	deadLetterPath := filepath.Join(townRoot, ".runtime", "nudge_deadletter", sessionName)
+	if err := os.MkdirAll(filepath.Dir(deadLetterPath), 0755); err != nil {
+		t.Fatalf("MkdirAll parent: %v", err)
+	}
+	if err := os.WriteFile(deadLetterPath, []byte("block"), 0644); err != nil {
+		t.Fatalf("blocking dead-letter dir: %v", err)
+	}
+
+	drained := []nudge.QueuedNudge{claims[0].Nudge}
+	deliverErr := fmt.Errorf("%w (C-j reset failed: pane gone)", tmux.ErrSubmitNotVerified)
+
+	unresolved := handleFailedInjection(testTmuxNoSession(), townRoot, sessionName, sourceNudgePoller, drained, deliverErr)
+	if len(unresolved) != 1 {
+		t.Fatalf("unresolved = %d entries, want 1 (retained, not dropped)", len(unresolved))
+	}
+	if unresolved[0].ID != "unverified-double-fault-1" {
+		t.Errorf("unresolved[0].ID = %q, want %q", unresolved[0].ID, "unverified-double-fault-1")
+	}
+
+	ackClaims(sourceNudgePoller, sessionName, claims, unresolved)
+
+	// The ORIGINAL claim file must still exist: retained, not acked away.
+	if n := claimFileCount(t, townRoot, sessionName); n != 1 {
+		t.Fatalf("claim files remaining after ackClaims = %d, want 1 (an unverified double fault must RETAIN the claim, never drop it)", n)
+	}
+
+	// Must NOT be requeued into the live queue: an unverified entry must
+	// never be retyped, and requeuing it here would risk exactly that on
+	// the next drain.
+	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 0 {
+		t.Fatalf("Pending = %d, want 0: an unverified double-fault entry must not reappear as a fresh requeued .json", pending)
+	}
+
 	if _, err := nudge.ListDeadLetters(townRoot, sessionName); err == nil {
 		t.Fatalf("ListDeadLetters succeeded against a directory this test replaced with a file — sabotage didn't take")
 	}

@@ -217,6 +217,15 @@ func NewTmuxWithSocket(socket string) *Tmux {
 	return &Tmux{socketName: socket}
 }
 
+// SocketName returns the tmux socket (-L flag) this instance targets, or ""
+// for the default tmux server. Exported so tests outside this package can
+// prove a test-isolation helper actually redirected NewTmux() to a private
+// socket, rather than assuming it from the env vars the helper happened to
+// set (codex, nudge_test.go:66, changes-requested at REVISION 3 — High 8).
+func (t *Tmux) SocketName() string {
+	return t.socketName
+}
+
 // run executes a tmux command and returns stdout.
 // All commands include -u flag for UTF-8 support regardless of locale settings.
 // See: https://github.com/steveyegge/gastown/issues/1219

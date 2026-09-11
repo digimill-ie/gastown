@@ -32,8 +32,9 @@ var errBusyDeferred = errors.New("nudge delivery deferred: session busy")
 // an unrelated new nudge happens to arrive (codex, propulsion.go:190,
 // changes-requested at REVISION 3 — High 7). Deliberately shorter than
 // nudge's staleClaimThreshold (5 minutes) so a busy-deferred claim gets
-// re-checked well before it would otherwise be swept as orphaned.
-const claimRecoveryInterval = 60 * time.Second
+// re-checked well before it would otherwise be swept as orphaned. A var,
+// not a const, so a test can shrink it instead of waiting a full minute.
+var claimRecoveryInterval = 60 * time.Second
 
 // acpDebugLogger provides file-based debug logging for ACP when GT_ACP_DEBUG=1.
 // It lazily opens the log file on first use and keeps it open for the session.

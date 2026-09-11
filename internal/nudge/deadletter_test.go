@@ -277,6 +277,67 @@ func TestOrphanedReplayIsSweptBackToVisible(t *testing.T) {
 	}
 }
 
+// TestOrphanedReplayAfterSuccessfulEnqueueIsNotResurrected covers High 9
+// (deadletter.go:211): a crash between ReplayDeadLetter's Enqueue
+// succeeding and its claim-file removal leaves a stale ".replaying" claim
+// whose payload is ALREADY live in the active queue. The prior sweep
+// treated every stale ".replaying" file the same way — restore it to a
+// plain, replayable dead-letter entry — which would let a SECOND replay
+// enqueue a duplicate. The sweep must instead recognize that this
+// specific claim's ID is already pending in the active queue and remove
+// it outright instead of resurrecting it.
+func TestOrphanedReplayAfterSuccessfulEnqueueIsNotResurrected(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-replay-post-enqueue-crash"
+
+	n := QueuedNudge{ID: "already-enqueued", Sender: "test", Message: "landed before the crash", Timestamp: time.Now()}
+	path, err := DeadLetter(townRoot, session, n, "nudge-poller", "boom", "", true)
+	if err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+
+	// Simulate ReplayDeadLetter's crash window AFTER Enqueue succeeded but
+	// BEFORE the claim file was removed: claim the entry, Enqueue its
+	// payload for real, and stop — no os.Remove(claimPath).
+	claimPath := path + ".replaying"
+	if err := os.Rename(path, claimPath); err != nil {
+		t.Fatalf("simulating claim: %v", err)
+	}
+	replay := n
+	replay.Attempts = 0
+	replay.LastError = ""
+	if err := Enqueue(townRoot, session, replay); err != nil {
+		t.Fatalf("simulating the replay's own Enqueue: %v", err)
+	}
+	old := time.Now().Add(-deadLetterReplayStaleThreshold - time.Minute)
+	if err := os.Chtimes(claimPath, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	// The sweep (via ListDeadLetters) must recognize the payload is
+	// already live and remove the stale claim, NOT restore it as a fresh,
+	// replayable dead-letter entry.
+	entries, err := ListDeadLetters(townRoot, session)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("ListDeadLetters = %#v, want none: the already-enqueued claim must not be resurrected as replayable", entries)
+	}
+	if _, err := os.Stat(claimPath); !os.IsNotExist(err) {
+		t.Fatalf("stale claim file still exists after the sweep should have removed it (already enqueued): err=%v", err)
+	}
+
+	// Exactly one copy in the active queue — never a duplicate.
+	drained, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drained) != 1 {
+		t.Fatalf("Drain got %d entries, want exactly 1 (no duplicate from the resurrected claim)", len(drained))
+	}
+}
+
 // TestFreshReplayClaimIsNotSweptPrematurely is the false-case companion:
 // a ".replaying" file younger than deadLetterReplayStaleThreshold (a
 // genuinely in-flight replay, not a crashed one) must NOT be restored —

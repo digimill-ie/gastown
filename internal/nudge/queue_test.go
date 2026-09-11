@@ -1,10 +1,12 @@
 package nudge
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -940,6 +942,68 @@ func TestConcurrentDrainNoDoubleDeli(t *testing.T) {
 	}
 }
 
+// TestConcurrentDrainOldEntryNoDoubleDeliOrphanRace covers High 3
+// (queue.go:430): DrainClaims used to reset a newly-claimed file's mtime
+// AFTER the rename, leaving a window where the file was already visible
+// under its .claimed name but still carried its old, pre-claim mtime. A
+// pending entry that had simply been sitting in the queue longer than
+// staleClaimThreshold (routine for a normal 30-minute-TTL nudge, not a
+// bug) would read as an orphaned claim the INSTANT a concurrent
+// DrainClaims call observed it in that window, restoring it to pending
+// and handing it to a second, concurrent claimer while the first was
+// still mid-delivery. The fix resets the mtime on the ORIGINAL path
+// before the rename, so the file is never visible under any .claimed name
+// with a stale mtime. Backdates ONE entry well past staleClaimThreshold
+// and races many concurrent DrainClaims calls against it.
+func TestConcurrentDrainOldEntryNoDoubleDeliOrphanRace(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-old-entry-race"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "test", Message: "long-waiting"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("ReadDir: entries=%d err=%v", len(entries), err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute) // well past staleClaimThreshold (5m)
+	path := filepath.Join(dir, entries[0].Name())
+	if err := os.Chtimes(path, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	const drainers = 20
+	var wg sync.WaitGroup
+	var claimedCount int32
+	start := make(chan struct{})
+	for i := 0; i < drainers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			claims, err := DrainClaims(townRoot, session)
+			if err != nil {
+				t.Errorf("concurrent DrainClaims: %v", err)
+				return
+			}
+			atomic.AddInt32(&claimedCount, int32(len(claims)))
+			for _, c := range claims {
+				if ackErr := c.Ack(); ackErr != nil {
+					t.Errorf("Ack: %v", ackErr)
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if claimedCount != 1 {
+		t.Fatalf("concurrent DrainClaims claimed the entry %d times, want exactly 1 (an old-but-pending entry must not be re-surfaced as orphaned the instant it is claimed)", claimedCount)
+	}
+}
+
 // TestEnqueueAssignsID covers hq-g52db: every enqueued nudge gets a stable
 // identity so failed-delivery attempts can be correlated across the poller,
 // the idle watcher, and a poller restart even though each requeue writes a
@@ -985,6 +1049,66 @@ func TestEnqueuePreservesExplicitID(t *testing.T) {
 	}
 	if nudges[0].ID != "fixed-id-123" {
 		t.Errorf("ID = %q, want %q (Enqueue must not overwrite an explicit ID)", nudges[0].ID, "fixed-id-123")
+	}
+}
+
+// TestDrainClaims_AssignsIDToLegacyEntryWithoutOne covers High 4
+// (queue.go:288): a file queued by a version of this code before the ID
+// field existed (or otherwise missing one) deserializes with ID == "".
+// AckClaims' skip map (see its doc) only ever adds a NON-empty ID, so a
+// claim that still carried an empty ID by the time it reached AckClaims
+// could never be recognized as unresolved — it would be acked (deleted)
+// even after a failed requeue/dead-letter write. DrainClaims must assign
+// (and persist) an ID at claim time so this can never happen.
+func TestDrainClaims_AssignsIDToLegacyEntryWithoutOne(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-legacy-no-id"
+
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// A pre-ID-field queue entry: no "id" key at all.
+	legacyPath := filepath.Join(dir, "100-legacy.json")
+	if err := os.WriteFile(legacyPath, []byte(`{"sender":"ghost","message":"pre-ID entry","priority":"normal"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	claims, err := DrainClaims(townRoot, session)
+	if err != nil {
+		t.Fatalf("DrainClaims: %v", err)
+	}
+	if len(claims) != 1 {
+		t.Fatalf("DrainClaims got %d claims, want 1", len(claims))
+	}
+	if claims[0].Nudge.ID == "" {
+		t.Fatal("DrainClaims left the claim's ID empty — AckClaims can never recognize this entry as unresolved")
+	}
+
+	// The assigned ID must be PERSISTED, not just held in memory: simulate
+	// a crash-and-restore by reading the claim file straight off disk.
+	// (Same package as queue.go, so the unexported path field is
+	// reachable directly — no need for a test-only exported accessor.)
+	data, err := os.ReadFile(claims[0].path)
+	if err != nil {
+		t.Fatalf("ReadFile claim: %v", err)
+	}
+	var onDisk QueuedNudge
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if onDisk.ID != claims[0].Nudge.ID {
+		t.Errorf("on-disk ID = %q, in-memory ID = %q: the assigned ID must be persisted to the claim file", onDisk.ID, claims[0].Nudge.ID)
+	}
+
+	// Reproduce the actual failure mode: a caller that decides this
+	// entry's outcome did NOT durably land anywhere (its ID appears in
+	// unresolved) must be able to leave its claim un-acked.
+	AckClaims(claims, []QueuedNudge{claims[0].Nudge}, func(c Claim, ackErr error) {
+		t.Errorf("unexpected ack error: %v", ackErr)
+	})
+	if _, err := os.Stat(claims[0].path); os.IsNotExist(err) {
+		t.Fatal("AckClaims deleted a claim named in unresolved — the empty-ID matching gap let it through")
 	}
 }
 
