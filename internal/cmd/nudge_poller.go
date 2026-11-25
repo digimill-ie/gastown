@@ -71,23 +71,6 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("session %q not found", sessionName)
 	}
 
-	// Resolve nudge options once at startup: if the target agent uses Escape
-	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
-	// to avoid canceling in-flight generation. (GH#gt-wasn)
-	nudgeOpts := tmux.NudgeOpts{}
-	agentName := ""
-	hasPromptDetection := false
-	readyPromptPrefix := tmux.DefaultReadyPromptPrefix
-	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
-		agentName = name
-		rigName, _ := t.GetEnvironment(sessionName, "GT_RIG")
-		rigPath := ""
-		if rigName != "" {
-			rigPath = filepath.Join(townRoot, rigName)
-		}
-		hasPromptDetection, readyPromptPrefix, nudgeOpts = resolveNudgePollerAgentOptions(agentName, townRoot, rigPath)
-	}
-
 	// Set up signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -110,6 +93,13 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			if n, _ := nudge.Pending(townRoot, sessionName); n == 0 {
 				continue
 			}
+
+			// Resolve runtime details for each pending batch. A session may have
+			// restarted under a different agent since the previous poll tick.
+			hasPromptDetection, readyPromptPrefix, nudgeOpts := resolveNudgePollerAgentOptionsForSession(
+				func(key string) (string, error) { return t.GetEnvironment(sessionName, key) },
+				townRoot,
+			)
 
 			// For runtimes with prompt detection, defer delivery until the session
 			// is actually idle. Runtimes without prompt detection preserve the old
@@ -138,6 +128,20 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	}
 }
 
+func resolveNudgePollerAgentOptionsForSession(getEnvironment func(string) (string, error), townRoot string) (bool, string, tmux.NudgeOpts) {
+	agentName, err := getEnvironment("GT_AGENT")
+	if err != nil || agentName == "" {
+		return false, tmux.DefaultReadyPromptPrefix, tmux.NudgeOpts{}
+	}
+
+	rigName, _ := getEnvironment("GT_RIG")
+	rigPath := ""
+	if rigName != "" {
+		rigPath = filepath.Join(townRoot, rigName)
+	}
+	return resolveNudgePollerAgentOptions(agentName, townRoot, rigPath)
+}
+
 func resolveNudgePollerAgentOptions(agentName, townRoot, rigPath string) (bool, string, tmux.NudgeOpts) {
 	if preset := config.GetAgentPresetByName(agentName); preset != nil {
 		promptPrefix := preset.ReadyPromptPrefix
@@ -153,20 +157,15 @@ func resolveNudgePollerAgentOptions(agentName, townRoot, rigPath string) (bool, 
 		return false, tmux.DefaultReadyPromptPrefix, tmux.NudgeOpts{}
 	}
 
-	readyPromptPrefix := ""
-	if resolved.Tmux != nil {
-		readyPromptPrefix = resolved.Tmux.ReadyPromptPrefix
-	}
-	hasPromptDetection := readyPromptPrefix != ""
-	if readyPromptPrefix == "" {
-		readyPromptPrefix = tmux.DefaultReadyPromptPrefix
-	}
 	presetName := resolved.Provider
 	if presetName == "" {
 		presetName = resolved.Command
 	}
 	preset := config.GetAgentPresetByName(presetName)
-	return hasPromptDetection, readyPromptPrefix, tmux.NudgeOpts{SkipEscape: preset != nil && preset.EscapeCancelsRequest}
+	if preset == nil || preset.ReadyPromptPrefix == "" {
+		return false, tmux.DefaultReadyPromptPrefix, tmux.NudgeOpts{SkipEscape: preset != nil && preset.EscapeCancelsRequest}
+	}
+	return true, preset.ReadyPromptPrefix, tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}
 }
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {

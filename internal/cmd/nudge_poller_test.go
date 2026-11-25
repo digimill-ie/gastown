@@ -39,7 +39,11 @@ func TestResolveNudgePollerAgentOptionsCustomAlias(t *testing.T) {
 	rigPath := filepath.Join(townRoot, "testrig")
 	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), &config.RigSettings{
 		Type: "rig-settings", Version: config.CurrentRigSettingsVersion,
-		Agents: map[string]*config.RuntimeConfig{"claude-helm": {Command: "claude"}},
+		Agents: map[string]*config.RuntimeConfig{
+			"claude-helm":  {Command: "claude"},
+			"codex-crew":   {Command: "codex", Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "CUSTOM> "}},
+			"copilot-crew": {Command: "copilot", Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "CUSTOM> "}},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +85,78 @@ func TestResolveNudgePollerAgentOptionsCustomAlias(t *testing.T) {
 	}
 	if len(drained) != 0 {
 		t.Fatalf("second idle drain delivered %d nudges, want 0", len(drained))
+	}
+}
+
+func TestResolveNudgePollerAgentOptionsUsesOnlyBuiltinPrompt(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), &config.RigSettings{
+		Type: "rig-settings", Version: config.CurrentRigSettingsVersion,
+		Agents: map[string]*config.RuntimeConfig{
+			"codex-crew":   {Command: "codex", Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "CUSTOM> "}},
+			"copilot-crew": {Command: "copilot", Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "CUSTOM> "}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hasPrompt, prefix, _ := resolveNudgePollerAgentOptions("codex-crew", townRoot, rigPath)
+	codexPreset := config.GetAgentPresetByName("codex")
+	if codexPreset == nil || codexPreset.ReadyPromptPrefix == "" {
+		t.Fatal("test requires Codex built-in preset to have its own prompt prefix")
+	}
+	if !hasPrompt || prefix != codexPreset.ReadyPromptPrefix {
+		t.Fatalf("Codex alias = (%v, %q), want built-in prefix %q", hasPrompt, prefix, codexPreset.ReadyPromptPrefix)
+	}
+
+	hasPrompt, prefix, _ = resolveNudgePollerAgentOptions("copilot-crew", townRoot, rigPath)
+	copilotPreset := config.GetAgentPresetByName("copilot")
+	if copilotPreset == nil || copilotPreset.ReadyPromptPrefix != "" {
+		t.Fatal("test requires Copilot built-in preset to have no prompt prefix")
+	}
+	if hasPrompt || prefix != tmux.DefaultReadyPromptPrefix {
+		t.Fatalf("Copilot alias = (%v, %q), want no prompt detection and default fallback", hasPrompt, prefix)
+	}
+	if shouldSkipDrainUntilIdle(hasPrompt, errors.New("timeout")) {
+		t.Fatal("agent without a built-in prompt should preserve best-effort draining")
+	}
+}
+
+func TestResolveNudgePollerAgentOptionsForSessionRefreshesAgent(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), &config.RigSettings{
+		Type: "rig-settings", Version: config.CurrentRigSettingsVersion,
+		Agents: map[string]*config.RuntimeConfig{
+			"claude-helm":  {Command: "claude"},
+			"copilot-crew": {Command: "copilot"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	currentAgent := "claude-helm"
+	getEnvironment := func(key string) (string, error) {
+		switch key {
+		case "GT_AGENT":
+			return currentAgent, nil
+		case "GT_RIG":
+			return "testrig", nil
+		default:
+			return "", errors.New("unexpected environment key")
+		}
+	}
+
+	hasPrompt, _, _ := resolveNudgePollerAgentOptionsForSession(getEnvironment, townRoot)
+	if !hasPrompt {
+		t.Fatal("Claude alias should enable prompt detection on the first tick")
+	}
+
+	currentAgent = "copilot-crew"
+	hasPrompt, prefix, _ := resolveNudgePollerAgentOptionsForSession(getEnvironment, townRoot)
+	if hasPrompt || prefix != tmux.DefaultReadyPromptPrefix {
+		t.Fatalf("updated alias = (%v, %q), want best-effort prompt fallback", hasPrompt, prefix)
 	}
 }
 
