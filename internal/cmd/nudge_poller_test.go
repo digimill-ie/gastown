@@ -7,6 +7,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestShouldSkipDrainUntilIdle(t *testing.T) {
@@ -48,9 +49,12 @@ func TestResolveNudgePollerAgentOptionsCustomAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hasPromptDetection, opts := resolveNudgePollerAgentOptions("claude-helm", townRoot, rigPath)
+	hasPromptDetection, promptPrefix, opts := resolveNudgePollerAgentOptions("claude-helm", townRoot, rigPath)
 	if !hasPromptDetection {
 		t.Fatal("custom Claude alias should enable prompt detection")
+	}
+	if promptPrefix != config.GetAgentPresetByName("claude").ReadyPromptPrefix {
+		t.Fatalf("custom Claude alias prompt prefix = %q, want Claude preset prefix", promptPrefix)
 	}
 	if opts.SkipEscape {
 		t.Fatal("Claude alias should not skip Escape")
@@ -81,9 +85,12 @@ func TestResolveNudgePollerAgentOptionsCustomAlias(t *testing.T) {
 }
 
 func TestResolveNudgePollerAgentOptionsUnknownAlias(t *testing.T) {
-	hasPromptDetection, opts := resolveNudgePollerAgentOptions("unknown-agent", t.TempDir(), "")
+	hasPromptDetection, promptPrefix, opts := resolveNudgePollerAgentOptions("unknown-agent", t.TempDir(), "")
 	if hasPromptDetection {
 		t.Fatal("unknown alias should preserve best-effort behavior")
+	}
+	if promptPrefix != tmux.DefaultReadyPromptPrefix {
+		t.Fatalf("unknown alias prompt prefix = %q, want default %q", promptPrefix, tmux.DefaultReadyPromptPrefix)
 	}
 	if opts.SkipEscape {
 		t.Fatal("unknown alias should use default nudge options")

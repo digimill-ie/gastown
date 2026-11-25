@@ -77,6 +77,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	nudgeOpts := tmux.NudgeOpts{}
 	agentName := ""
 	hasPromptDetection := false
+	readyPromptPrefix := tmux.DefaultReadyPromptPrefix
 	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
 		agentName = name
 		rigName, _ := t.GetEnvironment(sessionName, "GT_RIG")
@@ -84,7 +85,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		if rigName != "" {
 			rigPath = filepath.Join(townRoot, rigName)
 		}
-		hasPromptDetection, nudgeOpts = resolveNudgePollerAgentOptions(agentName, townRoot, rigPath)
+		hasPromptDetection, readyPromptPrefix, nudgeOpts = resolveNudgePollerAgentOptions(agentName, townRoot, rigPath)
 	}
 
 	// Set up signal handling for graceful shutdown.
@@ -113,7 +114,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			// For runtimes with prompt detection, defer delivery until the session
 			// is actually idle. Runtimes without prompt detection preserve the old
 			// best-effort behavior and drain on the poll interval.
-			waitErr := t.WaitForIdle(sessionName, idleTimeout)
+			waitErr := t.WaitForIdleWithPromptPrefix(sessionName, readyPromptPrefix, idleTimeout)
 			if shouldSkipDrainUntilIdle(hasPromptDetection, waitErr) {
 				continue
 			}
@@ -137,24 +138,35 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	}
 }
 
-func resolveNudgePollerAgentOptions(agentName, townRoot, rigPath string) (bool, tmux.NudgeOpts) {
+func resolveNudgePollerAgentOptions(agentName, townRoot, rigPath string) (bool, string, tmux.NudgeOpts) {
 	if preset := config.GetAgentPresetByName(agentName); preset != nil {
-		return preset.ReadyPromptPrefix != "", tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}
+		promptPrefix := preset.ReadyPromptPrefix
+		if promptPrefix == "" {
+			promptPrefix = tmux.DefaultReadyPromptPrefix
+		}
+		return preset.ReadyPromptPrefix != "", promptPrefix, tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}
 	}
 
 	resolved := config.ResolveAgentConfigByName(agentName, townRoot, rigPath)
 	if resolved == nil {
 		fmt.Fprintf(os.Stderr, "nudge-poller: could not resolve agent %q; using best-effort delivery\n", agentName)
-		return false, tmux.NudgeOpts{}
+		return false, tmux.DefaultReadyPromptPrefix, tmux.NudgeOpts{}
 	}
 
-	hasPromptDetection := resolved.Tmux != nil && resolved.Tmux.ReadyPromptPrefix != ""
+	readyPromptPrefix := ""
+	if resolved.Tmux != nil {
+		readyPromptPrefix = resolved.Tmux.ReadyPromptPrefix
+	}
+	hasPromptDetection := readyPromptPrefix != ""
+	if readyPromptPrefix == "" {
+		readyPromptPrefix = tmux.DefaultReadyPromptPrefix
+	}
 	presetName := resolved.Provider
 	if presetName == "" {
 		presetName = resolved.Command
 	}
 	preset := config.GetAgentPresetByName(presetName)
-	return hasPromptDetection, tmux.NudgeOpts{SkipEscape: preset != nil && preset.EscapeCancelsRequest}
+	return hasPromptDetection, readyPromptPrefix, tmux.NudgeOpts{SkipEscape: preset != nil && preset.EscapeCancelsRequest}
 }
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {

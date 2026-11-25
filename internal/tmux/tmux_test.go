@@ -2275,6 +2275,23 @@ func TestWaitForIdle_Timeout(t *testing.T) {
 	}
 }
 
+func TestWaitForIdleWithPromptPrefix_CustomRuntimePrompt(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := fmt.Sprintf("gt-test-idle-custom-%d", time.Now().UnixNano())
+	if err := tm.NewSessionWithCommand(sessionName, os.TempDir(), "printf 'CUSTOM> \\n'; sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	time.Sleep(200 * time.Millisecond)
+	if err := tm.WaitForIdle(sessionName, 500*time.Millisecond); !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("WaitForIdle with default prompt = %v, want ErrIdleTimeout", err)
+	}
+	if err := tm.WaitForIdleWithPromptPrefix(sessionName, "CUSTOM> ", time.Second); err != nil {
+		t.Fatalf("WaitForIdleWithPromptPrefix with custom prompt: %v", err)
+	}
+}
+
 func TestHasBusyIndicator(t *testing.T) {
 	t.Parallel()
 
