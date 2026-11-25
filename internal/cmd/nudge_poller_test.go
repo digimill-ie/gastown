@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/nudge"
 )
 
 func TestShouldSkipDrainUntilIdle(t *testing.T) {
@@ -42,6 +43,11 @@ func TestResolveNudgePollerAgentOptionsCustomAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	const session = "testrig-crew-helm"
+	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{Sender: "test", Message: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+
 	hasPromptDetection, opts := resolveNudgePollerAgentOptions("claude-helm", townRoot, rigPath)
 	if !hasPromptDetection {
 		t.Fatal("custom Claude alias should enable prompt detection")
@@ -52,8 +58,25 @@ func TestResolveNudgePollerAgentOptionsCustomAlias(t *testing.T) {
 	if !shouldSkipDrainUntilIdle(hasPromptDetection, errors.New("busy pane")) {
 		t.Fatal("busy pane should leave the nudge queued")
 	}
+	if pending, err := nudge.Pending(townRoot, session); err != nil || pending != 1 {
+		t.Fatalf("busy pane pending nudges = %d, err %v; want 1, nil", pending, err)
+	}
 	if shouldSkipDrainUntilIdle(hasPromptDetection, nil) {
 		t.Fatal("idle pane should allow the queued nudge to drain")
+	}
+	drained, err := nudge.Drain(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(drained) != 1 {
+		t.Fatalf("idle pane drained %d nudges, want 1", len(drained))
+	}
+	drained, err = nudge.Drain(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(drained) != 0 {
+		t.Fatalf("second idle drain delivered %d nudges, want 0", len(drained))
 	}
 }
 
