@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -78,12 +79,12 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	hasPromptDetection := false
 	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
 		agentName = name
-		if preset := config.GetAgentPresetByName(agentName); preset != nil {
-			hasPromptDetection = preset.ReadyPromptPrefix != ""
-			if preset.EscapeCancelsRequest {
-				nudgeOpts.SkipEscape = true
-			}
+		rigName, _ := t.GetEnvironment(sessionName, "GT_RIG")
+		rigPath := ""
+		if rigName != "" {
+			rigPath = filepath.Join(townRoot, rigName)
 		}
+		hasPromptDetection, nudgeOpts = resolveNudgePollerAgentOptions(agentName, townRoot, rigPath)
 	}
 
 	// Set up signal handling for graceful shutdown.
@@ -134,6 +135,26 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+}
+
+func resolveNudgePollerAgentOptions(agentName, townRoot, rigPath string) (bool, tmux.NudgeOpts) {
+	if preset := config.GetAgentPresetByName(agentName); preset != nil {
+		return preset.ReadyPromptPrefix != "", tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}
+	}
+
+	resolved := config.ResolveAgentConfigByName(agentName, townRoot, rigPath)
+	if resolved == nil {
+		fmt.Fprintf(os.Stderr, "nudge-poller: could not resolve agent %q; using best-effort delivery\n", agentName)
+		return false, tmux.NudgeOpts{}
+	}
+
+	hasPromptDetection := resolved.Tmux != nil && resolved.Tmux.ReadyPromptPrefix != ""
+	presetName := resolved.Provider
+	if presetName == "" {
+		presetName = resolved.Command
+	}
+	preset := config.GetAgentPresetByName(presetName)
+	return hasPromptDetection, tmux.NudgeOpts{SkipEscape: preset != nil && preset.EscapeCancelsRequest}
 }
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
