@@ -282,6 +282,42 @@ func TestProcessNudgePollTickUsesResolvedPromptBeforeDraining(t *testing.T) {
 	}
 }
 
+func TestProcessNudgePollTickWrapperCommandUsesBestEffortDrain(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), &config.RigSettings{
+		Type: "rig-settings", Version: config.CurrentRigSettingsVersion,
+		Agents: map[string]*config.RuntimeConfig{
+			"wrapper-agent": {Command: "my-agent.sh", Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "WRAPPER> "}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const session = "testrig-crew-wrapper"
+	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{Sender: "test", Message: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	tmuxFake := &fakeNudgePollerTmux{agent: "wrapper-agent", rig: "testrig", waitErrors: []error{errors.New("default prompt not present")}}
+	options := resolveNudgePollerAgentOptions("wrapper-agent", townRoot, rigPath)
+	if options.hasPromptDetection || options.readyPromptPrefix != tmux.DefaultReadyPromptPrefix {
+		t.Fatalf("wrapper alias = (%v, %q), want best-effort default prompt", options.hasPromptDetection, options.readyPromptPrefix)
+	}
+
+	if !processNudgePollTick(tmuxFake, filesystemNudgePollerQueue{}, session, townRoot, time.Second, make(map[string]struct{})) {
+		t.Fatal("poll tick reported a live session as gone")
+	}
+	if len(tmuxFake.waitPrefixes) != 1 || tmuxFake.waitPrefixes[0] != tmux.DefaultReadyPromptPrefix {
+		t.Fatalf("idle wait prefixes = %q, want default best-effort prefix", tmuxFake.waitPrefixes)
+	}
+	if pending, err := nudge.Pending(townRoot, session); err != nil || pending != 0 {
+		t.Fatalf("wrapper tick pending = %d, err %v; want drained queue", pending, err)
+	}
+	if len(tmuxFake.injected) != 1 {
+		t.Fatalf("wrapper tick injected %d nudges, want one", len(tmuxFake.injected))
+	}
+}
+
 func TestWarnUnknownNudgePollerAgentOnce(t *testing.T) {
 	var output bytes.Buffer
 	warned := make(map[string]struct{})

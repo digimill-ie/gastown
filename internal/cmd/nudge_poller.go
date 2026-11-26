@@ -192,28 +192,23 @@ func resolveNudgePollerAgentOptions(agentName, townRoot, rigPath string) nudgePo
 		return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix, unknownAgent: true}
 	}
 
-	if resolved.Tmux != nil && resolved.Tmux.ReadyPromptPrefix != "" {
-		presetName := resolved.Provider
-		if presetName == "" {
-			presetName = resolved.Command
-		}
-		preset := config.GetAgentPresetByName(presetName)
-		return nudgePollerAgentOptions{
-			hasPromptDetection: true,
-			readyPromptPrefix:  resolved.Tmux.ReadyPromptPrefix,
-			nudgeOpts:          tmux.NudgeOpts{SkipEscape: preset != nil && preset.EscapeCancelsRequest},
-		}
-	}
-
 	presetName := resolved.Provider
 	if presetName == "" {
 		presetName = resolved.Command
 	}
 	preset := config.GetAgentPresetByName(presetName)
-	if preset == nil || preset.ReadyPromptPrefix == "" {
-		return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix, nudgeOpts: tmux.NudgeOpts{SkipEscape: preset != nil && preset.EscapeCancelsRequest}}
+	if preset == nil {
+		return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix}
 	}
-	return nudgePollerAgentOptions{hasPromptDetection: true, readyPromptPrefix: preset.ReadyPromptPrefix, nudgeOpts: tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}}
+
+	readyPromptPrefix := preset.ReadyPromptPrefix
+	if resolved.Tmux != nil && resolved.Tmux.ReadyPromptPrefix != "" {
+		readyPromptPrefix = resolved.Tmux.ReadyPromptPrefix
+	}
+	if readyPromptPrefix == "" {
+		return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix, nudgeOpts: tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}}
+	}
+	return nudgePollerAgentOptions{hasPromptDetection: true, readyPromptPrefix: readyPromptPrefix, nudgeOpts: tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}}
 }
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
