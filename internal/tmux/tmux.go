@@ -3408,7 +3408,15 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns nil if the agent becomes idle within the timeout.
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
-	promptPrefix := readyPromptPrefixForSession(t, session)
+	return t.WaitForIdleWithPromptPrefix(session, readyPromptPrefixForSession(t, session), timeout)
+}
+
+// WaitForIdleWithPromptPrefix polls until the supplied runtime prompt appears.
+// Use this when the caller has already resolved a custom agent alias.
+func (t *Tmux) WaitForIdleWithPromptPrefix(session, promptPrefix string, timeout time.Duration) error {
+	if promptPrefix == "" {
+		promptPrefix = DefaultReadyPromptPrefix
+	}
 	prefix := strings.TrimSpace(promptPrefix)
 
 	// Require 2 consecutive idle polls to filter out transient states.

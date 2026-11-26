@@ -60,7 +60,7 @@ var eventsCmd = &cobra.Command{
 A durable, per-agent, append-only event stream with stable ids and an
 explicit claim -> complete -> ack lifecycle. One opt-in Claude agent
 subscribes with 'gt events tail <target>' under the Monitor tool; new
-lines arrive as notifications without cancelling any in-flight tool call.
+lines arrive as notifications without canceling any in-flight tool call.
 
 This is additive: it does not replace 'gt nudge' or the UserPromptSubmit
 hook drain, and nothing here changes a default delivery path.
