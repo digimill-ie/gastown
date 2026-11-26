@@ -187,23 +187,65 @@ func resolveNudgePollerAgentOptionsForSession(getEnvironment func(string) (strin
 }
 
 func resolveNudgePollerAgentOptions(agentName, townRoot, rigPath string) nudgePollerAgentOptions {
-	resolved := config.ResolveAgentConfigByName(agentName, townRoot, rigPath)
-	if resolved == nil {
-		return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix, unknownAgent: true}
-	}
-
-	presetName := resolved.Provider
-	if presetName == "" {
-		presetName = resolved.Command
-	}
-	preset := config.GetAgentPresetByName(presetName)
+	// Preserve direct built-in lookup first. A built-in agent name can use an
+	// absolute-path command override while retaining its preset behavior.
+	preset := config.GetAgentPresetByName(agentName)
+	var resolved *config.RuntimeConfig
 	if preset == nil {
-		return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix}
+		resolved = config.ResolveAgentConfigByName(agentName, townRoot, rigPath)
+		if resolved == nil {
+			return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix, unknownAgent: true}
+		}
+
+		if resolved.Provider != "" {
+			preset = config.GetAgentPresetByName(resolved.Provider)
+		}
+		if preset == nil && resolved.Command != "" {
+			commandBase := filepath.Base(resolved.Command)
+			preset = config.GetAgentPresetByName(commandBase)
+			if preset == nil {
+				for _, name := range config.ListAgentPresets() {
+					candidate := config.GetAgentPresetByName(name)
+					if candidate != nil && filepath.Base(candidate.Command) == commandBase {
+						preset = candidate
+						break
+					}
+				}
+			}
+		}
+		if preset == nil {
+			return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix, unknownAgent: true}
+		}
 	}
 
 	readyPromptPrefix := preset.ReadyPromptPrefix
-	if resolved.Tmux != nil && resolved.Tmux.ReadyPromptPrefix != "" {
-		readyPromptPrefix = resolved.Tmux.ReadyPromptPrefix
+	if resolved != nil {
+		// ResolveAgentConfigByName fills missing tmux settings from Claude.
+		// Read the unfilled alias config so only an explicit alias prompt can
+		// override a prompt-less or differently prompted preset.
+		aliasPromptPrefix := ""
+		if rigPath != "" {
+			if rigSettings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath)); err == nil {
+				if alias := rigSettings.Agents[agentName]; alias != nil && alias.Tmux != nil {
+					aliasPromptPrefix = alias.Tmux.ReadyPromptPrefix
+				}
+			}
+		}
+		if aliasPromptPrefix == "" {
+			if townSettings, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot)); err == nil {
+				if alias := townSettings.Agents[agentName]; alias != nil && alias.Tmux != nil {
+					aliasPromptPrefix = alias.Tmux.ReadyPromptPrefix
+				}
+			}
+		}
+		if aliasPromptPrefix == "" {
+			if aliasPreset := config.GetAgentPresetByName(agentName); aliasPreset != nil {
+				aliasPromptPrefix = aliasPreset.ReadyPromptPrefix
+			}
+		}
+		if aliasPromptPrefix != "" {
+			readyPromptPrefix = aliasPromptPrefix
+		}
 	}
 	if readyPromptPrefix == "" {
 		return nudgePollerAgentOptions{readyPromptPrefix: tmux.DefaultReadyPromptPrefix, nudgeOpts: tmux.NudgeOpts{SkipEscape: preset.EscapeCancelsRequest}}

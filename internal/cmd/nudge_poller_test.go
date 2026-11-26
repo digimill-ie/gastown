@@ -130,8 +130,9 @@ func TestResolveNudgePollerAgentOptionsUsesExplicitAliasPrompt(t *testing.T) {
 	}
 
 	options = resolveNudgePollerAgentOptions("codex", townRoot, rigPath)
-	if options.hasPromptDetection || options.nudgeOpts.SkipEscape {
-		t.Fatalf("custom codex alias = (%v, skip escape %v), want promptless Copilot behavior", options.hasPromptDetection, options.nudgeOpts.SkipEscape)
+	codexPreset := config.GetAgentPresetByName("codex")
+	if codexPreset == nil || !options.hasPromptDetection || options.readyPromptPrefix != codexPreset.ReadyPromptPrefix || options.nudgeOpts.SkipEscape != codexPreset.EscapeCancelsRequest {
+		t.Fatalf("direct Codex lookup = (%v, %q, skip escape %v), want built-in preset behavior", options.hasPromptDetection, options.readyPromptPrefix, options.nudgeOpts.SkipEscape)
 	}
 
 	options = resolveNudgePollerAgentOptions("codex-prompt", townRoot, rigPath)
@@ -140,12 +141,77 @@ func TestResolveNudgePollerAgentOptionsUsesExplicitAliasPrompt(t *testing.T) {
 	}
 
 	options = resolveNudgePollerAgentOptions("codex", townRoot, filepath.Join(townRoot, "other-rig"))
-	codexPreset := config.GetAgentPresetByName("codex")
+	codexPreset = config.GetAgentPresetByName("codex")
 	if codexPreset == nil {
 		t.Fatal("test requires Codex built-in preset")
 	}
 	if !options.hasPromptDetection || options.readyPromptPrefix != codexPreset.ReadyPromptPrefix {
 		t.Fatalf("built-in Codex = (%v, %q), want built-in prompt %q", options.hasPromptDetection, options.readyPromptPrefix, codexPreset.ReadyPromptPrefix)
+	}
+}
+
+func TestResolveNudgePollerAgentOptionsBuiltinNameKeepsGeminiPresetWithCommandOverride(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), &config.RigSettings{
+		Type: "rig-settings", Version: config.CurrentRigSettingsVersion,
+		Agents: map[string]*config.RuntimeConfig{
+			"gemini": {Command: "/opt/homebrew/bin/gemini"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	options := resolveNudgePollerAgentOptions("gemini", townRoot, rigPath)
+	preset := config.GetAgentPresetByName("gemini")
+	if preset == nil {
+		t.Fatal("test requires Gemini built-in preset")
+	}
+	wantPrefix := preset.ReadyPromptPrefix
+	if wantPrefix == "" {
+		wantPrefix = tmux.DefaultReadyPromptPrefix
+	}
+	if options.hasPromptDetection != (preset.ReadyPromptPrefix != "") || options.readyPromptPrefix != wantPrefix || options.nudgeOpts.SkipEscape != preset.EscapeCancelsRequest {
+		t.Fatalf("Gemini override = (%v, %q, skip escape %v), want built-in behavior (%v, %q, skip escape %v)", options.hasPromptDetection, options.readyPromptPrefix, options.nudgeOpts.SkipEscape, preset.ReadyPromptPrefix != "", wantPrefix, preset.EscapeCancelsRequest)
+	}
+}
+
+func TestResolveNudgePollerAgentOptionsPresetBinaryAliases(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), &config.RigSettings{
+		Type: "rig-settings", Version: config.CurrentRigSettingsVersion,
+		Agents: map[string]*config.RuntimeConfig{
+			"mistral-crew": {Command: "/usr/local/bin/vibe"},
+			"cursor-crew":  {Command: "/usr/local/bin/cursor-agent"},
+			"kiro-crew":    {Command: "/opt/homebrew/bin/kiro-cli"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		alias      string
+		presetName string
+	}{
+		{alias: "mistral-crew", presetName: "vibe"},
+		{alias: "cursor-crew", presetName: "cursor"},
+		{alias: "kiro-crew", presetName: "kiro"},
+	} {
+		t.Run(test.alias, func(t *testing.T) {
+			options := resolveNudgePollerAgentOptions(test.alias, townRoot, rigPath)
+			preset := config.GetAgentPresetByName(test.presetName)
+			if preset == nil {
+				t.Fatalf("missing built-in preset %q", test.presetName)
+			}
+			wantPrefix := preset.ReadyPromptPrefix
+			if wantPrefix == "" {
+				wantPrefix = tmux.DefaultReadyPromptPrefix
+			}
+			if options.unknownAgent || options.hasPromptDetection != (preset.ReadyPromptPrefix != "") || options.readyPromptPrefix != wantPrefix || options.nudgeOpts.SkipEscape != preset.EscapeCancelsRequest {
+				t.Fatalf("options = (%v, %q, skip escape %v, unknown %v), want preset %q", options.hasPromptDetection, options.readyPromptPrefix, options.nudgeOpts.SkipEscape, options.unknownAgent, test.presetName)
+			}
+		})
 	}
 }
 
@@ -319,6 +385,10 @@ func TestProcessNudgePollTickWrapperCommandUsesBestEffortDrain(t *testing.T) {
 }
 
 func TestWarnUnknownNudgePollerAgentOnce(t *testing.T) {
+	options := resolveNudgePollerAgentOptions("unregistered-agent", t.TempDir(), "")
+	if !options.unknownAgent {
+		t.Fatal("unregistered agent should be marked for one-time warning")
+	}
 	var output bytes.Buffer
 	warned := make(map[string]struct{})
 	warnUnknownNudgePollerAgent("unknown-alias", warned, &output)
